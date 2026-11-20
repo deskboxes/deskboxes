@@ -3887,16 +3887,16 @@ impl App {
                 // Found what was searched for: the search is done.
                 self.close_search();
             } else if let (Hit::Header { id, add: false, .. }, true) = (&hit, self.settings.rollup.double_click) {
-                // What looks open rolls up (also a box opened by hovering it); a rolled-up box
-                // opens and stays open.
+                // A rolled-up box opens and stays open (roll-up off for it), even when hovering
+                // has already slid it open; any other box rolls up.
                 let id = *id;
-                let looks_open = self.box_by_id(id).map(|b| !b.rolled_up).unwrap_or(false) || self.revealed.contains(&id);
+                let roll = self.box_by_id(id).map(|b| !b.rolled_up).unwrap_or(false);
                 self.revealed.remove(&id);
                 self.pending_reveal = None;
-                self.no_reveal = if looks_open { Some(id) } else { None };
+                self.no_reveal = if roll { Some(id) } else { None };
                 self.change_layout(|l, _| {
                     if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id) {
-                        b.rolled_up = looks_open;
+                        b.rolled_up = roll;
                     }
                 });
             } else if matches!(hit, Hit::Empty) && self.settings.hide.double_click {

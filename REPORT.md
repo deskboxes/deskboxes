@@ -537,3 +537,10 @@ install where nothing is installed.
 
 UNVERIFIED: a download through GitHub's redirect to its file servers (no release exists yet),
 a proxy that needs a password, SmartScreen on the downloaded installer (unsigned).
+
+Fixes (2026-11-20): double-clicking the title of a rolled-up box now opens it and keeps it open
+(roll-up off for that box) even when pointing at it had already slid it open; before, that
+double-click rolled it up again. Settings pages now come in as one fade-and-rise of the whole
+page (off when Windows' animation effects are off); the per-card entrance animation started a
+moment late, so the new page blinked and its picture popped back in. VERIFIED on the test
+desktop, the animation frame by frame (screen captures every 7 ms).

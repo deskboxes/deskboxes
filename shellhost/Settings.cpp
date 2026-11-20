@@ -805,16 +805,20 @@ namespace dbx
         }
 
         // A page: its title and cards in a scroller. `standalone`: a XAML document of its own (a
-        // page switch puts it into the navigation view that is there). `animate`: the cards come
-        // in one after another, rising a little, as Windows Settings pages do.
+        // page switch puts it into the navigation view that is there). `animate`: the page starts
+        // hidden and SwitchPage fades it in while it rises a little, as Windows Settings pages do.
+        // (One animation for the whole page: per-card entrance transitions started late, after the
+        // page had already been drawn once, so it blinked and the pictures popped.)
         std::wstring PageXaml(const Page* cur, bool standalone, bool animate)
         {
             std::wstring x = L"<ScrollViewer x:Name=\"Scroll\"";
             if (standalone)
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
-            x += L"><StackPanel Spacing=\"4\" Margin=\"36,12,36,36\" MaxWidth=\"1000\">";
+            x += L"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,12,36,36\" MaxWidth=\"1000\"";
+            x += animate ? L" Opacity=\"0\">" : L">";
             if (animate)
-                x += L"<StackPanel.ChildrenTransitions><TransitionCollection><EntranceThemeTransition FromVerticalOffset=\"36\" IsStaggeringEnabled=\"True\"/></TransitionCollection></StackPanel.ChildrenTransitions>";
+                x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.22\"/></StackPanel.OpacityTransition>"
+                     L"<StackPanel.TranslationTransition><Vector3Transition Duration=\"0:0:0.3\"/></StackPanel.TranslationTransition>";
             x += L"<TextBlock Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"0,0,0,12\"/>";
             if (cur->hero) x += Hero(cur);
             x += cur->build();
@@ -1205,16 +1209,30 @@ namespace dbx
             auto old = g.window.Content().try_as<mux::FrameworkElement>();
             auto nav = old ? Find<muxc::NavigationView>(old, L"Nav") : muxc::NavigationView{ nullptr };
             if (!nav) return Build();
+            // Windows' "Animation effects" off: the page just appears.
+            BOOL anim = TRUE;
+            SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
             mux::FrameworkElement page{ nullptr };
-            try { page = mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), true, true)).as<mux::FrameworkElement>(); }
+            try { page = mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), true, anim != FALSE)).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: page XAML failed: %s", e.message().c_str()); return Build(); }
+            auto body = anim ? Find<mux::UIElement>(page, L"PageBody") : mux::UIElement{ nullptr };
+            if (body) body.Translation({ 0.0f, 28.0f, 0.0f });
             g.wiring = true;
             g.builtPage = g.page;
             nav.Content(page);
             Wire(page);
-            page.Loaded([page](auto&&, auto&&)
+            page.Loaded([page, body](auto&&, auto&&)
             {
-                page.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { g.wiring = false; });
+                page.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [body]
+                {
+                    g.wiring = false;
+                    // Laid out and still invisible: now fade in and rise into place.
+                    if (body)
+                    {
+                        body.Opacity(1.0);
+                        body.Translation({ 0.0f, 0.0f, 0.0f });
+                    }
+                });
             });
         }
 
