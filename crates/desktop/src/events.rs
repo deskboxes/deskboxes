@@ -26,6 +26,8 @@ pub enum Ev {
     HostReady(deskboxes_ipc::HostClient),
     HostMsg(serde_json::Value),
     HostGone,
+    /// The updater's status changed (Settings shows it).
+    Update,
     /// Explorer's tooltip text for an item (empty: none).
     InfoTip {
         key: deskboxes_core::ItemKey,

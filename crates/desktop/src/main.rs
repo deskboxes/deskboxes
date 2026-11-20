@@ -38,6 +38,7 @@ mod logger;
 mod saved;
 mod above;
 mod folderbox;
+mod update;
 mod search;
 mod textedit;
 mod tuck;
@@ -113,6 +114,8 @@ pub struct Paths {
     pub backups: PathBuf,
     pub snapshot: PathBuf,
     pub logs: PathBuf,
+    /// Downloaded updates (update.rs).
+    pub update: PathBuf,
 }
 
 fn env_dir(var: &str) -> PathBuf {
@@ -135,6 +138,7 @@ impl Paths {
             layouts: roam.join("layouts"),
             backups: roam.join("backups"),
             snapshot: local.join("snapshot.bin"),
+            update: local.join("update"),
             logs,
         }
     }

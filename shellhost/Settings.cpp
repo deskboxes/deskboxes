@@ -214,6 +214,46 @@ namespace dbx
             x += Card(L"&#xF2B7;", Str(L"language"), Str(L"languageDesc"),
                       L"<ComboBox x:Name=\"Language\" MinWidth=\"220\">" + Opt(L"", Str(L"langAuto"), lang.empty()) + Opt(L"en", L"English", lang == L"en") + Opt(L"pl", L"Polski", lang == L"pl") + L"</ComboBox>");
             x += Card(L"&#xE823;", Str(L"autostart"), Str(L"autostartDesc"), Toggle(L"Autostart", app.GetNamedBoolean(L"autostart", false)));
+            // Updates: the switch, what the updater is doing, Check now / Install now.
+            {
+                auto up = g.data.GetNamedObject(L"update", JsonObject());
+                auto st = up.GetNamedObject(L"status", JsonObject());
+                std::wstring state = st.GetNamedString(L"state", L"").c_str(), latest = st.GetNamedString(L"latest", L"").c_str();
+                auto fill = [](std::wstring s, const wchar_t* k, const std::wstring& v) { auto i = s.find(k); if (i != std::wstring::npos) s.replace(i, wcslen(k), v); return s; };
+                std::wstring text = state == L"checking" ? Str(L"updChecking")
+                                  : state == L"downloading" ? fill(Str(L"updDownloading"), L"{v}", Esc(latest))
+                                  : state == L"ready" ? fill(Str(L"updReady"), L"{v}", Esc(latest))
+                                  : state == L"error" ? Str(L"updError")
+                                  : state == L"dev" ? Str(L"updDev")
+                                  : state == L"uptodate" ? fill(Str(L"updUpToDate"), L"{v}", Esc(std::wstring(up.GetNamedString(L"version", L"").c_str())))
+                                  : Str(L"updNever");
+                std::wstring when;
+                if (double t = st.GetNamedNumber(L"checked", 0); t > 0 && state != L"dev")
+                {
+                    time_t tt = (time_t)t;
+                    tm lt{};
+                    localtime_s(&lt, &tt);
+                    wchar_t b[64];
+                    wcsftime(b, 64, L"%Y-%m-%d %H:%M", &lt);
+                    when = fill(Str(L"updChecked"), L"{t}", b);
+                }
+                std::wstring more = state == L"ready" ? Str(L"updReadyDesc")
+                                  : state == L"error" ? [&] {
+                                        std::wstring k = st.GetNamedString(L"error", L"").c_str();
+                                        return Str(k == L"net" ? L"updErrNet" : k == L"none" ? L"updErrNone" : k == L"server" ? L"updErrServer" : k == L"file" ? L"updErrFile" : L"updErrOther");
+                                    }()
+                                  : state == L"dev" ? Str(L"updDevDesc")
+                                  : L"";
+                if (!more.empty() && !when.empty()) more += L" ";
+                when = more + when;
+                bool dev = state == L"dev", busy = state == L"checking" || state == L"downloading";
+                x += Section(Str(L"updates"));
+                x += Card(L"&#xE895;", Str(L"updAuto"), Str(L"updAutoDesc"), Toggle(L"UpdateAuto", up.GetNamedBoolean(L"auto", true)));
+                std::wstring btns = L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\">";
+                if (state == L"ready") btns += L"<Button x:Name=\"UpdateInstall\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(L"updInstall") + L"\" MinWidth=\"120\"/>";
+                btns += L"<Button x:Name=\"UpdateNow\" Content=\"" + Str(L"updNow") + L"\" MinWidth=\"120\"" + (dev || busy ? L" IsEnabled=\"False\"" : L"") + L"/></StackPanel>";
+                x += Card(state == L"error" ? L"&#xE783;" : state == L"ready" ? L"&#xE896;" : L"&#xE946;", text, when, btns);
+            }
             x += Section(Str(L"about"));
             x += Card(L"&#xE7E8;", Str(L"disable"), Str(L"disableDesc"), L"<Button x:Name=\"Disable\" Content=\"" + Str(L"disableButton") + L"\" MinWidth=\"120\"/>");
             x += L"<TextBlock Text=\"Deskboxes " + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" Margin=\"1,12,0,0\"/>";
@@ -997,6 +1037,9 @@ namespace dbx
             if (auto b = Find<muxc::Button>(root, L"HomeRules")) b.Click([](auto&&, auto&&) { GoTo(L"rules"); });
             // General
             OnToggle(root, L"Autostart", L"app", L"autostart");
+            OnToggle(root, L"UpdateAuto", L"update", L"auto");
+            OnClick(root, L"UpdateNow", L"update", 0, L"now");
+            OnClick(root, L"UpdateInstall", L"update", 0, L"install");
             OnToggle(root, L"LockAll", L"app", L"lockAll");
             OnToggle(root, L"Privacy", L"app", L"privacy");
             OnCombo(root, L"Language", [](std::wstring v) { Send(L"app", 0, L"language", JsonValue::CreateStringValue(v)); });

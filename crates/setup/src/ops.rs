@@ -483,8 +483,11 @@ pub struct InstallOptions {
     pub dir: PathBuf,
     pub autostart: bool,
     pub start_menu: bool,
-    /// Start Deskboxes when done (always, if it was running before).
+    /// Start Deskboxes when done (always, if it was running before, except for an update).
     pub launch: bool,
+    /// An update started by Deskboxes itself: the copy it closed was exiting anyway, so start
+    /// Deskboxes again only when `launch` says so.
+    pub update: bool,
     pub shortcut_desc: String,
 }
 
@@ -573,7 +576,7 @@ pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Resu
     report(Report::Fraction(0.97));
 
     // 4. Start it.
-    let start = o.launch || was_running;
+    let start = o.launch || (was_running && !o.update);
     if start {
         report(Report::Step(Step::Starting));
         launch(&wd, "--launch --enable", &o.dir).map_err(Failure::Other)?;

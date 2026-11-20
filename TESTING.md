@@ -301,3 +301,20 @@ Tests here used a folder in the temp directory (`--dir`), a test data root (`--d
     every box at once; Faint / As desktop labels / Semibold are the look from before.
 83. Title-bar buttons on: point at a box's title: a chevron and ⋯ appear left of the
     magnifier. The chevron rolls the box up (and opens it again); ⋯ opens the box's menu.
+
+### B.19 Updates (2026-11-20)
+
+84. Settings › General › Updates: "Update automatically" is on. In a build-folder copy the card
+    says the copy doesn't update itself and Check now is greyed out.
+85. In an installed copy: Check now → "Checking…", then "You have the newest version (X)" with
+    the time. Offline: "No connection to GitHub…".
+86. After a newer release is published: within two minutes of starting (or Check now) the card
+    shows "Version Y is ready" and Install now. Install now: Deskboxes closes, comes back as Y
+    within a few seconds, boxes unchanged. Or quit and start Deskboxes: it updates first.
+87. Update automatically off: no daily check (Check now still works).
+
+Testing without publishing: `DBX_UPDATE_FEED=http://127.0.0.1:PORT/latest.json` (plain http only
+on 127.0.0.1/localhost) and `DBX_UPDATE_DELAY=SECONDS` (first check; default 120) in the
+environment of an installed copy; serve `latest.json` and the installer with
+`python -m http.server --bind 127.0.0.1`. Make the newer installer with the workspace version
+raised in `Cargo.toml` (`tools\release.ps1 -Version X` without `-Publish` writes both files).

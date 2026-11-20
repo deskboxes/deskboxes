@@ -666,6 +666,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         settings.enabled = true;
         let _ = persist::save_settings(&paths.settings, &settings);
     }
+    // A downloaded update installs now, before anything is shown; the installer starts
+    // Deskboxes again (unless it is turned off).
+    if crate::update::install_pending(&paths.update, settings.enabled && args.desktop_dir.is_none() && !args.window) {
+        return 0;
+    }
     if !settings.enabled {
         log::info!("Deskboxes is disabled in settings: restoring native icons and exiting");
         hide::restore();
@@ -938,6 +943,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let _ = windows::Win32::System::Ole::RegisterDragDrop(hwnd, &crate::droptarget::DropTarget::create(hwnd));
     app.register_above_hotkey();
     app.above_poll();
+    crate::update::start(app.paths.update.clone(), app.settings.update.auto);
     APP.with(|a| *a.borrow_mut() = Some(app));
 
     let mut msg = MSG::default();
@@ -2466,7 +2472,7 @@ impl App {
             .map(|b| (b.id, b.title(), &b.style, b.az, &b.tint, &b.blend, b.stay_visible, &b.folder, b.tabs.iter().map(|t| (t.id, &t.title)).collect::<Vec<_>>()))
             .collect();
         let sorting = (&self.layout.rules, self.layout.keep_sorted, self.layout.new_items_to);
-        let look = (&self.settings.look.title_bar, &self.settings.look.align, self.settings.lock_all, self.settings.privacy.allowed, &self.settings.extras, &self.settings.az, &self.settings.search, &self.settings.icons, &self.settings.hide, &self.settings.saved, &self.settings.above, self.above_hotkey_ok);
+        let look = (&self.settings.look.title_bar, &self.settings.look.align, self.settings.lock_all, self.settings.privacy.allowed, &self.settings.extras, &self.settings.az, &self.settings.search, &self.settings.icons, &self.settings.hide, &self.settings.saved, &self.settings.above, self.above_hotkey_ok, &self.settings.update, crate::update::status());
         serde_json::to_string(&(boxes, &self.settings.default_style, &self.settings.language, sorting, &self.settings.tabs, &self.settings.rollup, look)).unwrap_or_default()
     }
 
@@ -2531,6 +2537,11 @@ impl App {
             "icons": { "tint": self.settings.icons.tint, "tintStrength": self.settings.icons.tint_strength, "blend": self.settings.icons.blend, "blendStrength": self.settings.icons.blend_strength, "desktop": self.settings.icons.desktop, "blendBoxes": self.settings.icons.blend_boxes, "fullHover": self.settings.icons.full_on_hover, "fullActive": self.settings.icons.full_when_active },
             "search": { "field": self.settings.search.field, "typeToSearch": self.settings.search.type_to_search },
             "hide": { "doubleClick": self.settings.hide.double_click },
+            "update": {
+                "auto": self.settings.update.auto,
+                "status": crate::update::status(),
+                "version": crate::update::current(),
+            },
             "above": { "hotkey": self.settings.above.hotkey, "corner": self.settings.above.corner, "dim": self.settings.above.dim, "hotkeyOk": self.above_hotkey_ok },
             "folderBoxes": {
                 "known": items::known_folders().iter().map(|(n, p)| json!({ "id": n, "path": p.display().to_string(), "name": t(self.lang, match *n {
@@ -2723,6 +2734,23 @@ impl App {
                 self.new_folder_box(&p, at);
                 self.send_settings(false, None);
             }
+            ("update", k) => match k {
+                "auto" => {
+                    self.settings.update.auto = val.as_bool().unwrap_or(true);
+                    crate::update::set_auto(self.settings.update.auto);
+                    let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                    self.settings_sent = self.settings_sig();
+                }
+                "now" => crate::update::check_now(),
+                "install" => {
+                    if crate::update::install_pending(&self.paths.update, self.args.desktop_dir.is_none() && !self.args.window) {
+                        unsafe {
+                            let _ = PostMessageW(Some(self.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+                _ => {}
+            },
             ("above", k) => {
                 match k {
                     "hotkey" => self.settings.above.hotkey = val.as_str().unwrap_or("").to_string(),
@@ -4937,6 +4965,11 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         }
                         Ev::HostMsg(v) => app.on_host_msg(v),
                         Ev::InfoTip { key, text } => app.on_info_tip(key, text),
+                        Ev::Update => {
+                            if app.host.is_some() && app.settings_sig() != app.settings_sent {
+                                app.send_settings(false, None);
+                            }
+                        }
                         Ev::HostGone => {
                             if !app.quitting {
                                 log::warn!("shell host disconnected; restarting it");

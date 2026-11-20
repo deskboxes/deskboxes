@@ -307,6 +307,22 @@ pub struct Settings {
     pub saved: SavedSettings,
     /// Boxes above windows.
     pub above: AboveSettings,
+    /// Updates from GitHub.
+    pub update: UpdateSettings,
+}
+
+/// Settings › General › Updates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a new version once a day, download it, install it on the next start.
+    pub auto: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        UpdateSettings { auto: true }
+    }
 }
 
 /// Settings › Boxes above windows.
@@ -373,6 +389,7 @@ impl Default for Settings {
             hide: HideSettings::default(),
             saved: SavedSettings::default(),
             above: AboveSettings::default(),
+            update: UpdateSettings::default(),
         }
     }
 }

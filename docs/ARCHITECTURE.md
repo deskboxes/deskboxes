@@ -544,3 +544,29 @@ Deskboxes through Explorer, so Deskboxes never runs elevated.
 **Window.** Plain Win32 with no redirection bitmap; Direct2D draws into a DirectComposition
 surface over Mica (`DWMSBT_MAINWINDOW`, frame extended into the whole client area, caption
 buttons drawn by us). Colors are WinUI 3's theme resources and the accent from `UISettings`.
+
+---
+
+## 17. Updates (`crates/desktop/src/update.rs`)
+
+```text
+github.com/deskboxes/releases  (public)  release vX: DeskboxesSetup.exe, latest.json
+latest.json  {"version", "url", "sha256", "size"}   read via releases/latest/download/latest.json
+%LOCALAPPDATA%\Deskboxes\update\state.json  {last_check, pending: {version, file, sha256}, attempts}
+%LOCALAPPDATA%\Deskboxes\update\DeskboxesSetup-X.exe  verified download
+```
+
+**Check.** A thread (`update`) waits `DBX_UPDATE_DELAY` (120 s), then hourly looks whether a day
+has passed since `last_check` (and Update automatically is on), or Check now woke it. HTTP is
+WinHTTP (`Win32_Networking_WinHttp`); hosts are limited to github.com and *.githubusercontent.com
+over HTTPS (127.0.0.1/localhost over http for tests). The download is streamed to `*.part`,
+hashed as it arrives (SHA-256 in the module, no crate), checked against size and hash, then
+renamed. Status changes post `Ev::Update`, and the UI thread sends Settings the new state.
+
+**Install.** `run_inner` calls `install_pending` before anything else: a pending installer that
+is newer than this build, still hashes right, and has been tried fewer than two times is started
+detached with `--quiet --update` (`--launch` unless this is a fixture/window run) and the core
+returns 0, so the watchdog exits too. Setup closes whatever is left, keeps the autostart and
+Start menu choices (`--update`), replaces the files and starts Deskboxes only with `--launch`.
+The next start sees the pending version is not newer and deletes it. Only a copy whose folder
+is the registered `InstallLocation` does any of this.

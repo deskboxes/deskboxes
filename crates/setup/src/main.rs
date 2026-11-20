@@ -5,6 +5,8 @@
 //! DeskboxesSetup.exe                       the installer window
 //! DeskboxesSetup.exe --quiet               install with the defaults, no window
 //!     [--dir DIR] [--no-autostart] [--no-start-menu] [--launch]
+//!     [--update]                           an update: keep "Start with Windows" and the Start
+//!                                          menu shortcut as they are
 //! uninstall.exe --uninstall                the uninstaller window (Settings › Apps runs this)
 //! uninstall.exe --uninstall --quiet [--remove-data]
 //!     [--lang en|pl]                       language (default: Windows' display language)
@@ -35,6 +37,7 @@ struct Args {
     no_autostart: bool,
     no_start_menu: bool,
     launch: bool,
+    update: bool,
     remove_data: bool,
     data_root: Option<PathBuf>,
     lang: Option<String>,
@@ -59,6 +62,7 @@ fn parse() -> Args {
             "--no-autostart" => a.no_autostart = true,
             "--no-start-menu" => a.no_start_menu = true,
             "--launch" => a.launch = true,
+            "--update" => a.update = true,
             "--remove-data" => a.remove_data = true,
             "--data-root" => a.data_root = Some(next(&mut i).into()),
             "--lang" => a.lang = Some(next(&mut i)),
@@ -162,13 +166,21 @@ fn main() {
                     ops::log("no payload: nothing to install");
                     3
                 }
+                // An update only replaces an installed copy; it never installs a new one.
+                Some(_) if args.update && installed.is_none() => {
+                    ops::log("--update: Deskboxes is not installed");
+                    3
+                }
                 Some(p) => {
                     let dir = args.dir.clone().or_else(|| installed.as_ref().map(|i| i.dir.clone())).unwrap_or_else(ops::default_dir);
+                    // An update keeps the choices made when Deskboxes was installed.
+                    let keep = args.update && installed.is_some();
                     let o = ops::InstallOptions {
                         dir,
-                        autostart: !args.no_autostart,
-                        start_menu: !args.no_start_menu,
+                        autostart: if keep { ops::autostart_on() } else { !args.no_autostart },
+                        start_menu: if keep { ops::start_menu_link().map(|l| l.exists()).unwrap_or(false) } else { !args.no_start_menu },
                         launch: args.launch,
+                        update: args.update,
                         shortcut_desc: text::t(lang, text::T::ShortcutDesc).into(),
                     };
                     exit_code(ops::install(p, &o, &report).map(|_| ()))

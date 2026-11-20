@@ -495,3 +495,45 @@ the size and `tools/art/export.py` writes `res/settings`: each picture in a dark
 version (`NAME.jpg`, `NAME_l.jpg`), and Settings shows the one matching its theme. The Styles page
 got a picture too. VERIFIED in the dark theme on the test desktop; the light theme's pictures are
 checked as images only (this PC runs dark).
+
+## 18. GitHub and updates (2026-11-20)
+
+The code is on GitHub now: `deskboxes/deskboxes` (private) holds the source as one fresh
+commit (no history online; commits use the account's no-reply address), and
+`deskboxes/releases` (public) is where installers go. `tools/release.ps1 -Version X [-Publish]`
+bumps the version, builds the installer and `latest.json`, and with `-Publish` commits, tags
+and pushes the code and creates the public release.
+
+Installed copies update themselves (Settings › General › Updates, on by default, a switch to
+turn it off):
+
+- Two minutes after start and then once a day, Deskboxes reads
+  `https://github.com/deskboxes/releases/releases/latest/download/latest.json` (version, url,
+  SHA-256, size). A newer version's installer is downloaded in the background to
+  `%LOCALAPPDATA%\Deskboxes\update` and kept only if its size and SHA-256 match.
+- The next time Deskboxes starts it runs that installer quietly (`--quiet --update`) before
+  showing anything; the installer keeps "Start with Windows" and the Start menu shortcut as
+  they were and starts Deskboxes again. "Install now" in Settings does the same at once.
+- Only HTTPS to github.com / githubusercontent.com is used (WinHTTP, no new libraries). Only
+  a copy running from its install folder updates; a build-folder copy says so in Settings.
+  An installer that fails twice is not tried again until a newer version appears.
+- Settings shows what it is doing in plain words: up to date, checking, downloading, ready
+  (with Install now), or why a check failed (no connection, nothing published yet, a bad
+  download), plus when it last checked. Check now asks at once.
+
+VERIFIED end to end on this PC with a local feed: 0.1.0 installed quietly into a temp folder,
+a 0.1.1 installer served from 127.0.0.1; the installed copy (on the test desktop) found it,
+downloaded and verified it, showed "Version 0.1.1 is ready"; both "Install now" and "install
+on the next start" put 0.1.1 in place with autostart and Start menu left off; the next start
+removed the downloaded installer; Settings then showed 0.1.1 and "You have the newest
+version". The real GitHub address answers 404 until the first release ("No version has been
+published yet").
+
+Found and fixed during that test: the installer restarted Deskboxes after an update even
+without `--launch` (it saw the copy that was just exiting), which started the test copy on
+the real desktop once; it was stopped within a minute and the real settings put back
+(`enabled: false`). An update now starts Deskboxes only when asked, and `--update` refuses to
+install where nothing is installed.
+
+UNVERIFIED: a download through GitHub's redirect to its file servers (no release exists yet),
+a proxy that needs a password, SmartScreen on the downloaded installer (unsigned).
