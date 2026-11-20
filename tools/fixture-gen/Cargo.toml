@@ -1,0 +1,15 @@
+[package]
+name = "fixture-gen"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Creates and removes exactly N generated desktop items for Deskboxes tests."
+
+[dependencies]
+serde_json = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }

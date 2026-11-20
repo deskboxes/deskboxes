@@ -1,0 +1,18 @@
+[package]
+name = "spike-explorer-command"
+edition.workspace = true
+version.workspace = true
+publish = false
+description = "Throwaway spike (a): activate packaged IExplorerCommand context-menu handlers from an unpackaged process."
+
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = { workspace = true }

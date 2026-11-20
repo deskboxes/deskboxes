@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "spikes/explorer-command",
+    "spikes/desktop-layer",
+    "spikes/hide-icons",
+    "tools/run-as-user",
+    "tools/fixture-gen",
+    "crates/core",
+    "crates/i18n",
+    "crates/ipc",
+    "crates/shell",
+    "crates/render",
+    "crates/desktop",
+    "crates/watchdog",
+    "crates/setup",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+windows = "0.62"
+windows-core = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+deskboxes-core = { path = "crates/core" }
+deskboxes-ipc = { path = "crates/ipc" }
+deskboxes-i18n = { path = "crates/i18n" }
+deskboxes-shell = { path = "crates/shell" }
+deskboxes-render = { path = "crates/render" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"
+panic = "unwind"
+
+[profile.dev.package."*"]
+opt-level = 2

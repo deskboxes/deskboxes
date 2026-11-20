@@ -1,0 +1,328 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;background:#000;overflow:hidden}
+#stage{position:relative;overflow:hidden;transform-origin:0 0}
+.wp{position:absolute;inset:0;background-repeat:no-repeat}
+.abs{position:absolute}
+.ui{font-family:'Segoe UI Variable Text','Segoe UI',sans-serif}
+.gl{font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-style:normal;line-height:1}
+.box{position:absolute;border-radius:var(--r,14px);overflow:hidden;box-shadow:0 28px 70px rgba(0,0,0,var(--sh)),0 3px 10px rgba(0,0,0,.18)}
+.box>.bg{position:absolute;inset:0;backdrop-filter:blur(38px) saturate(1.45);-webkit-backdrop-filter:blur(38px) saturate(1.45)}
+.box>.bd{position:absolute;inset:0;border-radius:var(--r,14px);pointer-events:none}
+.box>.hd{position:absolute;left:0;right:0;top:0;height:58px}
+.ttl{position:absolute;left:0;right:0;top:0;height:58px;display:flex;align-items:center;justify-content:center;font:600 22px 'Segoe UI Variable Display','Segoe UI';letter-spacing:.1px}
+.tabs{position:absolute;left:10px;top:9px;display:flex;gap:6px}
+.tab{height:40px;padding:0 18px;border-radius:9px;display:flex;align-items:center;font:600 20px 'Segoe UI Variable Display','Segoe UI';white-space:nowrap}
+.hbtn{position:absolute;top:9px;width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:19px}
+.grid{position:absolute;left:14px;top:68px;display:grid;grid-auto-rows:134px}
+.it{display:flex;flex-direction:column;align-items:center;padding-top:8px;border-radius:8px;position:relative}
+.it svg{width:76px;height:76px;flex:none}
+.it span{font:400 17.5px 'Segoe UI Variable Text','Segoe UI';text-align:center;line-height:1.22;margin-top:5px;max-width:116px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.desk span{color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.85),0 0 6px rgba(0,0,0,.4)}
+.desk svg{filter:drop-shadow(0 2px 4px rgba(0,0,0,.35))}
+.card{position:absolute;border-radius:12px;backdrop-filter:blur(40px) saturate(1.3);box-shadow:0 24px 60px rgba(0,0,0,.35)}
+.key{display:inline-flex;align-items:center;justify-content:center;min-width:64px;height:64px;padding:0 20px;border-radius:12px;font:600 26px 'Segoe UI Variable Display','Segoe UI';box-sizing:border-box}
+.plus{font:600 30px 'Segoe UI';margin:0 14px;color:#fff;text-shadow:0 2px 6px rgba(0,0,0,.5)}
+</style></head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+ <linearGradient id="gfold" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFD965"/><stop offset="1" stop-color="#F5B132"/></linearGradient>
+ <linearGradient id="gback" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#E9A825"/><stop offset="1" stop-color="#D38F12"/></linearGradient>
+ <linearGradient id="gpage" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#EEF0F3"/></linearGradient>
+ <linearGradient id="gsky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3D8BFF"/><stop offset="1" stop-color="#B9DCFF"/></linearGradient>
+ <linearGradient id="gsky2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF8A3D"/><stop offset="1" stop-color="#FFD39A"/></linearGradient>
+</defs></svg>
+<div id="stage"><div class="wp" id="wp"></div></div>
+<script>
+const P = new URLSearchParams(location.hash.slice(1));
+const SCENE = P.get('scene') || 'tabs', THEME = P.get('theme') || 'dark', THUMB = P.get('thumb') === '1';
+const D = THEME === 'dark';
+const ACC = D ? '#4CC2FF' : '#0067C0';
+const ACCF = D ? 'rgba(76,194,255,' : 'rgba(0,103,192,';
+const FG = D ? '#FFFFFF' : '#1B1B1B';
+
+// ---------- icons (my own drawings, 64x64) ----------
+const page = (badge) => `<svg viewBox="0 0 64 64"><path d="M15 3h24l14 14v42a3 3 0 0 1-3 3H15a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z" fill="url(#gpage)" stroke="rgba(0,0,0,.14)" stroke-width="1"/><path d="M39 3v11a3 3 0 0 0 3 3h11z" fill="#D9DDE3"/>
+<g stroke="#C9CED6" stroke-width="2.4" stroke-linecap="round"><path d="M34 30h12M34 37h12M34 44h12M20 51h26"/></g>${badge}</svg>`;
+const badge = (c, inner) => `<rect x="5" y="26" width="27" height="25" rx="4" fill="${c}"/>${inner}`;
+const linesG = '<g stroke="#fff" stroke-width="2.6" stroke-linecap="round"><path d="M11 33h15M11 38.5h15M11 44h10"/></g>';
+const ICONS = {
+  folder: `<svg viewBox="0 0 64 64"><path d="M5 15a4 4 0 0 1 4-4h15.5a4 4 0 0 1 2.9 1.2l4.3 4.3H55a4 4 0 0 1 4 4V26H5z" fill="url(#gback)"/><path d="M5 23.5a3 3 0 0 1 3-3h48a3 3 0 0 1 3 3V51a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="url(#gfold)"/><path d="M5 25h54" stroke="rgba(255,255,255,.55)" stroke-width="1.5"/></svg>`,
+  folderdoc: `<svg viewBox="0 0 64 64"><path d="M5 15a4 4 0 0 1 4-4h15.5a4 4 0 0 1 2.9 1.2l4.3 4.3H55a4 4 0 0 1 4 4V26H5z" fill="url(#gback)"/><rect x="14" y="14" width="34" height="26" rx="2" fill="#fff"/><path d="M19 21h22M19 26h22M19 31h14" stroke="#9AA3AE" stroke-width="2" stroke-linecap="round"/><path d="M5 23.5a3 3 0 0 1 3-3h48a3 3 0 0 1 3 3V51a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="url(#gfold)" opacity=".96"/></svg>`,
+  doc: page(badge('#2F6FDE', linesG)),
+  sheet: page(badge('#1E8E4E', '<g stroke="#fff" stroke-width="2"><rect x="10" y="31" width="17" height="15" fill="none" rx="1"/><path d="M10 38.5h17M18.5 31v15"/></g>')),
+  slides: page(badge('#E0612B', '<g fill="#fff"><rect x="10" y="40" width="3.5" height="6"/><rect x="16" y="35" width="3.5" height="11"/><rect x="22" y="31" width="3.5" height="15"/></g>')),
+  pdf: page(badge('#D93636', '<text x="18.5" y="43.5" text-anchor="middle" font-family="Segoe UI" font-weight="700" font-size="10.5" fill="#fff">PDF</text>')),
+  txt: `<svg viewBox="0 0 64 64"><path d="M15 3h24l14 14v42a3 3 0 0 1-3 3H15a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z" fill="url(#gpage)" stroke="rgba(0,0,0,.14)"/><path d="M39 3v11a3 3 0 0 0 3 3h11z" fill="#D9DDE3"/><g stroke="#8E96A1" stroke-width="2.4" stroke-linecap="round"><path d="M20 26h24M20 33h24M20 40h24M20 47h16"/></g></svg>`,
+  md: page(badge('#7B4FD6', '<path d="M10 45V33l4.5 5 4.5-5v12M23 33v12m-3.5-3.5L23 45l3.5-3.5" stroke="#fff" stroke-width="2.2" fill="none" stroke-linejoin="round" stroke-linecap="round"/>')),
+  music: page(badge('#B0399A', '<path d="M15 44a3 3 0 1 1-2-2.8V32l11-2.5v11.6a3 3 0 1 1-2-2.8V32.6l-7 1.6z" fill="#fff"/>')),
+  video: page(badge('#6A3DD8', '<path d="M14 32.5v12l10-6z" fill="#fff"/>')),
+  zip: `<svg viewBox="0 0 64 64"><path d="M15 3h24l14 14v42a3 3 0 0 1-3 3H15a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3z" fill="#F4C24A" stroke="rgba(0,0,0,.14)"/><path d="M39 3v11a3 3 0 0 0 3 3h11z" fill="#D9A52C"/><g fill="#7A5A10"><rect x="27" y="6" width="5" height="4"/><rect x="32" y="10" width="5" height="4"/><rect x="27" y="14" width="5" height="4"/><rect x="32" y="18" width="5" height="4"/><rect x="27" y="22" width="5" height="4"/><rect x="27" y="30" width="10" height="12" rx="2"/></g><rect x="29.5" y="35" width="5" height="4" fill="#F4C24A"/></svg>`,
+  img: `<svg viewBox="0 0 64 64"><rect x="5" y="9" width="54" height="46" rx="5" fill="#fff"/><rect x="8" y="12" width="48" height="40" rx="3" fill="url(#gsky)"/><circle cx="44" cy="22" r="5" fill="#FFE27A"/><path d="M8 44l13-14 10 10 7-6 18 15v0a3 3 0 0 1-3 3H11a3 3 0 0 1-3-3z" fill="#1F9E6E"/><path d="M8 47l11-9 12 9 9-6 16 9v1a3 3 0 0 1-3 3H11a3 3 0 0 1-3-3z" fill="#15805A"/></svg>`,
+  img2: `<svg viewBox="0 0 64 64"><rect x="5" y="9" width="54" height="46" rx="5" fill="#fff"/><rect x="8" y="12" width="48" height="40" rx="3" fill="url(#gsky2)"/><circle cx="32" cy="34" r="9" fill="#FFF1C2"/><path d="M8 38h48v11a3 3 0 0 1-3 3H11a3 3 0 0 1-3-3z" fill="#2F7FD0"/><path d="M8 41c8 2 16-2 24 0s16 2 24 0" stroke="#9CD2FF" stroke-width="1.6" fill="none"/></svg>`,
+};
+const APPS = {
+  calc: ['#3A3A3A', '#1F1F1F', ''], term: ['#2B2B2B', '#0C0C0C', ''], note: ['#4DA3FF', '#1C6FD6', ''],
+  photo: ['#3FC0F5', '#1676D9', ''], mail: ['#2E8BEA', '#1255B5', ''], web: ['#29B2A0', '#0C7A8A', ''],
+  music: ['#F25EA0', '#C2287A', ''], set: ['#8A8F99', '#5B606A', ''], cal: ['#4F7DF0', '#2A50C4', ''],
+  game: ['#7FCB3F', '#3E8E1E', ''], chat: ['#7B6CF0', '#4C3DC4', ''], map: ['#F2A33A', '#D06A12', ''],
+};
+function appIcon(k) {
+  const [a, b, g] = APPS[k];
+  return `<svg viewBox="0 0 64 64"><defs><linearGradient id="ga_${k}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${a}"/><stop offset="1" stop-color="${b}"/></linearGradient></defs><rect x="6" y="6" width="52" height="52" rx="13" fill="url(#ga_${k})"/><rect x="6.5" y="6.5" width="51" height="51" rx="12.5" fill="none" stroke="rgba(255,255,255,.22)"/><text x="32" y="43.5" text-anchor="middle" font-family="Segoe Fluent Icons" font-size="27" fill="#fff">${g}</text></svg>`;
+}
+const iconSvg = k => k.startsWith('app:') ? appIcon(k.slice(4)) : ICONS[k];
+
+// ---------- building blocks ----------
+const COLS = { teal: [14, 110, 122], purple: [107, 63, 160], green: [27, 122, 62], amber: [176, 112, 20], rose: [170, 52, 92], blue: [28, 84, 170], slate: [60, 72, 90] };
+function boxBg(tint, op) {
+  if (tint) { const [r, g, b] = COLS[tint]; return D ? `rgba(${r},${g},${b},${op ?? .5})` : `linear-gradient(rgba(${r},${g},${b},${(op ?? .5) * .62}),rgba(${r},${g},${b},${(op ?? .5) * .62})),rgba(255,255,255,.5)`; }
+  return D ? `rgba(28,28,30,${op ?? .56})` : `rgba(246,246,248,${op ?? .66})`;
+}
+function item(k, label, o = {}) {
+  const sel = o.sel ? `background:${ACCF}.30);box-shadow:inset 0 0 0 1.5px ${ACCF}.85);` : o.hover ? `background:${D ? 'rgba(255,255,255,.10)' : 'rgba(0,0,0,.06)'};` : '';
+  const dim = o.dim ? 'opacity:.22;' : '';
+  const lab = o.priv ? `<i style="display:block;height:9px;width:${50 + (label.length * 5) % 40}px;border-radius:5px;margin-top:14px;background:${D ? 'rgba(255,255,255,.55)' : 'rgba(0,0,0,.35)'}"></i>` : `<span>${label}</span>`;
+  const ic = o.priv ? `<div style="width:66px;height:66px;margin:5px;border-radius:12px;border:2.5px dashed ${D ? 'rgba(255,255,255,.55)' : 'rgba(0,0,0,.35)'};box-sizing:border-box"></div>` : `<div style="${o.icf ? 'filter:' + o.icf : ''}">${iconSvg(k)}</div>`;
+  return `<div class="it" style="${sel}${dim}">${ic}${lab}${o.badge || ''}</div>`;
+}
+// A box. o: x,y,cols,rows,title|tabs,active,tint,op,items,hover(header buttons),lock,rolled,w,h,titleStyle,left,folderGlyph,back,outline,extra
+function box(o) {
+  const cols = o.cols || 4, rows = o.rows || 1;
+  const w = o.w || 28 + cols * 124, h = o.rolled ? 58 : (o.h || 68 + rows * 134 + 10);
+  const light = !D && !o.forceDark;
+  const fg = o.fg || (light ? '#1B1B1B' : '#FFFFFF');
+  const band = o.band ?? (light ? 'rgba(0,0,0,.045)' : 'rgba(0,0,0,.22)');
+  const line = o.outline || (light ? 'rgba(0,0,0,.10)' : 'rgba(255,255,255,.14)');
+  const ow = o.outlineW || 1.5;
+  let head = '';
+  const right = [];
+  if (o.hover) right.push('', '');
+  if (o.lock) right.push('');
+  if (o.btns) right.push(...o.btns);
+  if (o.tabs) {
+    head = `<div class="tabs">` + o.tabs.map((t, i) => {
+      const [name, col] = Array.isArray(t) ? t : [t, null];
+      const act = i === (o.active || 0);
+      let bg = 'transparent', c = fg, op = act ? 1 : .68;
+      if (col) { const [r, g, b] = COLS[col]; bg = act ? `rgba(${r},${g},${b},.9)` : `rgba(${r},${g},${b},${o.tabHover === i ? .62 : .42})`; c = '#fff'; op = act ? 1 : .9; }
+      else if (act) bg = light ? 'rgba(0,0,0,.08)' : 'rgba(0,0,0,.34)';
+      else if (o.tabHover === i) bg = light ? 'rgba(0,0,0,.05)' : 'rgba(255,255,255,.08)';
+      return `<div class="tab" style="background:${bg};color:${c};opacity:${op}">${name}</div>`;
+    }).join('') + `</div>`;
+  } else {
+    const al = o.left ? `justify-content:flex-start;padding-left:${o.folderGlyph || o.back ? 58 : 20}px;` : '';
+    const tf = o.titleFont ? `font-family:${o.titleFont};` : '';
+    const tw = o.titleWeight ? `font-weight:${o.titleWeight};` : '';
+    head = `<div class="ttl" style="color:${fg};${al}${tf}${tw}">${o.title}</div>`;
+    if (o.folderGlyph || o.back) head += `<div class="hbtn gl" style="left:9px;color:${fg};${o.back ? `background:${light ? 'rgba(0,0,0,.06)' : 'rgba(255,255,255,.10)'};opacity:1` : 'opacity:.62'}">${o.back ? '' : ''}</div>`;
+  }
+  head += right.reverse().map((g, i) => `<div class="hbtn gl" style="right:${8 + i * 44}px;color:${fg};opacity:${g === '' ? .7 : .78};${o.btnHover === g ? `background:${light ? 'rgba(0,0,0,.06)' : 'rgba(255,255,255,.12)'};opacity:1` : ''}">${g}</div>`).join('');
+  const items = o.rolled ? '' : `<div class="grid ${light ? '' : 'desk'}" style="grid-template-columns:repeat(${cols},124px);${o.gridTop ? 'top:' + o.gridTop + 'px;' : ''}${light ? `color:${fg}` : ''}">${(o.items || []).map(a => item(a[0], a[1], a[2] || {})).join('')}</div>`;
+  return `<div class="box ui" style="left:${o.x}px;top:${o.y}px;width:${w}px;height:${h}px;--sh:${o.shadow ?? (D ? .42 : .22)};${o.r !== undefined ? '--r:' + o.r + 'px;' : ''}${o.style || ''}">
+   <div class="bg" style="background:${boxBg(o.tint, o.op)}"></div>
+   ${o.rolled ? '' : `<div class="hd" style="background:${band}"></div>`}
+   ${head}${items}${o.extra || ''}
+   <div class="bd" style="box-shadow:inset 0 0 0 ${ow}px ${line}"></div></div>`;
+}
+function cursor(x, y, s = 1.7) {
+  return `<svg class="abs" style="left:${x}px;top:${y}px;width:${22 * s}px;height:${32 * s}px;filter:drop-shadow(0 3px 4px rgba(0,0,0,.45));z-index:50" viewBox="0 0 22 32"><path d="M1.5 1.5v24.2l6.2-6 4.3 9.6 4-1.8-4.2-9.4h8.6z" fill="#fff" stroke="#111" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+}
+function ripple(x, y) {
+  return `<div class="abs" style="left:${x - 34}px;top:${y - 34}px;width:68px;height:68px;border-radius:50%;border:3px solid rgba(255,255,255,.9);box-shadow:0 0 18px rgba(255,255,255,.5);z-index:49"></div>
+  <div class="abs" style="left:${x - 54}px;top:${y - 54}px;width:108px;height:108px;border-radius:50%;border:2px solid rgba(255,255,255,.45);z-index:49"></div>`;
+}
+function key(t, wide) {
+  const k = D ? 'background:linear-gradient(#3A3A3E,#2A2A2E);color:#fff;box-shadow:0 5px 0 #18181A,0 10px 24px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.15)' : 'background:linear-gradient(#FFFFFF,#ECECEF);color:#1B1B1B;box-shadow:0 5px 0 #BDBDC4,0 10px 24px rgba(0,0,0,.25),inset 0 1px 0 #fff';
+  return `<div class="key" style="${k};${wide ? 'min-width:' + wide + 'px' : ''}">${t}</div>`;
+}
+function card(x, y, w, h, inner, extra = '') {
+  return `<div class="card ui" style="left:${x}px;top:${y}px;width:${w}px;height:${h}px;background:${D ? 'rgba(40,40,44,.78)' : 'rgba(252,252,253,.82)'};box-shadow:0 24px 60px rgba(0,0,0,${D ? .45 : .2}),inset 0 0 0 1px ${D ? 'rgba(255,255,255,.10)' : 'rgba(0,0,0,.07)'};color:${FG};${extra}">${inner}</div>`;
+}
+function badgeCircle(x, y, glyph, size = 96) {
+  return `<div class="abs gl" style="left:${x}px;top:${y}px;width:${size}px;height:${size}px;border-radius:50%;background:${ACC};color:${D ? '#00243A' : '#fff'};display:flex;align-items:center;justify-content:center;font-size:${size * .45}px;box-shadow:0 14px 36px rgba(0,0,0,.4),0 0 0 6px ${D ? 'rgba(76,194,255,.22)' : 'rgba(0,103,192,.18)'};z-index:40">${glyph}</div>`;
+}
+function arrow(x1, y1, x2, y2, bend = -120, dashed = true) {
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 + bend;
+  const ang = Math.atan2(y2 - my, x2 - mx);
+  const a1 = ang + 2.6, a2 = ang - 2.6, L = 22;
+  return `<svg class="abs nofit" style="left:0;top:0;width:100%;height:100%;z-index:45;overflow:visible;filter:drop-shadow(0 2px 6px rgba(0,0,0,.4))"><path d="M${x1} ${y1}Q${mx} ${my} ${x2} ${y2}" fill="none" stroke="${ACC}" stroke-width="5" stroke-linecap="round" ${dashed ? 'stroke-dasharray="14 12"' : ''}/><path d="M${x2 + L * Math.cos(a1)} ${y2 + L * Math.sin(a1)}L${x2} ${y2}L${x2 + L * Math.cos(a2)} ${y2 + L * Math.sin(a2)}" fill="none" stroke="${ACC}" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+// ---------- item sets ----------
+const DOCS = [['doc', 'Report.docx'], ['doc', 'Cover letter.docx'], ['slides', 'Pitch.pptx'], ['pdf', 'Manual.pdf'], ['txt', 'Notes.txt'], ['pdf', 'Contract.pdf'], ['md', 'Plan.md'], ['doc', 'Resume.docx']];
+const SHEETS = [['sheet', 'Budget.xlsx'], ['sheet', 'Sales Q3.xlsx'], ['sheet', 'Data.csv']];
+const APPL = [['app:calc', 'Calculator'], ['app:term', 'Terminal'], ['app:note', 'Notepad'], ['app:photo', 'Photos'], ['app:mail', 'Mail'], ['app:web', 'Browser'], ['app:music', 'Music'], ['app:set', 'Settings']];
+const MEDIA = [['img', 'Holiday.png'], ['img2', 'Beach.jpg'], ['music', 'Song.mp3'], ['video', 'Clip.mp4'], ['music', 'Podcast.mp3'], ['img', 'Hiking.png']];
+const FOLD = ['Archive', 'Invoices', 'Music', 'Photos', 'Projects', 'Recipes', 'School', 'Travel'].map(n => ['folder', n]);
+
+// ---------- scenes (1600x900 unless set) ----------
+// wp: [size, x, y] of the wallpaper; focus: [x, y, zoom] for the Home tile close-up.
+const S = {};
+S.home = () => ({ w: 1920, h: 534, wp: [2300, -360, -560], html:
+  box({ x: 990, y: 52, cols: 3, rows: 2, tabs: [['Documents'], ['Sheets', 'green']], items: DOCS }) +
+  box({ x: 1416, y: 52, cols: 2, rows: 2, title: 'Apps', tint: 'teal', items: APPL.slice(0, 4) }) +
+  box({ x: 990, y: 424, w: 400, title: 'Archives', rolled: true }) +
+  box({ x: 1416, y: 424, w: 276, title: 'Media', rolled: true, tint: 'purple' }) });
+S.tabs = () => ({ wp: [2300, -420, -360], focus: [140, 110, 1.55], html:
+  box({ x: 150, y: 120, cols: 5, rows: 2, tabs: [['Documents'], ['Spreadsheets', 'green'], ['Slides', 'amber']], tabHover: 1, hover: true, items: DOCS.slice(0, 7).concat([['slides', 'Pitch v2.pptx'], ['doc', 'Letter.docx'], ['txt', 'Ideas.txt']]) }) +
+  box({ x: 880, y: 300, cols: 4, rows: 2, tabs: [['Photos', 'purple'], ['Music'], ['Videos']], items: MEDIA.concat([['img2', 'Sunset.jpg'], ['img', 'Lake.png']]) }) +
+  cursor(470, 162) });
+S.rollup = () => ({ wp: [2300, -300, -420], focus: [700, 120, 1.5], html:
+  box({ x: 140, y: 160, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL }) +
+  box({ x: 760, y: 160, w: 600, title: 'Archives', rolled: true, btns: [''], btnHover: '' }) +
+  box({ x: 760, y: 244, w: 600, title: 'Games', rolled: true, tint: 'purple' }) +
+  box({ x: 760, y: 328, w: 600, cols: 4, rows: 1, title: 'Media', btns: [''], items: MEDIA.slice(0, 4) }) +
+  cursor(1290, 196) });
+S.rules = () => ({ wp: [2300, -500, -300], focus: [200, 120, 1.35], html:
+  `<div class="abs desk ui" style="left:150px;top:150px;width:124px">${item('pdf', 'Invoice 042.pdf', { sel: true })}</div>` +
+  `<div class="abs" style="left:250px;top:150px;width:22px;height:22px;border-radius:50%;background:${ACC};box-shadow:0 0 0 5px ${ACCF}.3)"></div>` +
+  arrow(300, 230, 790, 380, -170) +
+  box({ x: 820, y: 170, cols: 4, rows: 2, title: 'Invoices', items: [['pdf', 'Invoice 039.pdf'], ['pdf', 'Invoice 040.pdf'], ['pdf', 'Invoice 041.pdf'], ['pdf', 'Invoice 042.pdf', { sel: true }], ['sheet', 'Taxes.xlsx'], ['pdf', 'Receipt.pdf']] }) +
+  card(150, 560, 560, 150, `<div style="display:flex;align-items:center;height:100%;padding:0 30px;gap:22px;font:600 26px 'Segoe UI Variable Display'">
+    <div class="gl" style="width:60px;height:60px;border-radius:12px;background:${ACCF}.18);color:${ACC};display:flex;align-items:center;justify-content:center;font-size:28px"></div>
+    <div style="flex:1;display:flex;align-items:center;gap:16px"><span style="font-family:Consolas,monospace;font-weight:600">*.pdf</span><span class="gl" style="font-size:22px;opacity:.7"></span><span>Invoices</span></div>
+    <div style="width:64px;height:32px;border-radius:16px;background:${ACC};position:relative"><div style="position:absolute;right:6px;top:6px;width:20px;height:20px;border-radius:50%;background:${D ? '#00243A' : '#fff'}"></div></div></div>`) });
+S.az = () => {
+  const L = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', have = 'AMPRST';
+  const strip = `<div class="abs" style="left:0;right:0;top:62px;display:flex;justify-content:center;gap:2px;font:600 19px 'Segoe UI Variable Display'">` +
+    [...L].map(c => `<div style="width:30px;height:34px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:${c === 'P' ? (D ? '#00243A' : '#fff') : FG};background:${c === 'P' ? ACC : 'transparent'};opacity:${have.includes(c) ? 1 : .3}">${c}</div>`).join('') + `</div>`;
+  const g = [['A', ['Archive', 'Art']], ['M', ['Music', 'Movies']], ['P', ['Photos', 'Projects', 'Podcasts']], ['R', ['Recipes']], ['S', ['School', 'Scans']], ['T', ['Taxes', 'Travel', 'Trips']]];
+  const items = [];
+  g.forEach(([c, ns]) => ns.forEach((n, i) => items.push(['folder', n, { badge: i ? '' : `<b style="position:absolute;left:4px;top:0;font:700 18px 'Segoe UI Variable Display';color:${c === 'P' ? ACC : FG};opacity:.9">${c}</b>`, sel: c === 'P' && i === 0 }])));
+  return { wp: [2300, -350, -330], focus: [280, 130, 1.5], html: box({ x: 270, y: 150, cols: 7, rows: 2, h: 68 + 46 + 2 * 134 + 12, gridTop: 112, title: 'Folders', extra: strip, items: items.slice(0, 13) }) + cursor(808, 238) };
+};
+S.folder = () => ({ wp: [2300, -380, -320], focus: [100, 150, 1.45], html:
+  box({ x: 100, y: 190, cols: 4, rows: 2, title: 'Projects', left: true, folderGlyph: true, items: [['folder', 'App', { sel: true }], ['folder', 'Website'], ['folder', 'Photos 2026'], ['folderdoc', 'Docs'], ['sheet', 'Budget 2.xlsx'], ['sheet', 'Budget 10.xlsx'], ['txt', 'Notes.txt'], ['slides', 'Timeline.pptx']] }) +
+  ripple(176, 300) + cursor(170, 296) +
+  `<div class="abs gl" style="left:676px;top:345px;width:90px;height:90px;border-radius:50%;background:${D ? 'rgba(255,255,255,.16)' : 'rgba(255,255,255,.7)'};backdrop-filter:blur(20px);display:flex;align-items:center;justify-content:center;font-size:38px;color:${FG};box-shadow:0 10px 30px rgba(0,0,0,.3)"></div>` +
+  box({ x: 870, y: 190, cols: 4, rows: 2, title: 'App', left: true, back: true, items: [['folder', 'src'], ['folder', 'assets'], ['txt', 'Cargo.toml'], ['md', 'README.md'], ['txt', 'main.rs'], ['txt', '.gitignore']] }) });
+S.above = () => {
+  const win = `<div class="abs ui" style="left:420px;top:60px;width:1120px;height:780px;border-radius:12px;overflow:hidden;background:${D ? '#202020' : '#FAFAFA'};box-shadow:0 30px 80px rgba(0,0,0,.5),inset 0 0 0 1px ${D ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.1)'}">
+    <div style="height:52px;display:flex;align-items:center;padding-left:20px;gap:14px;color:${FG};font:400 18px 'Segoe UI'"><span class="gl" style="color:${ACC};font-size:20px"></span><span style="opacity:.85">Quarterly report</span>
+      <span class="gl" style="margin-left:auto;font-size:14px;width:64px;text-align:center;opacity:.8"></span><span class="gl" style="font-size:14px;width:64px;text-align:center;opacity:.8"></span><span class="gl" style="font-size:14px;width:64px;text-align:center;opacity:.8"></span></div>
+    <div style="height:48px;background:${D ? '#2B2B2B' : '#F0F0F0'}"></div>
+    <div style="position:absolute;left:150px;right:150px;top:140px;bottom:0;background:${D ? '#2C2C2C' : '#fff'};box-shadow:0 0 0 1px ${D ? '#333' : '#e5e5e5'};padding:60px 80px">
+      ${[90, 100, 96, 70, 0, 100, 92, 98, 60, 0, 85, 100, 40].map(w => `<div style="height:${w ? 14 : 22}px;margin-bottom:14px;border-radius:7px;width:${w}%;background:${w ? (D ? '#4A4A4A' : '#DADADA') : 'transparent'}"></div>`).join('')}
+    </div></div>
+    <div class="abs" style="left:420px;top:60px;width:1120px;height:780px;border-radius:12px;background:rgba(0,0,0,${D ? .45 : .32})"></div>`;
+  return { wp: [2300, -400, -380], focus: [170, 120, 1.4], html: win +
+    box({ x: 150, y: 150, cols: 4, rows: 2, tabs: [['Documents'], ['Spreadsheets', 'green']], items: DOCS, shadow: .6 }) +
+    box({ x: 740, y: 150, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL, shadow: .6 }) +
+    box({ x: 150, y: 530, cols: 4, rows: 1, title: 'Folders', items: FOLD, shadow: .6 }) +
+    `<div class="abs" style="left:760px;width:620px;top:610px;display:flex;justify-content:center;align-items:center">${key('Win', 96)}<span class="plus">+</span>${key('Shift', 120)}<span class="plus">+</span>${key('D')}</div>` };
+};
+S.hide = () => ({ wp: [2300, -330, -350], focus: [470, 160, 1.35], html:
+  `<div class="abs" style="left:0;top:0;width:800px;height:900px;overflow:hidden">` +
+  box({ x: 130, y: 130, cols: 4, rows: 2, tabs: [['Documents'], ['Spreadsheets', 'green']], items: DOCS }) +
+  box({ x: 130, y: 500, cols: 4, rows: 1, title: 'Folders', items: FOLD }) +
+  box({ x: 560, y: 130, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL }) + `</div>` +
+  `<div class="abs" style="left:800px;top:0;width:800px;height:900px;overflow:hidden">` +
+  `<div style="position:absolute;left:0;top:0;width:800px;height:900px;opacity:.12">` + box({ x: -240, y: 130, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL }) + `</div></div>` +
+  `<div class="abs" style="left:798px;top:0;width:4px;height:900px;background:rgba(255,255,255,.85);box-shadow:0 0 20px rgba(0,0,0,.4)"></div>` +
+  ripple(1160, 600) + cursor(1154, 596) });
+S.saved = () => {
+  const mini = (k, rot, x, y, label, z) => {
+    const L = [[[.06, .08, .3, .4], [.4, .08, .28, .4], [.06, .56, .4, .26]], [[.06, .08, .42, .3], [.54, .08, .3, .55], [.06, .45, .3, .3]], [[.1, .1, .25, .7], [.4, .1, .5, .3], [.4, .48, .3, .3]]][k];
+    return `<div class="abs" style="left:${x}px;top:${y}px;width:640px;height:420px;transform:rotate(${rot}deg);z-index:${z};border-radius:16px;overflow:hidden;box-shadow:0 30px 70px rgba(0,0,0,.45),inset 0 0 0 2px rgba(255,255,255,.35);background:url(wp_${THEME}.jpg) ${-200 - k * 120}px ${-260 - k * 60}px/1300px auto">` +
+      L.map(([a, b, c, d], i) => `<div style="position:absolute;left:${a * 100}%;top:${b * 100}%;width:${c * 100}%;height:${d * 100}%;border-radius:8px;background:${i === 1 && k === 0 ? 'rgba(14,110,122,.6)' : D ? 'rgba(28,28,30,.6)' : 'rgba(246,246,248,.7)'};backdrop-filter:blur(10px);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);border-top:12px solid rgba(0,0,0,.18);background-image:radial-gradient(circle at 50% 50%,rgba(255,255,255,.62) 0 5px,transparent 6px);background-size:44px 40px;background-position:6px 8px;background-clip:content-box;box-sizing:border-box;padding:4px"></div>`).join('') +
+      `<div class="ui" style="position:absolute;left:18px;bottom:16px;padding:8px 16px;border-radius:10px;background:${D ? 'rgba(20,20,22,.8)' : 'rgba(255,255,255,.88)'};color:${FG};font:600 22px 'Segoe UI Variable Display';display:flex;gap:10px;align-items:center"><span class="gl" style="color:${ACC}"></span>${label}</div></div>`;
+  };
+  return { wp: [2300, -360, -300], focus: [420, 160, 1.3], html:
+    mini(2, -7, 220, 250, '2026-11-18', 1) + mini(1, -2.5, 470, 190, '2026-11-19', 2) + mini(0, 2.5, 760, 220, '2026-11-20  12:40', 3) +
+    badgeCircle(1330, 170, '', 110) };
+};
+S.search = () => ({ wp: [2300, -380, -330], focus: [250, 160, 1.35], html:
+  box({ x: 110, y: 90, cols: 4, rows: 2, tabs: [['Documents'], ['Spreadsheets', 'green']], items: DOCS.map(a => [a[0], a[1], { dim: true }]) }) +
+  box({ x: 690, y: 90, cols: 3, rows: 2, title: 'Apps', tint: 'teal', items: APPL.slice(0, 6).map(a => [a[0], a[1], { dim: true }]) }) +
+  box({ x: 110, y: 470, cols: 4, rows: 1, title: 'Folders', items: [['folder', 'Archive', { dim: true }], ['folder', 'Invoices', { sel: true }], ['folder', 'Music', { dim: true }], ['folder', 'Photos', { dim: true }]] }) +
+  `<div class="abs desk ui" style="left:1190px;top:110px;width:124px">${item('pdf', 'Invoice 041.pdf', { sel: true })}</div>` +
+  `<div class="abs desk ui" style="left:1190px;top:250px;width:124px">${item('txt', 'Ideas.txt', { dim: true })}</div>` +
+  `<div class="abs ui" style="left:560px;top:730px;width:480px;height:66px;border-radius:33px;backdrop-filter:blur(30px) saturate(1.4);background:${D ? 'rgba(32,32,34,.78)' : 'rgba(255,255,255,.85)'};box-shadow:0 18px 50px rgba(0,0,0,.4),inset 0 0 0 1.5px ${ACC};display:flex;align-items:center;padding:0 28px;gap:16px;color:${FG};font:400 25px 'Segoe UI Variable Text'"><span class="gl" style="font-size:22px;opacity:.8"></span><span>inv<span style="display:inline-block;width:2px;height:28px;background:${FG};vertical-align:-5px;margin-left:2px"></span></span><span style="margin-left:auto;opacity:.6;font-size:20px">1 / 2</span></div>` });
+S.locks = () => ({ wp: [2300, -420, -300], focus: [260, 110, 1.4], html:
+  box({ x: 260, y: 150, cols: 5, rows: 2, title: 'Work', lock: true, items: DOCS.concat([['sheet', 'Budget.xlsx'], ['sheet', 'Data.csv']]), style: 'z-index:2' }) +
+  `<div class="abs" style="left:300px;top:200px;width:648px;height:346px;border-radius:14px;border:3px dashed ${D ? 'rgba(255,255,255,.5)' : 'rgba(255,255,255,.85)'};z-index:1"></div>` +
+  badgeCircle(860, 100, '', 104) +
+  box({ x: 1000, y: 330, cols: 3, rows: 2, title: 'Apps', tint: 'teal', items: APPL.slice(0, 6) }) +
+  `<div class="abs gl" style="left:932px;top:520px;width:44px;height:44px;border-radius:50%;background:#C42B1C;color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;z-index:60;box-shadow:0 6px 16px rgba(0,0,0,.4)"></div>` + cursor(905, 488) });
+S.privacy = () => ({ wp: [2300, -360, -380], focus: [150, 120, 1.4], html:
+  box({ x: 140, y: 130, cols: 4, rows: 2, tabs: [['————'], ['———', 'green']], items: DOCS.map(a => [a[0], a[1], { priv: true }]) }) +
+  box({ x: 720, y: 130, cols: 4, rows: 2, title: '————', tint: 'teal', items: APPL.map(a => [a[0], a[1], { priv: true }]) }) +
+  box({ x: 140, y: 510, cols: 4, rows: 1, title: '—————', items: FOLD.slice(0, 4).map(a => [a[0], a[1], { priv: true }]) }) +
+  badgeCircle(1300, 560, '', 120) });
+S.boxes = () => ({ wp: [2300, -300, -380], focus: [90, 90, 1.4], html:
+  box({ x: 90, y: 90, cols: 4, rows: 2, tabs: [['Documents'], ['Spreadsheets', 'green']], items: DOCS }) +
+  box({ x: 670, y: 90, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL }) +
+  box({ x: 1250, y: 90, cols: 2, rows: 2, w: 280, title: 'Media', tint: 'purple', items: MEDIA.slice(0, 4) }) +
+  box({ x: 90, y: 470, cols: 5, rows: 1, title: 'Folders', items: FOLD.slice(0, 5) }) +
+  box({ x: 800, y: 470, w: 480, title: 'Archives', rolled: true }) +
+  box({ x: 800, y: 550, w: 480, title: 'Games', rolled: true, tint: 'slate' }) });
+S.colors = () => {
+  const sw = ['teal', 'purple', 'green', 'amber', 'rose', 'blue', 'slate'];
+  const pal = card(760, 600, 600, 120, `<div style="display:flex;align-items:center;justify-content:center;gap:18px;height:100%">` + sw.map(c => { const [r, g, b] = COLS[c]; return `<div style="width:56px;height:56px;border-radius:50%;background:rgb(${r},${g},${b});box-shadow:${c === 'purple' ? `0 0 0 4px ${D ? '#2B2B2E' : '#fff'},0 0 0 7px ${ACC}` : 'inset 0 0 0 2px rgba(255,255,255,.25)'}"></div>`; }).join('') + `</div>`);
+  return { wp: [2300, -440, -300], focus: [140, 110, 1.4], html:
+    box({ x: 140, y: 110, cols: 4, rows: 2, title: 'Apps', tint: 'teal', items: APPL }) +
+    box({ x: 720, y: 110, cols: 3, rows: 2, title: 'Media', tint: 'purple', items: MEDIA }) +
+    box({ x: 1170, y: 110, cols: 2, rows: 2, w: 300, title: 'Money', tint: 'green', items: SHEETS.concat([['pdf', 'Invoice.pdf']]) }) +
+    box({ x: 140, y: 480, cols: 4, rows: 1, title: 'Travel', tint: 'amber', items: [['img2', 'Beach.jpg'], ['pdf', 'Tickets.pdf'], ['img', 'Map.png'], ['doc', 'Plan.docx']] }) +
+    pal + cursor(905, 655) };
+};
+S.icons = () => {
+  const ap = APPL.slice(0, 6), fo = FOLD.slice(0, 6);
+  const TINT = 'grayscale(1) sepia(1) hue-rotate(165deg) saturate(2.6)';
+  const BLEND = `grayscale(1) brightness(${D ? 2.4 : 1.25}) contrast(.7) opacity(.55)`;
+  const half = (clip, f, op) => `<div class="abs" style="inset:0;clip-path:${clip}">` +
+    box({ x: 414, y: 130, cols: 6, rows: 1, title: 'Apps', op, band: op !== undefined ? 'transparent' : undefined, items: ap.map(a => [a[0], a[1], { icf: f }]) }) +
+    box({ x: 414, y: 440, cols: 6, rows: 1, title: 'Folders', op, band: op !== undefined ? 'transparent' : undefined, items: fo.map(a => [a[0], a[1], { icf: f }]) }) + `</div>`;
+  return { wp: [2300, -380, -360], html: half('inset(0 800px 0 0)', TINT) + half('inset(0 0 0 800px)', BLEND, .1) +
+    `<div class="abs" style="left:798px;top:0;width:4px;height:900px;background:rgba(255,255,255,.85);box-shadow:0 0 20px rgba(0,0,0,.4)"></div>` };
+};
+S.look = () => ({ wp: [2300, -420, -330], focus: [120, 100, 1.4], html:
+  box({ x: 120, y: 110, cols: 4, rows: 1, title: 'Documents', titleFont: 'Georgia, serif', titleWeight: 700, outline: ACC, outlineW: 3, items: DOCS.slice(0, 4) }) +
+  box({ x: 700, y: 110, cols: 4, rows: 1, title: 'Apps', left: true, tint: 'teal', fg: '#fff', band: 'rgba(14,110,122,.85)', outline: 'rgba(14,110,122,1)', outlineW: 3, r: 4, items: APPL.slice(0, 4) }) +
+  box({ x: 120, y: 420, cols: 5, rows: 2, title: 'Projects', titleWeight: 400, hover: true, btns: ['', ''], btnHover: '', r: 22, items: FOLD.slice(0, 5).concat(DOCS.slice(0, 5)) }) +
+  cursor(560, 440) + box({ x: 790, y: 420, cols: 4, rows: 2, title: 'Media', tint: 'purple', titleFont: "'Segoe Print'", outline: 'rgba(255,255,255,.75)', outlineW: 2, items: MEDIA }) });
+
+// ---------- render ----------
+const sc = S[SCENE]();
+const FOCUS = { tabs: [130, 95, 720, 405], rollup: [700, 120, 740, 416], az: [470, 120, 700, 394], folder: [80, 150, 760, 428], locks: [230, 70, 840, 473],
+  above: [130, 110, 1150, 647], hide: [300, 100, 1000, 563], saved: [180, 120, 1260, 709], icons: [400, 100, 800, 450], privacy: [120, 110, 1180, 664] };
+const NOFIT = ['home', 'hide', 'icons', 'above', 'saved'];
+const W = sc.w || 1600, H = sc.h || 900;
+const st = document.getElementById('stage');
+st.style.width = W + 'px'; st.style.height = H + 'px';
+const [ws, wx, wy] = sc.wp;
+const wpEl = document.getElementById('wp');
+wpEl.style.backgroundImage = `url(wp_${THEME}.jpg)`;
+wpEl.style.backgroundSize = ws + 'px auto';
+wpEl.style.backgroundPosition = `${wx}px ${wy}px`;
+st.insertAdjacentHTML('beforeend', `<div id="content" style="position:absolute;left:0;top:0;width:${W}px;height:${H}px;transform-origin:0 0">${sc.html}</div>`);
+const content = document.getElementById('content');
+// Frame the scene: its contents (or, for a Home tile, the part that shows the feature) fill the picture.
+let rect = null, fill = .88;
+if (THUMB && FOCUS[SCENE]) { rect = FOCUS[SCENE]; fill = 1; }
+// Page pictures are small too: these show the close-up with a little more around it.
+else if (['tabs', 'rollup', 'az', 'locks'].includes(SCENE)) { rect = FOCUS[SCENE]; fill = .9; }
+else if (!NOFIT.includes(SCENE)) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const el of content.children) {
+    if (el.classList.contains('nofit')) continue;
+    const r = el.getBoundingClientRect();
+    if (!r.width) continue;
+    x0 = Math.min(x0, r.left); y0 = Math.min(y0, r.top); x1 = Math.max(x1, r.right); y1 = Math.max(y1, r.bottom);
+  }
+  rect = [x0, y0, x1 - x0, y1 - y0];
+  if (THUMB) fill = .97;
+}
+if (rect) {
+  const [x, y, w, h] = rect;
+  const k = Math.min(fill * W / w, fill * H / h, 1.9);
+  const tx = W / 2 - (x + w / 2) * k, ty = H / 2 - (y + h / 2) * k;
+  content.style.transform = `translate(${tx}px,${ty}px) scale(${k})`;
+  // The wallpaper zooms a little with it, as a camera moving closer.
+  const z = 1 + (k - 1) * .35;
+  wpEl.style.backgroundSize = ws * z + 'px auto';
+  wpEl.style.backgroundPosition = `${wx * z + (1 - z) * W / 2}px ${wy * z + (1 - z) * H / 2}px`;
+}
+</script></body></html>

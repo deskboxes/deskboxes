@@ -1,0 +1,18 @@
+/target/
+**/target/
+/out/
+/shellhost/packages/
+/shellhost/x64/
+/shellhost/Generated Files/
+/shellhost/**/bin/
+/shellhost/**/obj/
+*.user
+*.vcxproj.filters.user
+.vs/
+*.log
+/fixtures/
+/docs/fidelity/raw/
+# Menu captures taken on the developer's own desktop: kept on that PC only.
+/docs/fidelity/explorer/*.png
+/docs/fidelity/deskboxes-view/*.png
+/shellhost/obj/

@@ -1,0 +1,237 @@
+﻿{
+  "case": "desktop_background",
+  "appearedMs": 729,
+  "rowPosition": "none",
+  "row": [],
+  "list": [
+    {
+      "group": "list",
+      "name": "View",
+      "id": "view",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 812,
+      "y": 259,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Sort by",
+      "id": "arrange",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 812,
+      "y": 291,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Refresh",
+      "id": "refresh",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 323,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "New",
+      "id": "New",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 812,
+      "y": 364,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Display settings",
+      "id": "Display",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 405,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Personalize",
+      "id": "Personalize",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 437,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Open in Terminal",
+      "id": "{EB9DD180-53C8-4E8E-B61F-36FDD0D0CD13}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 478,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Open in Terminal",
+      "id": "{9F156763-7844-4DC4-B2B1-901F640F5155}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 510,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "App extensions",
+      "id": "Windows.ExtensionsFlyout",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 812,
+      "y": 542,
+      "w": 178,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Customize menu",
+      "id": "Windows.CustomizeMenu",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 812,
+      "y": 583,
+      "w": 178,
+      "h": 32
+    }
+  ],
+  "escapeClosed": true,
+  "submenus": {
+    "New": [
+      {
+        "name": "Folder",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Shortcut",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Microsoft Word Document",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Microsoft PowerPoint Presentation",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Windows PowerShell Script",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Python.File",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Text Document",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Microsoft Excel Worksheet",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Compressed (zipped) Folder",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      }
+    ],
+    "Windows.ExtensionsFlyout": [
+      {
+        "name": "AMD Software: Adrenalin Edition",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Rename with PowerRename",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Manage extensions",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      }
+    ]
+  }
+}

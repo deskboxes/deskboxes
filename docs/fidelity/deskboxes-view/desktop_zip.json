@@ -1,0 +1,282 @@
+﻿{
+  "case": "desktop_zip",
+  "appearedMs": 720,
+  "rowPosition": "top",
+  "row": [
+    {
+      "group": "row",
+      "name": "Cut",
+      "id": "cut",
+      "accel": "Ctrl+X",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Copy",
+      "id": "copy",
+      "accel": "Ctrl+C",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 808,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Rename",
+      "id": "rename",
+      "accel": "F2",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 873,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Share",
+      "id": "Windows.ModernShare",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 938,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Delete",
+      "id": "delete",
+      "accel": "Delete",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 1003,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    }
+  ],
+  "list": [
+    {
+      "group": "list",
+      "name": "Open",
+      "id": "open",
+      "accel": "Enter",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 304,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Open with",
+      "id": "openas",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 743,
+      "y": 336,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Copy as path",
+      "id": "copyaspath",
+      "accel": "Ctrl+Shift+C",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 368,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Compress to",
+      "id": "Windows.CompressTo",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 743,
+      "y": 400,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Pin to Start",
+      "id": "PinToStartScreen",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 432,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Add to Favorites",
+      "id": "pintohomefile",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 464,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Properties",
+      "id": "properties",
+      "accel": "Alt+Enter",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 496,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Open in Terminal",
+      "id": "{EB9DD180-53C8-4E8E-B61F-36FDD0D0CD13}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 537,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "NanaZip",
+      "id": "{CAE3F1D4-7765-4D98-A060-52CD14D56EAB}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 743,
+      "y": 569,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "App extensions",
+      "id": "Windows.ExtensionsFlyout",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 743,
+      "y": 601,
+      "w": 316,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Customize menu",
+      "id": "Windows.CustomizeMenu",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 743,
+      "y": 642,
+      "w": 316,
+      "h": 32
+    }
+  ],
+  "escapeClosed": true,
+  "submenus": {
+    "openas": [
+      {
+        "name": "NanaZip",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Windows Explorer",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Search the Microsoft Store",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Choose another app",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      }
+    ],
+    "Windows.ExtensionsFlyout": [
+      {
+        "name": "Edit with Notepad++",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Unlock with File Locksmith",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Rename with PowerRename",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Manage extensions",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      }
+    ]
+  }
+}

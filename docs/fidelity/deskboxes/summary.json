@@ -1,0 +1,218 @@
+[
+  {
+    "Case": "pdf",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 49.2,
+    "ColdMs": 592.3,
+    "Elevated": false
+  },
+  {
+    "Case": "xlsx",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 59.0,
+    "ColdMs": 600.1,
+    "Elevated": false
+  },
+  {
+    "Case": "docx",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 56.7,
+    "ColdMs": 600.5,
+    "Elevated": false
+  },
+  {
+    "Case": "txt",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 50.7,
+    "ColdMs": 608.9,
+    "Elevated": false
+  },
+  {
+    "Case": "folder",
+    "Row": "same",
+    "List": "same*",
+    "Submenus": "same",
+    "WarmMs": 54.9,
+    "ColdMs": 643.0,
+    "Elevated": false
+  },
+  {
+    "Case": "png",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 62.8,
+    "ColdMs": 616.1,
+    "Elevated": false
+  },
+  {
+    "Case": "zip",
+    "Row": "same",
+    "List": "same*",
+    "Submenus": "same",
+    "WarmMs": 52.4,
+    "ColdMs": 606.0,
+    "Elevated": false
+  },
+  {
+    "Case": "exe",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 55.7,
+    "ColdMs": 618.7,
+    "Elevated": false
+  },
+  {
+    "Case": "lnk",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 58.9,
+    "ColdMs": 609.7,
+    "Elevated": false
+  },
+  {
+    "Case": "url",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 26.8,
+    "ColdMs": 538.0,
+    "Elevated": false
+  },
+  {
+    "Case": "multi3",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 52.1,
+    "ColdMs": 593.6,
+    "Elevated": false
+  },
+  {
+    "Case": "mixed",
+    "Row": "same",
+    "List": "same*",
+    "Submenus": "same",
+    "WarmMs": 56.8,
+    "ColdMs": 608.3,
+    "Elevated": false
+  },
+  {
+    "Case": "folder_background",
+    "Row": "same",
+    "List": "DIFF",
+    "Submenus": "same",
+    "WarmMs": 27.5,
+    "ColdMs": 539.4,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_background",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 72.8,
+    "ColdMs": 563.6,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_exe",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 51.2,
+    "ColdMs": 588.7,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_docx",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 57.5,
+    "ColdMs": 587.3,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_multi",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 47.7,
+    "ColdMs": 576.6,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_url",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 23.8,
+    "ColdMs": 525.5,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_mixed",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 54.5,
+    "ColdMs": 613.6,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_zip",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 49.7,
+    "ColdMs": 584.5,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_folder",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 52.4,
+    "ColdMs": 630.1,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_png",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 61.7,
+    "ColdMs": 605.4,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_lnk",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 72.8,
+    "ColdMs": 631.5,
+    "Elevated": false
+  },
+  {
+    "Case": "desktop_publnk",
+    "Row": "same",
+    "List": "same",
+    "Submenus": "same",
+    "WarmMs": 57.0,
+    "ColdMs": 600.5,
+    "Elevated": false
+  }
+]

@@ -1,0 +1,230 @@
+﻿{
+  "case": "mixed",
+  "appearedMs": 741,
+  "rowPosition": "top",
+  "row": [
+    {
+      "group": "row",
+      "name": "Cut",
+      "id": "cut",
+      "accel": "Ctrl+X",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Copy",
+      "id": "copy",
+      "accel": "Ctrl+C",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 825,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Rename",
+      "id": "rename",
+      "accel": "F2",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 890,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    },
+    {
+      "group": "row",
+      "name": "Delete",
+      "id": "delete",
+      "accel": "Delete",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 955,
+      "y": 247,
+      "w": 56,
+      "h": 48
+    }
+  ],
+  "list": [
+    {
+      "group": "list",
+      "name": "Open",
+      "id": "open",
+      "accel": "Enter",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 304,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Copy as path",
+      "id": "copyaspath",
+      "accel": "Ctrl+Shift+C",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 336,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Compress to",
+      "id": "Windows.CompressTo",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 760,
+      "y": 368,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Pin to Quick access",
+      "id": "pintohome",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 400,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Properties",
+      "id": "properties",
+      "accel": "Alt+Enter",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 432,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Open in Terminal",
+      "id": "{EB9DD180-53C8-4E8E-B61F-36FDD0D0CD13}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 473,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "NanaZip",
+      "id": "{CAE3F1D4-7765-4D98-A060-52CD14D56EAB}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 760,
+      "y": 505,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "Open in Terminal",
+      "id": "{9F156763-7844-4DC4-B2B1-901F640F5155}",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 537,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "App extensions",
+      "id": "Windows.ExtensionsFlyout",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": true,
+      "enabled": true,
+      "x": 760,
+      "y": 569,
+      "w": 282,
+      "h": 32
+    },
+    {
+      "group": "list",
+      "name": "----",
+      "id": "separator"
+    },
+    {
+      "group": "list",
+      "name": "Customize menu",
+      "id": "Windows.CustomizeMenu",
+      "accel": "",
+      "cls": "AppBarButton",
+      "submenu": false,
+      "enabled": true,
+      "x": 760,
+      "y": 610,
+      "w": 282,
+      "h": 32
+    }
+  ],
+  "escapeClosed": true,
+  "submenus": {
+    "Windows.ExtensionsFlyout": [
+      {
+        "name": "Edit in Notepad",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Unlock with File Locksmith",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Rename with PowerRename",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      },
+      {
+        "name": "Manage extensions",
+        "id": "",
+        "accel": "",
+        "submenu": false
+      }
+    ]
+  }
+}

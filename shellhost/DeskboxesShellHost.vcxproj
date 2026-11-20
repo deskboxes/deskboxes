@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  deskboxes-shellhost: context-menu host + settings window (C++/WinRT, WinUI 3).
+  Windows App SDK 2.7 components are referenced individually (not the metapackage) so the
+  self-contained output does not carry the AI/ML runtimes. Packages restore into .\packages
+  via `nuget restore packages.config` (build.ps1 does this).
+-->
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Pk>$(MSBuildThisFileDirectory)packages\</Pk>
+    <WasdkVer>2.7.0</WasdkVer>
+    <SdkBtVer>10.0.26100.4654</SdkBtVer>
+    <MsixVer>1.7.251221100</MsixVer>
+    <CppWinRTVer>3.0.260818.1</CppWinRTVer>
+    <WebView2Ver>1.0.3719.77</WebView2Ver>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <Import Project="$(Pk)Microsoft.Windows.SDK.BuildTools.MSIX.$(MsixVer)\build\Microsoft.Windows.SDK.BuildTools.MSIX.props" />
+  <Import Project="$(Pk)Microsoft.Windows.SDK.BuildTools.$(SdkBtVer)\build\Microsoft.Windows.SDK.BuildTools.props" />
+  <Import Project="$(Pk)Microsoft.WindowsAppSDK.Base.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Base.props" />
+  <Import Project="$(Pk)Microsoft.WindowsAppSDK.InteractiveExperiences.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.props" />
+  <Import Project="$(Pk)Microsoft.WindowsAppSDK.Foundation.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Foundation.props" />
+  <Import Project="$(Pk)Microsoft.WindowsAppSDK.WinUI.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.WinUI.props" />
+  <Import Project="$(Pk)Microsoft.WindowsAppSDK.Runtime.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Runtime.props" />
+  <Import Project="$(Pk)Microsoft.Windows.CppWinRT.$(CppWinRTVer)\build\native\Microsoft.Windows.CppWinRT.props" />
+  <PropertyGroup Label="Globals">
+    <CppWinRTOptimized>true</CppWinRTOptimized>
+    <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
+    <MinimalCoreWin>true</MinimalCoreWin>
+    <ProjectGuid>{3F0B6E1A-2C55-4D1E-9B7A-6A1D2E9C4B10}</ProjectGuid>
+    <ProjectName>DeskboxesShellHost</ProjectName>
+    <TargetName>deskboxes-shellhost</TargetName>
+    <RootNamespace>DeskboxesShellHost</RootNamespace>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>16.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>false</AppContainerApplication>
+    <AppxPackage>false</AppxPackage>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <DesktopCompatible>true</DesktopCompatible>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration"><UseDebugLibraries>true</UseDebugLibraries><LinkIncremental>true</LinkIncremental></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration"><UseDebugLibraries>false</UseDebugLibraries><WholeProgramOptimization>true</WholeProgramOptimization><LinkIncremental>false</LinkIncremental></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\out\$(Configuration)\shellhost\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
+      <WarningLevel>Level4</WarningLevel>
+      <AdditionalOptions>%(AdditionalOptions) /bigobj /utf-8</AdditionalOptions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>DISABLE_XAML_GENERATED_MAIN;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>shell32.lib;ole32.lib;oleaut32.lib;user32.lib;advapi32.lib;gdi32.lib;shlwapi.lib;propsys.lib;comctl32.lib;uxtheme.lib;dwmapi.lib;shcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'"><ClCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'"><ClCompile><PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="..\res\deskboxes.rc"><AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\res</AdditionalIncludeDirectories></ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="App.xaml.h"><DependentUpon>App.xaml</DependentUpon></ClInclude>
+    <ClInclude Include="Log.h" />
+    <ClInclude Include="MenuModel.h" />
+    <ClInclude Include="MenuView.h" />
+    <ClInclude Include="Ipc.h" />
+    <ClInclude Include="Settings.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp"><PrecompiledHeader>Create</PrecompiledHeader></ClCompile>
+    <ClCompile Include="App.xaml.cpp"><DependentUpon>App.xaml</DependentUpon></ClCompile>
+    <ClCompile Include="Main.cpp" />
+    <ClCompile Include="Log.cpp" />
+    <ClCompile Include="ShellUtil.cpp" />
+    <ClCompile Include="ClassicMenu.cpp" />
+    <ClCompile Include="ExplorerCommands.cpp" />
+    <ClCompile Include="MenuPolicy.cpp" />
+    <ClCompile Include="MenuBuilder.cpp" />
+    <ClCompile Include="MenuView.cpp" />
+    <ClCompile Include="Ipc.cpp" />
+    <ClCompile Include="Settings.cpp" />
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+    <Content Include="menu_policy.json"><DeploymentContent>true</DeploymentContent><CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory></Content>
+  </ItemGroup>
+  <Target Name="CopyPolicy" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)menu_policy.json" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\res\deskboxes-256.png" DestinationFiles="$(OutDir)deskboxes.png" SkipUnchangedFiles="true" />
+    <!-- Pictures of each feature for Settings (ms-appx:///settings/NAME.jpg). -->
+    <ItemGroup><SettingsPics Include="$(MSBuildThisFileDirectory)..\res\settings\*.jpg" /></ItemGroup>
+    <Copy SourceFiles="@(SettingsPics)" DestinationFolder="$(OutDir)settings" SkipUnchangedFiles="true" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(Pk)Microsoft.Windows.SDK.BuildTools.MSIX.$(MsixVer)\build\Microsoft.Windows.SDK.BuildTools.MSIX.targets" />
+    <Import Project="$(Pk)Microsoft.Windows.SDK.BuildTools.$(SdkBtVer)\build\Microsoft.Windows.SDK.BuildTools.targets" />
+    <Import Project="$(Pk)Microsoft.Web.WebView2.$(WebView2Ver)\build\native\Microsoft.Web.WebView2.targets" />
+    <Import Project="$(Pk)Microsoft.WindowsAppSDK.Base.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Base.targets" />
+    <Import Project="$(Pk)Microsoft.WindowsAppSDK.InteractiveExperiences.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.InteractiveExperiences.targets" />
+    <Import Project="$(Pk)Microsoft.WindowsAppSDK.Foundation.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Foundation.targets" />
+    <Import Project="$(Pk)Microsoft.WindowsAppSDK.WinUI.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.WinUI.targets" />
+    <Import Project="$(Pk)Microsoft.WindowsAppSDK.Runtime.$(WasdkVer)\build\native\Microsoft.WindowsAppSDK.Runtime.targets" />
+    <Import Project="$(Pk)Microsoft.Windows.CppWinRT.$(CppWinRTVer)\build\native\Microsoft.Windows.CppWinRT.targets" />
+  </ImportGroup>
+</Project>

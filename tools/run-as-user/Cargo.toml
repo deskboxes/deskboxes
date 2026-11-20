@@ -1,0 +1,16 @@
+[package]
+name = "run-as-user"
+edition.workspace = true
+version.workspace = true
+publish = false
+description = "Dev/test tool: launch a command at normal (non-elevated) integrity from an elevated session, using the shell's token."
+
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_WindowsAndMessaging",
+] }

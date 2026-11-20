@@ -1,0 +1,19 @@
+[package]
+name = "deskboxes-ipc"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Named-pipe client for the Deskboxes shell host (u32 LE length + JSON frames)."
+
+[dependencies]
+serde_json = { workspace = true }
+log = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+] }

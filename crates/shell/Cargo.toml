@@ -1,0 +1,33 @@
+[package]
+name = "deskboxes-shell"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Shell integration for the Deskboxes core: enumeration, identity, icons, icon hiding, file operations, watchers."
+
+[dependencies]
+deskboxes-core = { workspace = true }
+log = { workspace = true }
+windows-core = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Security",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }

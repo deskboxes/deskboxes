@@ -1,0 +1,109 @@
+{
+  "_comment": [
+    "Windows' OWN presentation policy for the modern (Windows 11) context menu.",
+    "Contains only Windows canonical verb names / CommandStore names / string resource refs.",
+    "It never lists third-party entries: those are discovered at runtime on each machine",
+    "(classic IContextMenu verbs, packaged IExplorerCommand extensions, CommandStore handlers,",
+    "the user's Settings > Personalization > Context menu preferences).",
+    "Windows does not expose this policy through any API; values were observed with",
+    "tools/menu-probe.ps1 and must be re-verified on other builds (REPORT.md).",
+    "Classic verbs NOT promoted here remain reachable via 'Show more options' / the classic menu."
+  ],
+  "schema": 1,
+  "profiles": [
+    {
+      "name": "win11-26h2",
+      "minBuild": 26200,
+      "verifiedBuilds": [ "26300.9974" ],
+      "customizableMenu": true,
+      "itemPromotedVerbs": [
+        "open", "openas", "opennewtab", "opennewwindow", "opencontaining", "runas",
+        "copyaspath", "Windows.CompressTo", "rotate90", "rotate270", "setdesktopwallpaper",
+        "pintohome", "PinToStartScreen", "pintohomefile", "New", "properties"
+      ],
+      "backgroundPromotedVerbs": [
+        "view", "arrange", "groupby", "refresh", "paste", "pastelink", "undo", "redo", "New",
+        "Display", "Personalize", "properties"
+      ],
+      "_itemPromotedVerbs": "Shown in THIS order (Windows' order, not the classic menu's). 'print' is not promoted (verified: png, xlsx, docx, txt).",
+      "itemOrder": "policy",
+      "alwaysSubmenuVerbs": [ "openas", "New" ],
+      "_alwaysSubmenuVerbs": "Windows' modern menu always shows 'Open with' as a submenu (verified: xlsx/docx, where the classic item is 'Open with...'). An item's 'New' verb (Office documents) is shown as Windows' New-item (ShellNew) submenu of the containing folder (verified: desktop .docx, its New submenu lists Folder, Shortcut, Word Document, ...).",
+      "honorLegacyDisable": true,
+      "_honorLegacyDisable": "Static verbs with LegacyDisable are not shown; if that removes the classic default verb, the next static verb of the same ProgID is shown first, followed by a separator (verified on .url only; UNVERIFIED as a general rule).",
+      "rowVerbs": [ "cut", "copy", "rename", "Windows.ModernShare", "delete" ],
+      "backgroundRowVerbs": [ "paste" ],
+      "_backgroundRowVerbs": "A folder background's menu shows Paste as a button in the row above the list, not in the list (File Explorer, 26300; user's capture 2026-11-19).",
+      "extendedOnlyVerbs": [ "pastelink" ],
+      "_extendedOnlyVerbs": "Background entries listed only when the menu is opened with Shift held (Explorer's list has no Paste shortcut).",
+      "commandStoreItems": [
+        { "name": "Windows.CompressTo", "after": "copyaspath", "files": true, "folders": true },
+        { "name": "Windows.ModernShare", "row": true, "after": "rename", "files": true, "folders": false }
+      ],
+      "accelerators": {
+        "open": "Enter", "Open": "Enter", "copyaspath": "Ctrl+Shift+C", "properties": "Alt+Enter",
+        "cut": "Ctrl+X", "copy": "Ctrl+C", "rename": "F2", "delete": "Delete", "paste": "Ctrl+V", "undo": "Ctrl+Z"
+      },
+      "defaultAcceleratorWhenNoOpen": "Enter",
+      "strings": {
+        "appExtensions": "@Windows.UI.FileExplorer.dll,-52480",
+        "customizeMenu": "@Windows.UI.FileExplorer.dll,-52483",
+        "showMoreOptions": "@Windows.UI.FileExplorer.dll,-51841",
+        "manageExtensions": "@Windows.UI.FileExplorer.dll,-52482",
+        "shellNewLabel": "@shell32.dll,-30315",
+        "chooseAnotherApp": "@shell32.dll,-5378",
+        "openWithStore": "@shell32.dll,-5382",
+        "openWithStoreApp": "Microsoft.WindowsStore_8wekyb3d8bbwe!App",
+        "openWithStoreUri": "ms-windows-store://assoc/?FileExt={ext}"
+      },
+      "appExtensionsFooter": "manageExtensions",
+      "_appExtensionsFooter": "Last entry of the App extensions submenu (verified: desktop background, .docx, .png). Opens the same Settings page as Customize menu (UNVERIFIED).",
+      "desktopOwnEntries": {
+        "_comment": "Entries Explorer's desktop VIEW adds to the background menu (not the folder's IContextMenu). In Deskboxes the core implements them; the host only takes Windows' localized text from DefView's own menu resource. Positions verified on 26300.9974.",
+        "menuResource": "shell32.dll", "menuId": 215,
+        "items": [
+          { "id": "view", "position": [ 0, 2 ], "submenu": true },
+          { "id": "arrange", "position": [ 0, 3 ], "submenu": true },
+          { "id": "refresh", "command": 28931 },
+          { "id": "paste", "command": 28698, "when": "clipboardHasFiles", "group": 2 },
+          { "id": "pastelink", "command": 28700, "when": "clipboardHasFiles", "group": 2 },
+          { "id": "undo", "command": 28699, "when": "coreUndo", "group": 2 },
+          { "id": "redo", "command": 28704, "when": "coreRedo", "group": 2 }
+        ]
+      },
+      "customizeMenuUri": "ms-settings:personalization-contextmenu",
+      "iconAssets": {
+        "_comment": "Explorer's own menu icons: installed SVGs named by command id, looked up at runtime under <package>/<path>/contrast-standard/theme-dark|theme-light (contrast-black|contrast-white in high contrast). Lookup: names[id], then id, then 'windows.'+id (case-insensitive). The names below are the ids whose file name differs; verified by comparing captures (tools/menu-view-check.ps1).",
+        "package": "MicrosoftWindows.Client.FileExp_cw5n1h2txyewy",
+        "path": "FileExplorerExtensions\\Assets\\images",
+        "names": {
+          "runas": "RunAsAdmin", "openas": "windows.openwith", "delete": "windows.ribbondelete",
+          "New": "windows.newitem", "Windows.CompressTo": "Windows.Zip.Action", "arrange": "SortBy",
+          "view": "View", "groupby": "windows.groupbycolumn", "Display": "DisplaySettings",
+          "opencontaining": "windows.shortcut.opencontaining", "pastelink": "windows.pasteshortcut",
+          "createlink": "link"
+        }
+      },
+      "glyphs": {
+        "cut": "", "copy": "", "rename": "", "delete": "", "Windows.ModernShare": "",
+        "open": "", "opennewtab": "", "opennewwindow": "", "copyaspath": "",
+        "Windows.CompressTo": "", "pintohome": "", "PinToStartScreen": "",
+        "pintohomefile": "", "properties": "", "openas": "", "opencontaining": "",
+        "rotate90": "", "rotate270": "", "setdesktopwallpaper": "", "print": "",
+        "view": "", "arrange": "", "groupby": "", "refresh": "", "New": "",
+        "Personalize": "", "paste": "", "undo": "",
+        "Windows.ExtensionsFlyout": "", "Windows.CustomizeMenu": "", "showMoreOptions": ""
+      }
+    },
+    {
+      "name": "win11-pre-26h2",
+      "minBuild": 22000,
+      "verifiedBuilds": [],
+      "customizableMenu": false,
+      "inherit": "win11-26h2",
+      "strings": {
+        "showMoreOptions": "@Windows.UI.FileExplorer.dll,-51841"
+      }
+    }
+  ]
+}

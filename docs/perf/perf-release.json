@@ -1,0 +1,206 @@
+{
+  "machine": {
+    "windows": "Windows 11 Pro 26H2 build 26300.9974",
+    "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor (8 cores / 16 threads)",
+    "ramGb": 30.9,
+    "gpu": [
+      "AMD Radeon(TM) Graphics @  Hz",
+      "AMD Radeon RX 7900 XTX @ 144 Hz"
+    ],
+    "config": "release"
+  },
+  "n1000.cold": {
+    "firstPaintMs": 148.8126,
+    "reconcileMs": 827.9316,
+    "items": 1000,
+    "privateMb": 114.765625,
+    "workingSetMb": 92.70703125
+  },
+  "n1000.warm": {
+    "firstPaintMs": [
+      175.2,
+      176.2,
+      173.8,
+      173.9,
+      173.2
+    ],
+    "reconcileMs": [
+      202.3,
+      203.1,
+      199.6,
+      199.0,
+      208.1
+    ],
+    "medianFirstPaintMs": 173.9,
+    "medianReconcileMs": 202.3,
+    "medianPrivateMb": 110.6,
+    "medianWorkingSetMb": 82.5
+  },
+  "n1000.desktopMode": {
+    "cold": {
+      "firstPaintMs": 93.1,
+      "hideMs": 47.2,
+      "reconcileMs": 726.0,
+      "privateMb": 74.9,
+      "workingSetMb": 71.9,
+      "nativeIconsAfter": true
+    },
+    "warm": [
+      {
+        "firstPaintMs": 124.6,
+        "hideMs": 19.0,
+        "reconcileMs": 154.8,
+        "privateMb": 73.3,
+        "workingSetMb": 64.4,
+        "nativeIconsAfter": true
+      },
+      {
+        "firstPaintMs": 124.0,
+        "hideMs": 20.9,
+        "reconcileMs": 156.0,
+        "privateMb": 73.2,
+        "workingSetMb": 64.5,
+        "nativeIconsAfter": true
+      },
+      {
+        "firstPaintMs": 123.6,
+        "hideMs": 20.4,
+        "reconcileMs": 154.5,
+        "privateMb": 73.3,
+        "workingSetMb": 64.2,
+        "nativeIconsAfter": true
+      }
+    ],
+    "medianWarmFirstPaintMs": 124.0,
+    "medianWarmPrivateMb": 73.3
+  },
+  "idleCpu": {
+    "cpuMsIn10s": 0.0,
+    "percentOfOneCore": 0.0,
+    "processes": [
+      "deskboxes",
+      "deskboxes-shellhost"
+    ]
+  },
+  "menu.oneItemMs": {
+    "noHold": [
+      244.9,
+      145.4,
+      137.2
+    ],
+    "rest300": [
+      61.2,
+      53.9,
+      53.4
+    ],
+    "hold100": [
+      54.3,
+      48.4,
+      46.8
+    ],
+    "menuKey": [
+      48.7,
+      45.9,
+      43.9
+    ],
+    "medianNoHold": 145.4,
+    "medianRest300": 53.9,
+    "medianHold100": 48.4,
+    "medianMenuKey": 45.9
+  },
+  "menu.manyItemsMs": {
+    "selected": 100,
+    "noHold": [
+      150.9,
+      258.1,
+      122.2
+    ],
+    "hold100": [
+      42.9,
+      49.4,
+      43.9
+    ],
+    "menuKey": [
+      42.6,
+      49.0,
+      42.8
+    ],
+    "medianNoHold": 150.9,
+    "medianHold100": 43.9,
+    "medianMenuKey": 42.8
+  },
+  "explorer.menuKeyMs": {
+    "oneItem": [
+      245.4,
+      63.5,
+      53.0
+    ],
+    "manyItems": [
+      54.7,
+      55.8,
+      55.7
+    ],
+    "selectedMany": 100,
+    "medianOne": 63.5,
+    "medianMany": 55.7
+  },
+  "fileChange": {
+    "createdMs": [
+      141.2,
+      98.0,
+      97.1
+    ],
+    "renamedMs": [
+      111.5,
+      110.7,
+      110.0
+    ],
+    "median": 110.0
+  },
+  "n1000.interactive.exit": "clean",
+  "n1000.interactive.stats": {
+    "privateMb": 105.9140625,
+    "workingSetMb": 92.1484375,
+    "drawCount": 97,
+    "drawMsP50": 2.9017999172210693,
+    "drawMsP95": 3.7964000701904297,
+    "drawMsMax": 10.756199836730957,
+    "hostReadyMs": 1073.5058
+  },
+  "n2000.cold": {
+    "firstPaintMs": 144.9318,
+    "reconcileMs": 1349.3680000000002,
+    "items": 2000,
+    "privateMb": 134.06640625
+  },
+  "n2000.desktopMode": {
+    "cold": {
+      "firstPaintMs": 95.7,
+      "hideMs": 16.0,
+      "reconcileMs": 1319.7,
+      "privateMb": 102.7,
+      "workingSetMb": 84.3,
+      "nativeIconsAfter": true
+    },
+    "warm": {
+      "firstPaintMs": 149.7,
+      "hideMs": 22.1,
+      "reconcileMs": 188.7,
+      "privateMb": 101.3,
+      "workingSetMb": 75.4,
+      "nativeIconsAfter": true
+    }
+  },
+  "n2000.items": 1660,
+  "n2000.rubber.exit": "clean",
+  "n2000.rubber": {
+    "frames": 270,
+    "drawMsP50": 2.983599901199341,
+    "drawMsP95": 3.344899892807007,
+    "drawMsMax": 3.848900079727173,
+    "intervalMsP50": 13.952300071716309,
+    "intervalMsP95": 27.521099090576172,
+    "intervalMsMax": 35.141700744628906,
+    "privateMb": 118.96875
+  }
+}

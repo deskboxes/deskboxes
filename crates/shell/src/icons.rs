@@ -1,0 +1,194 @@
+//! Icons from the shell (docs/ARCHITECTURE.md §6): `IShellItemImageFactory::GetImage(ICONONLY)` for
+//! the image, the system image list index to share one image between items of the same type, and
+//! the system image list overlay (shortcut arrow) drawn on top.
+//! Files with a thumbnail handler show their thumbnail, like Explorer (`thumbnail`).
+
+use crate::{pcw, wide};
+use deskboxes_core::snapshot::IconImage;
+use windows::Win32::Foundation::SIZE;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// System image list index and overlay index (1-based, 0 = none: the shortcut arrow is 2) for
+/// an item. The overlay is only filled in together with SHGFI_ICON (verified on 26300: without
+/// it every shortcut reported none), so a small icon is made and thrown away.
+pub fn sys_index(parsing: &str) -> (i32, u32) {
+    unsafe {
+        let p = wide(parsing);
+        let mut sfi = SHFILEINFOW::default();
+        let r = SHGetFileInfoW(
+            pcw(&p),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX | SHGFI_OVERLAYINDEX | SHGFI_ICON | SHGFI_SMALLICON,
+        );
+        if !sfi.hIcon.is_invalid() {
+            let _ = DestroyIcon(sfi.hIcon);
+        }
+        if r == 0 {
+            return (-1, 0);
+        }
+        (sfi.iIcon & 0x00ff_ffff, (sfi.iIcon as u32) >> 24)
+    }
+}
+
+/// Whether Explorer shows the UAC shield on the item (a program, or a shortcut to one, that asks
+/// for administrator rights): the item's own icon extractor says so for GIL_CHECKSHIELD.
+pub fn needs_shield(parsing: &str) -> bool {
+    unsafe {
+        let p = wide(parsing);
+        let Ok(si) = SHCreateItemFromParsingName::<_, _, IShellItem>(pcw(&p), None) else { return false };
+        let Ok(ei) = si.BindToHandler::<_, IExtractIconW>(None, &BHID_SFUIObject) else { return false };
+        let mut buf = [0u16; 260];
+        let (mut ix, mut flags) = (0i32, 0u32);
+        ei.GetIconLocation(GIL_FORSHELL | GIL_CHECKSHIELD, &mut buf, &mut ix, &mut flags).is_ok() && flags & GIL_SHIELD != 0
+    }
+}
+
+/// Windows' shield at `px` × `px` (drawn on the icons of programs that run as administrator).
+pub fn shield_image(px: u32) -> Option<IconImage> {
+    unsafe {
+        let mut si = SHSTOCKICONINFO {
+            cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
+            ..Default::default()
+        };
+        SHGetStockIconInfo(SIID_SHIELD, SHGSI_ICONLOCATION, &mut si).ok()?;
+        let mut hi = HICON::default();
+        let px16 = px.clamp(8, 256);
+        SHDefExtractIconW(windows::core::PCWSTR(si.szPath.as_ptr()), si.iIcon, 0, Some(&mut hi), None, px16 | (px16 << 16)).ok().ok()?;
+        let img = icon_pixels(hi);
+        let _ = DestroyIcon(hi);
+        img
+    }
+}
+
+/// The item's picture as Explorer shows it on the desktop with no "icon only" restriction: a
+/// folder's icon with a preview of what is inside.
+pub fn folder_image(parsing: &str, px: u32) -> Option<IconImage> {
+    unsafe {
+        let p = wide(parsing);
+        let f: IShellItemImageFactory = SHCreateItemFromParsingName(pcw(&p), None).ok()?;
+        let hb = f.GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_BIGGERSIZEOK).ok()?;
+        let img = bitmap_pixels(hb);
+        let _ = DeleteObject(hb.into());
+        img
+    }
+}
+
+/// Explorer's tooltip text for an item (type, size, date modified, a shortcut's description...).
+pub fn info_tip(parsing: &str) -> Option<String> {
+    unsafe {
+        let p = wide(parsing);
+        let si: IShellItem = SHCreateItemFromParsingName(pcw(&p), None).ok()?;
+        let qi: IQueryInfo = si.BindToHandler(None, &BHID_SFUIObject).ok()?;
+        let tip = qi.GetInfoTip(QITIPF_DEFAULT).ok()?;
+        let s = tip.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(tip.0 as _));
+        s.map(|s| s.replace("\r\n", "\n")).filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// 32-bpp pixels of an HBITMAP, top-down, premultiplied.
+unsafe fn bitmap_pixels(hb: HBITMAP) -> Option<IconImage> {
+    let mut bm = BITMAP::default();
+    if GetObjectW(hb.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
+        return None;
+    }
+    let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+        ..Default::default()
+    };
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let dc = GetDC(None);
+    let n = GetDIBits(dc, hb, 0, h as u32, Some(px.as_mut_ptr() as _), &mut bi, DIB_RGB_COLORS);
+    ReleaseDC(None, dc);
+    if n == 0 {
+        return None;
+    }
+    let has_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+    if !has_alpha {
+        px.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+    } else if px.chunks_exact(4).any(|p| p[0] > p[3] || p[1] > p[3] || p[2] > p[3]) {
+        // straight alpha → premultiply
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    Some(IconImage { w: w as u32, h: h as u32, bgra: px })
+}
+
+/// The item's icon at `px` × `px` (no thumbnail, no overlay).
+pub fn item_icon(parsing: &str, px: u32) -> Option<IconImage> {
+    unsafe {
+        let p = wide(parsing);
+        let f: IShellItemImageFactory = SHCreateItemFromParsingName(pcw(&p), None).ok()?;
+        let hb = f.GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+        let img = bitmap_pixels(hb);
+        let _ = DeleteObject(hb.into());
+        img
+    }
+}
+
+/// The file's thumbnail fitted into `px` × `px` (aspect kept), if Windows has one for it.
+pub fn thumbnail(parsing: &str, px: u32) -> Option<IconImage> {
+    unsafe {
+        let p = wide(parsing);
+        let f: IShellItemImageFactory = SHCreateItemFromParsingName(pcw(&p), None).ok()?;
+        let hb = f.GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK).ok()?; // may be larger: the caller fits it
+        let img = bitmap_pixels(hb);
+        let _ = DeleteObject(hb.into());
+        img
+    }
+}
+
+/// Whether files with this extension (".png") have a thumbnail handler registered.
+pub fn has_thumbnail_handler(ext: &str) -> bool {
+    unsafe {
+        let e = wide(ext);
+        let iid = wide("{e357fccd-a995-4576-b01f-234630154e96}"); // IThumbnailProvider
+        let mut n = 0u32;
+        AssocQueryStringW(ASSOCF_INIT_DEFAULTTOSTAR, ASSOCSTR_SHELLEXTENSION, pcw(&e), pcw(&iid), None, &mut n).is_ok() && n > 1
+    }
+}
+
+/// Pixels of an HICON (color bitmap with alpha; mask applied when it has no alpha).
+unsafe fn icon_pixels(hi: HICON) -> Option<IconImage> {
+    let mut ii = ICONINFO::default();
+    GetIconInfo(hi, &mut ii).ok()?;
+    let img = bitmap_pixels(ii.hbmColor);
+    let _ = DeleteObject(ii.hbmColor.into());
+    let _ = DeleteObject(ii.hbmMask.into());
+    img
+}
+
+/// The system overlay image (1-based overlay index, e.g. the shortcut arrow) from the image list
+/// of the icon size, as Explorer takes it (the arrow is drawn smaller relative to a 48 px icon
+/// than to a 256 px one); the caller scales it to the icon size if they differ.
+pub fn overlay_icon(overlay: u32, px: u32) -> Option<IconImage> {
+    if overlay == 0 {
+        return None;
+    }
+    // The smallest list at least `px` big (the caller scales it down to `px`).
+    let list = match px {
+        0..=16 => SHIL_SMALL,
+        17..=32 => SHIL_LARGE,
+        33..=48 => SHIL_EXTRALARGE,
+        _ => SHIL_JUMBO,
+    };
+    unsafe {
+        let il: IImageList = SHGetImageList(list as i32).ok()?;
+        let ix = il.GetOverlayImage(overlay as i32).ok()?;
+        let hi = il.GetIcon(ix, ILD_TRANSPARENT.0).ok()?;
+        let img = icon_pixels(hi);
+        let _ = DestroyIcon(hi);
+        img
+    }
+}

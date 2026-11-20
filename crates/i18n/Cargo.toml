@@ -1,0 +1,9 @@
+[package]
+name = "deskboxes-i18n"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+description = "Deskboxes' own UI strings (Polish, English). Menu text of Windows verbs never comes from here."
+
+[dependencies]
