@@ -12,6 +12,10 @@ pub const WM_APP_EVENTS: u32 = WM_APP + 1;
 pub const WM_APP_DRAW: u32 = WM_APP + 2;
 /// Give the focus back to a name field that just opened (see WM_KILLFOCUS).
 pub const WM_APP_REFOCUS: u32 = WM_APP + 3;
+/// The icon name field is done: wParam 1 commit (Enter), 0 cancel (Esc), 2 it lost the focus.
+pub const WM_APP_RENAME_END: u32 = WM_APP + 6;
+/// Open the folder picker asked for (folder boxes), outside the App's borrow.
+pub const WM_APP_PICKFOLDER: u32 = WM_APP + 7;
 /// The wallpaper settings in the registry changed (see `watch_wallpaper`).
 pub const WM_APP_WALLPAPER: u32 = WM_APP + 4;
 
@@ -77,6 +81,12 @@ pub enum Ev {
     InfoTip {
         key: deskboxes_core::ItemKey,
         text: String,
+    },
+    /// A file operation went through (for undo): `undo` None a new one, Some(true) an undo,
+    /// Some(false) a redo, with what really happened.
+    FileDone {
+        op: deskboxes_core::layout::FileOp,
+        undo: Option<bool>,
     },
 }
 

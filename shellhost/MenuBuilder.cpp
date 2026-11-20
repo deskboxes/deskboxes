@@ -81,6 +81,14 @@ namespace dbx
                 for (size_t i = 0; i + 1 < oe.position.size() && h; ++i) h = GetSubMenu(h, oe.position[i]);
                 if (h) GetMenuStringW(h, oe.position.back(), text, ARRAYSIZE(text), MF_BYPOSITION);
             }
+            // What Undo / Redo would do, named as Explorer names it ("Undo Move").
+            const std::wstring& named = oe.id == L"undo" ? r.coreUndoText : oe.id == L"redo" ? r.coreRedoText : std::wstring();
+            if (!named.empty())
+            {
+                const wchar_t* tab = wcschr(text, L'\t'); // keep Windows' "\tCtrl+Z"
+                std::wstring t = named + (tab ? std::wstring(tab) : std::wstring());
+                wcsncpy_s(text, t.c_str(), _TRUNCATE);
+            }
             if (!text[0]) { Log(L"own entry %s: no text in resource", oe.id.c_str()); continue; }
             if (oe.group != group && !out.empty()) out.push_back(Sep());
             group = oe.group;

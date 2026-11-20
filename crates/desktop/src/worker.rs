@@ -4,6 +4,7 @@
 
 use crate::events::{post, Ev};
 use deskboxes_core::snapshot::IconImage;
+use deskboxes_core::layout::FileOp;
 use deskboxes_core::Item;
 use deskboxes_shell::items::{self, DirSpec, Entry};
 use deskboxes_shell::{fileops, icons, view};
@@ -27,6 +28,52 @@ pub enum Req {
     InfoTip { key: deskboxes_core::ItemKey, path: String },
     /// The folders folder boxes show now: listed with the desktop from the next scan on.
     Folders(Vec<String>),
+    /// Undo (`undo`) or redo a file operation.
+    UndoFiles { op: FileOp, undo: bool },
+}
+
+fn pairs(d: &[fileops::Done]) -> Vec<(String, String)> {
+    d.iter().map(|d| (d.from.clone(), d.to.clone())).collect()
+}
+
+fn file_name(p: &str) -> String {
+    std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Undo or redo `op`; what really happened then (None: nothing went through).
+fn undo_files(op: &FileOp, undo: bool, owner: isize, no_ui: bool) -> Option<FileOp> {
+    let rev = |v: &[(String, String)]| -> Vec<(String, String)> { v.iter().map(|(a, b)| (b.clone(), a.clone())).collect() };
+    let r = match (op, undo) {
+        (FileOp::Moved(v), true) => fileops::move_back(&rev(v), owner, no_ui).ok().map(|d| FileOp::Moved(rev(&pairs(&d)))),
+        (FileOp::Moved(v), false) => fileops::move_back(v, owner, no_ui).ok().map(|d| FileOp::Moved(pairs(&d))),
+        (FileOp::Copied(v), true) => {
+            let copies: Vec<String> = v.iter().map(|(_, c)| c.clone()).filter(|c| !c.is_empty()).collect();
+            fileops::delete_logged(&copies, true, owner, no_ui).ok().map(|_| op.clone())
+        }
+        (FileOp::Copied(v), false) => {
+            // Copied again: each copy where it was (the folder it was copied into).
+            let mut out = vec![];
+            for (src, copy) in v {
+                let Some(dir) = std::path::Path::new(copy).parent() else { continue };
+                if let Ok(d) = fileops::transfer_logged(std::slice::from_ref(src), &dir.to_string_lossy(), true, owner, no_ui) {
+                    out.extend(pairs(&d));
+                }
+            }
+            (!out.is_empty()).then_some(FileOp::Copied(out))
+        }
+        (FileOp::Recycled(v), true) => {
+            let d = fileops::restore(v);
+            (!d.is_empty()).then(|| op.clone())
+        }
+        (FileOp::Recycled(v), false) => {
+            let paths: Vec<String> = v.iter().map(|(a, _)| a.clone()).collect();
+            fileops::delete_logged(&paths, true, owner, no_ui).ok().map(|d| FileOp::Recycled(pairs(&d)))
+        }
+        (FileOp::Renamed(from, to), true) => fileops::rename_logged(to, &file_name(from), owner, no_ui).ok().map(|_| op.clone()),
+        (FileOp::Renamed(from, to), false) => fileops::rename_logged(from, &file_name(to), owner, no_ui).ok().map(|_| op.clone()),
+    };
+    log::info!("{} {op:?}: {}", if undo { "undo" } else { "redo" }, if r.is_some() { "done" } else { "failed" });
+    r
 }
 
 pub struct Config {
@@ -465,13 +512,26 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                 }
                 Req::Folders(v) => folders = v,
                 Req::Rename { path, new_name } => {
-                    let r = fileops::rename(&path, &new_name, cfg.owner, cfg.no_ui);
+                    let r = fileops::rename_logged(&path, &new_name, cfg.owner, cfg.no_ui);
                     log::info!("rename {path} -> {new_name}: {r:?}");
+                    if let Some(d) = r.ok().and_then(|d| d.into_iter().find(|d| !d.to.is_empty())) {
+                        post(Ev::FileDone { op: FileOp::Renamed(d.from, d.to), undo: None });
+                    }
                     post(Ev::Rescan);
                 }
                 Req::Delete { paths, recycle } => {
-                    let r = fileops::delete(&paths, recycle, cfg.owner, cfg.no_ui);
+                    let r = fileops::delete_logged(&paths, recycle, cfg.owner, cfg.no_ui);
                     log::info!("delete {} item(s) recycle={recycle}: {r:?}", paths.len());
+                    // Into the Recycle Bin: undoable (deleted for good: not).
+                    if let Some(d) = r.ok().filter(|d| recycle && !d.is_empty()) {
+                        post(Ev::FileDone { op: FileOp::Recycled(pairs(&d)), undo: None });
+                    }
+                    post(Ev::Rescan);
+                }
+                Req::UndoFiles { op, undo } => {
+                    if let Some(done) = undo_files(&op, undo, cfg.owner, cfg.no_ui) {
+                        post(Ev::FileDone { op: done, undo: Some(undo) });
+                    }
                     post(Ev::Rescan);
                 }
                 Req::Paste { folder, link, pt } => {
@@ -508,7 +568,14 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                     // drop target returned S_OK without moving when driven from this worker).
                     // Programs, archives and other drop targets: the item's own drop target.
                     let r = if std::path::Path::new(&target).is_dir() {
-                        fileops::transfer(&paths, &target, copy, cfg.owner, cfg.no_ui).map(|_| ())
+                        let r = fileops::transfer_logged(&paths, &target, copy, cfg.owner, cfg.no_ui);
+                        if let Ok(d) = &r {
+                            let v: Vec<(String, String)> = pairs(d).into_iter().filter(|(_, t)| !t.is_empty()).collect();
+                            if !v.is_empty() {
+                                post(Ev::FileDone { op: if copy { FileOp::Copied(v) } else { FileOp::Moved(v) }, undo: None });
+                            }
+                        }
+                        r.map(|_| ())
                     } else {
                         view::drop_on_item(&target, &paths, copy)
                     };

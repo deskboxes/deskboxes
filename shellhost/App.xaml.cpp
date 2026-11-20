@@ -11,6 +11,13 @@ namespace winrt::DeskboxesShellHost::implementation
         UnhandledException([](auto&&, Microsoft::UI::Xaml::UnhandledExceptionEventArgs const& e) {
             dbx::Log(L"XAML unhandled exception 0x%08X: %s", (uint32_t)e.Exception(), e.Message().c_str());
         });
+        // DESKBOXES_THEME=light|dark: a test copy in the other theme (the core reads it too).
+        wchar_t t[8]{};
+        if (GetEnvironmentVariableW(L"DESKBOXES_THEME", t, 8))
+        {
+            if (!wcscmp(t, L"light")) RequestedTheme(Microsoft::UI::Xaml::ApplicationTheme::Light);
+            else if (!wcscmp(t, L"dark")) RequestedTheme(Microsoft::UI::Xaml::ApplicationTheme::Dark);
+        }
     }
 
     void App::OnLaunched(Microsoft::UI::Xaml::LaunchActivatedEventArgs const&)

@@ -69,6 +69,12 @@ impl Gpu {
                 D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None)?;
             }
             let dxgi: IDXGIDevice = dev.unwrap().cast()?;
+            // At most one frame queued ahead of the GPU: when a slower GPU falls behind, the
+            // picture (a selection rectangle, a dragged box) trails the pointer by one frame, not
+            // three.
+            if let Ok(d1) = dxgi.cast::<IDXGIDevice1>() {
+                let _ = d1.SetMaximumFrameLatency(1);
+            }
             let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2d = factory.CreateDevice(&dxgi)?;
             let rdc = d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
@@ -468,6 +474,8 @@ pub struct Surface {
     _target: IDCompositionTarget,
     /// Another window showing the surface for now (boxes above windows).
     elsewhere: Option<IDCompositionTarget>,
+    /// What its own window shows meanwhile.
+    still: Option<IDCompositionVisual2>,
     visual: IDCompositionVisual2,
     surface: Option<IDCompositionSurface>,
     pub w: u32,
@@ -483,6 +491,7 @@ impl Surface {
             let mut s = Surface {
                 _target: target,
                 elsewhere: None,
+                still: None,
                 visual,
                 surface: None,
                 w: 0,
@@ -507,20 +516,43 @@ impl Surface {
         Ok(())
     }
 
-    /// Show the surface in another window (`Some`) instead of its own, or back in its own (`None`).
-    pub fn retarget(&mut self, gpu: &Gpu, hwnd: Option<HWND>) -> R<()> {
+    /// Show the surface in another window (`Some`, whose top-left is `offset` px from the
+    /// surface's) instead of its own, or back in its own (`None`). Meanwhile its own window shows
+    /// `still` (drawn once, in DIPs at `scale`), so it is not left empty (black).
+    pub fn retarget(&mut self, gpu: &Gpu, hwnd: Option<HWND>, offset: (i32, i32), still: Option<(f32, &dyn Fn(&ID2D1DeviceContext) -> R<()>)>) -> R<()> {
         unsafe {
             match hwnd {
                 Some(h) => {
                     let t = gpu.dcomp.CreateTargetForHwnd(h, true)?;
                     self._target.SetRoot(None::<&IDCompositionVisual>)?;
+                    self.visual.SetOffsetX2(-offset.0 as f32)?;
+                    self.visual.SetOffsetY2(-offset.1 as f32)?;
                     t.SetRoot(&self.visual)?;
                     self.elsewhere = Some(t);
+                    if let Some((scale, f)) = still {
+                        let v = gpu.dcomp.CreateVisual()?;
+                        let s = gpu.dcomp.CreateSurface(self.w.max(1), self.h.max(1), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED)?;
+                        let mut off = POINT::default();
+                        let dc: ID2D1DeviceContext = s.BeginDraw(None, &mut off)?;
+                        dc.SetTransform(&Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: off.x as f32, M32: off.y as f32 });
+                        dc.Clear(Some(&Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                        dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                        let r = f(&dc);
+                        let e = s.EndDraw();
+                        if r.and(e).is_ok() {
+                            v.SetContent(&s)?;
+                            self._target.SetRoot(&v)?;
+                            self.still = Some(v);
+                        }
+                    }
                 }
                 None => {
                     if let Some(t) = self.elsewhere.take() {
                         t.SetRoot(None::<&IDCompositionVisual>)?;
                     }
+                    self.still = None;
+                    self.visual.SetOffsetX2(0.0)?;
+                    self.visual.SetOffsetY2(0.0)?;
                     self._target.SetRoot(&self.visual)?;
                 }
             }

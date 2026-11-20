@@ -48,4 +48,9 @@
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Input.h>
 #include <winrt/Windows.Graphics.h>
+#include <winrt/Windows.Foundation.Numerics.h>
+#include <winrt/Windows.Media.Core.h>
+#include <winrt/Windows.Media.Playback.h>
+#include <winrt/Microsoft.UI.Composition.h>
+#include <winrt/Microsoft.UI.Xaml.Hosting.h>
 #include <winrt/Windows.System.h>

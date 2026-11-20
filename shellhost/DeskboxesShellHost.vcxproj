@@ -118,9 +118,11 @@
   <Target Name="CopyPolicy" AfterTargets="Build">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)menu_policy.json" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\res\deskboxes-256.png" DestinationFiles="$(OutDir)deskboxes.png" SkipUnchangedFiles="true" />
-    <!-- Pictures of each feature for Settings (ms-appx:///settings/NAME.jpg). -->
-    <ItemGroup><SettingsPics Include="$(MSBuildThisFileDirectory)..\res\settings\*.jpg" /></ItemGroup>
-    <Copy SourceFiles="@(SettingsPics)" DestinationFolder="$(OutDir)settings" SkipUnchangedFiles="true" />
+    <!-- Pictures of each feature for Settings (ms-appx:///settings/NAME.jpg) and their clips (NAME.mp4);
+         the folder is made afresh so a picture taken out of res\settings does not ship. -->
+    <RemoveDir Directories="$(OutDir)settings" />
+    <ItemGroup><SettingsPics Include="$(MSBuildThisFileDirectory)..\res\settings\*.jpg;$(MSBuildThisFileDirectory)..\res\settings\*.mp4" /></ItemGroup>
+    <Copy SourceFiles="@(SettingsPics)" DestinationFolder="$(OutDir)settings" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

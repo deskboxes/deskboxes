@@ -574,20 +574,62 @@ pub fn placed_keys(l: &MonitorLayout) -> BTreeSet<ItemKey> {
     s
 }
 
-/// Undo history: whole-layout snapshots (layouts are small: a few KB for 1,000 items).
+/// A file operation Deskboxes did that can be undone, as Explorer's Undo Move / Undo Delete /
+/// Undo Rename (paths: full file-system paths).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileOp {
+    /// Moved into a folder: (from, to).
+    Moved(Vec<(String, String)>),
+    /// Copied into a folder: (source, the copy).
+    Copied(Vec<(String, String)>),
+    /// Into the Recycle Bin: (where it was, the file in the Recycle Bin; "" if not known).
+    Recycled(Vec<(String, String)>),
+    /// Renamed: (from, to).
+    Renamed(String, String),
+}
+
+/// A file operation in the undo history, with where its icons were (so they come back there).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileStep {
+    pub op: FileOp,
+    /// Each icon's place and its position in a box tab.
+    pub places: Vec<(ItemKey, Place, usize)>,
+}
+
+enum Entry {
+    Layout(MonitorLayout),
+    Files(FileStep),
+}
+
+/// What an undo or redo did: the layout was put back, or a file operation is to be reversed
+/// (undo) or done again (redo) by the caller.
+#[derive(Debug)]
+pub enum Step {
+    Layout,
+    Files(FileStep),
+}
+
+/// Undo history: whole-layout snapshots (layouts are small: a few KB for 1,000 items) and file
+/// operations, in the order they happened.
 #[derive(Default)]
 pub struct History {
-    undo: Vec<MonitorLayout>,
-    redo: Vec<MonitorLayout>,
+    undo: Vec<Entry>,
+    redo: Vec<Entry>,
 }
 
 impl History {
-    pub fn record(&mut self, before: &MonitorLayout) {
-        self.undo.push(before.clone());
+    fn push(&mut self, e: Entry) {
+        self.undo.push(e);
         if self.undo.len() > 50 {
             self.undo.remove(0);
         }
         self.redo.clear();
+    }
+    pub fn record(&mut self, before: &MonitorLayout) {
+        self.push(Entry::Layout(before.clone()));
+    }
+    pub fn record_files(&mut self, step: FileStep) {
+        self.push(Entry::Files(step));
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
@@ -595,22 +637,50 @@ impl History {
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
-    pub fn undo(&mut self, current: &mut MonitorLayout) -> bool {
-        match self.undo.pop() {
-            Some(prev) => {
-                self.redo.push(std::mem::replace(current, prev));
-                true
+    /// The kind of the next undo / redo: None, Some(None) a layout change, Some(Some(op)) a file
+    /// operation (for the menu's "Undo Move" and the like).
+    pub fn next_undo(&self) -> Option<Option<&FileOp>> {
+        self.undo.last().map(|e| match e {
+            Entry::Layout(_) => None,
+            Entry::Files(s) => Some(&s.op),
+        })
+    }
+    pub fn next_redo(&self) -> Option<Option<&FileOp>> {
+        self.redo.last().map(|e| match e {
+            Entry::Layout(_) => None,
+            Entry::Files(s) => Some(&s.op),
+        })
+    }
+    pub fn undo(&mut self, current: &mut MonitorLayout) -> Option<Step> {
+        match self.undo.pop()? {
+            Entry::Layout(prev) => {
+                self.redo.push(Entry::Layout(std::mem::replace(current, prev)));
+                Some(Step::Layout)
             }
-            None => false,
+            Entry::Files(s) => {
+                self.redo.push(Entry::Files(s.clone()));
+                Some(Step::Files(s))
+            }
         }
     }
-    pub fn redo(&mut self, current: &mut MonitorLayout) -> bool {
-        match self.redo.pop() {
-            Some(next) => {
-                self.undo.push(std::mem::replace(current, next));
-                true
+    pub fn redo(&mut self, current: &mut MonitorLayout) -> Option<Step> {
+        match self.redo.pop()? {
+            Entry::Layout(next) => {
+                self.undo.push(Entry::Layout(std::mem::replace(current, next)));
+                Some(Step::Layout)
             }
-            None => false,
+            Entry::Files(s) => {
+                self.undo.push(Entry::Files(s.clone()));
+                Some(Step::Files(s))
+            }
+        }
+    }
+    /// A file step just undone or redone came out differently (new names, new Recycle Bin
+    /// files): keep what really happened for the next redo / undo.
+    pub fn update_last(&mut self, undone: bool, op: FileOp) {
+        let stack = if undone { &mut self.redo } else { &mut self.undo };
+        if let Some(Entry::Files(s)) = stack.last_mut() {
+            s.op = op;
         }
     }
 }
@@ -751,9 +821,9 @@ mod tests {
         let mut h = History::default();
         h.record(&l);
         create_box(&mut l, Rect::new(0.0, 0.0, 10.0, 10.0), "x", BoxStyle::default());
-        assert!(h.undo(&mut l));
+        assert!(h.undo(&mut l).is_some());
         assert!(l.boxes.is_empty());
-        assert!(h.redo(&mut l));
+        assert!(h.redo(&mut l).is_some());
         assert_eq!(l.boxes.len(), 1);
     }
 

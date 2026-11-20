@@ -213,14 +213,87 @@ impl App {
             y1 = y1.max(cell.bottom() + m);
         }
         let reach = 480.0;
-        let (x0, y0, x1, y1) = (x0.max(at.x - reach), y0.max(at.y - reach), x1.min(at.x + reach), y1.min(at.y + reach));
+        let (mut x0, mut y0, mut x1, y1) = (x0.max(at.x - reach), y0.max(at.y - reach), x1.min(at.x + reach), y1.min(at.y + reach));
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
+        // How many are being dragged: a badge above the pointer, clear of Windows' caption below it.
+        let count = (self.settings.extras.drag_count && keys.len() > 1).then(|| Pt { x: at.x + 10.0, y: at.y - 26.0 });
+        if let Some(c) = count {
+            x0 = x0.min(c.x - 2.0);
+            y0 = y0.min(c.y - 2.0);
+            x1 = x1.max(c.x + 44.0);
+        }
         let s = self.scale;
         let (w, h) = (((x1 - x0) * s).ceil() as u32, ((y1 - y0) * s).ceil() as u32);
-        let px = self.gpu.render_pixels(w, h, s, (x0, y0), |dc| self.paint_ghost(dc, keys, 0.0, 0.0, 0.85)).ok()?;
+        let px = self
+            .gpu
+            .render_pixels(w, h, s, (x0, y0), |dc| {
+                self.paint_ghost(dc, keys, 0.0, 0.0, 0.85)?;
+                if let Some(c) = count {
+                    self.paint_drag_count(dc, keys.len(), c)?;
+                }
+                Ok(())
+            })
+            .ok()?;
         Some((w, h, px, (((at.x - x0) * s).round() as i32, ((at.y - y0) * s).round() as i32)))
+    }
+
+    /// What the desktop shows while the boxes are above the windows: the wallpaper and the
+    /// icons on it (the boxes are in the window above).
+    pub fn paint_still(&self, dc: &Dc) -> r::R<()> {
+        if let Some(w) = &self.wall {
+            let (ox, oy) = self.mon_offset();
+            let sz = unsafe { w.GetPixelSize() };
+            r::draw_bitmap(dc, w, r::rect(ox, oy, sz.width as f32 / self.scale, sz.height as f32 / self.scale), 1.0);
+        }
+        if !self.settings.show_icons || self.tuck_alpha(None) < 0.5 {
+            return Ok(());
+        }
+        let dt = Self::desktop_theme();
+        for (k, c) in self.loose_view().iter() {
+            if self.items.contains_key(k) {
+                let fx = self.icon_fx(None, k);
+                self.paint_item(dc, k, self.grid.cell_rect(*c), &dt, true, 1.0, fx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The accent badge with how many icons are dragged, its top-left at `at`.
+    fn paint_drag_count(&self, dc: &Dc, n: usize, at: Pt) -> r::R<()> {
+        let (ar, ag, ab) = accent();
+        if let Ok(l) = self.gpu.label(&self.az_tf, &n.to_string(), 60.0, 16.0, 1, false) {
+            let w = (r::text_width(&l) + 10.0).max(18.0);
+            let bx = Rect::new(at.x.round(), at.y.round(), w, 18.0);
+            r::fill_round(dc, rf(bx.offset(0.0, 1.0)), 9.0, rgba(0, 0, 0, 0.3))?;
+            r::fill_round(dc, rf(bx), 9.0, rgba(ar, ag, ab, 1.0))?;
+            r::draw_text(dc, &l, bx.x + (w - r::text_width(&l)) / 2.0, bx.y + (18.0 - r::text_height(&l)) / 2.0, rgba(255, 255, 255, 1.0))?;
+        }
+        Ok(())
+    }
+
+    /// Where a drag would land: the icon taking it highlighted (a folder, the Recycle Bin, a
+    /// program), as Explorer does; else the box outlined, with a marker where our icons go.
+    fn paint_drop_feedback(&self, dc: &Dc, cells: &[(ItemKey, Rect, Option<u32>)], cur: Pt, onto: Option<ItemKey>, own: bool) -> r::R<()> {
+        let (ar, ag, ab) = accent();
+        if let Some(t) = onto {
+            if let Some((_, cell, _)) = cells.iter().find(|(k, _, _)| *k == t) {
+                let hr = self.hit_rect(&t, *cell);
+                r::fill_rect(dc, rf(hr), rgba(ar, ag, ab, 0.35))?;
+                r::stroke_round(dc, rf(hr.inflate(-0.5)), 0.0, rgba(ar, ag, ab, 0.9), 1.0)?;
+            }
+        } else if let Some(b) = self.drop_box(cur).and_then(|id| self.box_by_id(id)) {
+            r::stroke_round(dc, rf(b.rect), radius(), rgba(ar, ag, ab, 0.9), 2.0)?;
+            if own && self.fully_open(b) && cur.y >= b.rect.y + header_h() && !b.az && !b.is_folder() {
+                let (_, at) = self.box_drop_slot(b, cur);
+                let c = App::content_rect(b);
+                r::push_clip(dc, rf(c));
+                r::fill_round(dc, rf(Rect::new(at.x - 1.5, at.y + 6.0, 3.0, self.grid.cell_h - 14.0)), 1.5, rgba(ar, ag, ab, 1.0))?;
+                r::pop_clip(dc);
+            }
+        }
+        Ok(())
     }
 
     fn paint(&self, dc: &Dc) -> r::R<()> {
@@ -251,13 +324,23 @@ impl App {
             if ta < 0.998 {
                 r::push_layer(dc, all, ta)?;
             }
-            // Loose items (where they settle while a box is dragged, gliding there).
+            // Loose items (where they settle while a box is dragged, gliding there). The selected
+            // icon's whole name goes over the icons below it, always (Explorer's): drawn last.
+            let mut last = None;
             for (k, c) in self.loose_view().iter() {
                 if self.items.contains_key(k) {
                     let cell = self.glided(k, self.grid.cell_rect(*c));
+                    if self.is_full_label(k) {
+                        last = Some((k.clone(), cell));
+                        continue;
+                    }
                     let fx = self.icon_fx(None, k);
                     self.paint_item(dc, k, cell, &dt, true, 1.0, fx)?;
                 }
+            }
+            if let Some((k, cell)) = last {
+                let fx = self.icon_fx(None, &k);
+                self.paint_item(dc, &k, cell, &dt, true, 1.0, fx)?;
             }
             self.paint_vanishing(dc, None, &dt, true)?;
             if ta < 0.998 {
@@ -285,35 +368,15 @@ impl App {
                 self.paint_ghost(dc, &dragging, cur.x - start.x, cur.y - start.y, 0.6)?;
                 // How many are being dragged.
                 if self.settings.extras.drag_count && keys.len() > 1 {
-                    let (ar, ag, ab) = accent();
-                    let txt = keys.len().to_string();
-                    if let Ok(l) = self.gpu.label(&self.az_tf, &txt, 60.0, 16.0, 1, false) {
-                        let w = (r::text_width(&l) + 10.0).max(18.0);
-                        let bx = Rect::new((cur.x + 12.0).round(), (cur.y + 14.0).round(), w, 18.0);
-                        r::fill_round(dc, rf(bx.offset(0.0, 1.0)), 9.0, rgba(0, 0, 0, 0.3))?;
-                        r::fill_round(dc, rf(bx), 9.0, rgba(ar, ag, ab, 1.0))?;
-                        r::draw_text(dc, &l, bx.x + (w - r::text_width(&l)) / 2.0, bx.y + (18.0 - r::text_height(&l)) / 2.0, rgba(255, 255, 255, 1.0))?;
-                    }
+                    self.paint_drag_count(dc, keys.len(), Pt { x: cur.x + 12.0, y: cur.y + 14.0 })?;
                 }
-                let (ar, ag, ab) = accent();
-                if let Some(t) = self.drop_onto_item(*cur, keys) {
-                    // Dropping into a folder / onto a program: highlight it, as Explorer does.
-                    if let Some((_, cell, _)) = cells.iter().find(|(k, _, _)| *k == t) {
-                        let hr = self.hit_rect(&t, *cell);
-                        r::fill_rect(dc, rf(hr), rgba(ar, ag, ab, 0.35))?;
-                        r::stroke_round(dc, rf(hr.inflate(-0.5)), 0.0, rgba(ar, ag, ab, 0.9), 1.0)?;
-                    }
-                } else if let Some(b) = self.drop_box(*cur).and_then(|id| self.box_by_id(id)) {
-                    r::stroke_round(dc, rf(b.rect), radius(), rgba(ar, ag, ab, 0.9), 2.0)?;
-                    // Insertion marker where the items will go.
-                    if self.fully_open(b) && cur.y >= b.rect.y + header_h() && !b.az {
-                        let (_, at) = self.box_drop_slot(b, *cur);
-                        let c = App::content_rect(b);
-                        r::push_clip(dc, rf(c));
-                        r::fill_round(dc, rf(Rect::new(at.x - 1.5, at.y + 6.0, 3.0, self.grid.cell_h - 14.0)), 1.5, rgba(ar, ag, ab, 1.0))?;
-                        r::pop_clip(dc);
-                    }
-                }
+                self.paint_drop_feedback(dc, &cells, *cur, self.drop_onto_item(*cur, keys), true)?;
+            }
+            // Windows' drag and drop over us (our icons, or files from an app).
+            Drag::None if self.drop_at.is_some() => {
+                let cells = self.visible_cells();
+                let own = self.own_drag.is_some();
+                self.paint_drop_feedback(dc, &cells, self.drop_at.unwrap(), self.drop_hl.clone(), own)?;
             }
             Drag::Tab { id, tab, cur, .. } => {
                 if let Some(b) = self.box_by_id(*id) {
@@ -360,10 +423,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-        // An icon's name being edited: above everything else.
-        if self.box_edit.as_ref().map(|e| e.item.is_some()).unwrap_or(false) {
-            self.paint_title_field(dc, self.light)?;
         }
         self.paint_search(dc)?;
         self.paint_tip(dc)?;
@@ -505,7 +564,7 @@ impl App {
         };
         let opacity = opacity * (1.0 - 0.3 * fx.blend);
         // Its name is being edited: the field (drawn on top) shows it.
-        if self.box_edit.as_ref().and_then(|e| e.item.as_ref()) == Some(k) {
+        if self.rename.as_ref().map(|r| &r.key) == Some(k) {
             return Ok(());
         }
         let lk = (k.clone(), full, (cell.w - 4.0) as i32);
@@ -675,7 +734,8 @@ impl App {
             Material::Mica => {
                 // The wallpaper under the box, blurred (or sharp with no blur) ...
                 if st.blur < 1.0 {
-                    if let Some(w) = &self.wall {
+                    // (Above the windows: what is behind the box now.)
+                    if let Some(w) = self.above_wall.as_ref().filter(|_| self.is_above()).or(self.wall.as_ref()) {
                         r::fill_with_backdrop(dc, w, 1.0 / self.scale, self.mon_offset(), rf(body), radius())?;
                     }
                 } else if let Some(bd) = self.backdrops.get(&(st.blur as i32)) {
@@ -741,7 +801,7 @@ impl App {
         // their colors), and + (add a tab) while the pointer is on the title.
         let hl = self.header_layout(b);
         let n = b.tabs.len();
-        let editing = self.box_edit.as_ref().filter(|e| e.id == b.id && e.item.is_none()).map(|e| e.tab);
+        let editing = self.box_edit.as_ref().filter(|e| e.id == b.id).map(|e| e.tab);
         let hov = self.hover_hdr.filter(|h| h.0 == b.id && matches!(self.drag, Drag::None));
         let style = self.settings.tabs.style.as_str();
         // A search field over the title hides it.
@@ -958,19 +1018,29 @@ impl App {
         let fade = if open { 1.0 } else { o };
         let tagged = self.az_tagged(b);
         r::push_clip(dc, rf(vis));
+        let a = ta.map(|(_, t)| t).unwrap_or(1.0) * fade;
+        // The selected icon's whole name over the icons below it: drawn last.
+        let mut last = None;
         for (i, k, cell) in self.box_cells_in(b, vis.y - dy, vis.bottom() - dy) {
             let cell = cell.offset(0.0, dy);
             if cell.bottom() < vis.y || cell.y > vis.bottom() {
                 continue;
             }
-            let a = ta.map(|(_, t)| t).unwrap_or(1.0) * fade;
-            let fx = self.icon_fx(Some(b), &k);
-            self.paint_item(dc, &k, cell, &th, !light, a, fx)?;
+            if self.is_full_label(&k) {
+                last = Some((k.clone(), cell));
+            } else {
+                let fx = self.icon_fx(Some(b), &k);
+                self.paint_item(dc, &k, cell, &th, !light, a, fx)?;
+            }
             if let Some((_, c)) = tagged.iter().find(|t| t.0 == i) {
                 if !self.privacy_on() {
                     self.paint_az_tag(dc, *c, cell, th.text, !light, a * self.search_alpha(&k))?;
                 }
             }
+        }
+        if let Some((k, cell)) = last {
+            let fx = self.icon_fx(Some(b), &k);
+            self.paint_item(dc, &k, cell, &th, !light, a, fx)?;
         }
         self.paint_vanishing(dc, Some(b.id), &th, !light)?;
         r::pop_clip(dc);
@@ -1048,10 +1118,6 @@ impl App {
             (rgba(30, 30, 30, 0.96), rgba(255, 255, 255, 1.0), rgba(255, 255, 255, 0.10))
         };
         let a = |c: Color| Color { a: c.a * fade, ..c };
-        // A soft shadow under an icon's field (it floats over the desktop).
-        if be.item.is_some() {
-            r::fill_round(dc, rf(field.offset(0.0, 1.0).inflate(0.5)), 4.5, rgba(0, 0, 0, 0.22 * fade))?;
-        }
         r::fill_round(dc, rf(field), 4.0, a(bg))?;
         r::stroke_round(dc, rf(field.inflate(-0.5)), 4.0, a(edge), 1.0)?;
         let (ar, ag, ab) = accent();

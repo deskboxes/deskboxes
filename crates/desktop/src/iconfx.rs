@@ -93,6 +93,10 @@ impl App {
     }
 
     fn blends(&self, b: Option<&BoxModel>) -> bool {
+        // Above the windows there is no wallpaper to blend into: the boxes' own look.
+        if self.is_above() {
+            return false;
+        }
         match b.map(|b| b.blend.as_str()).unwrap_or("") {
             "on" => true,
             "off" => false,

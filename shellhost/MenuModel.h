@@ -44,6 +44,7 @@ namespace dbx
         bool shift = false;
         bool desktop = false;               // background of the desktop surface (adds the view's own entries)
         bool coreUndo = false, coreRedo = false; // the core has something to undo / redo
+        std::wstring coreUndoText, coreRedoText; // "Undo Move", "Redo Delete" (empty: Windows' "Undo")
         bool keyboard = false;              // opened from the keyboard (Menu key, Shift+F10): show KeyTips
         POINT pt{};                         // physical screen pixels
         HWND owner = nullptr;

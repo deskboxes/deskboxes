@@ -629,7 +629,25 @@ namespace dbx
             std::wstring x = Card(L"&#xE790;", Str(L"tint"), Str(L"tintDesc"), TintBox(L"IconTint", ic.GetNamedString(L"tint", L"").c_str(), false));
             x += Card(L"&#xE706;", Str(L"tintStrength"), L"",
                       L"<Slider x:Name=\"IconTintS\" Minimum=\"10\" Maximum=\"100\" StepFrequency=\"5\" SnapsTo=\"StepValues\" Width=\"220\" Value=\"" + Num(std::round(ic.GetNamedNumber(L"tintStrength", 1.0) * 100.0)) + L"\"/>");
-            x += Card(L"&#xE81E;", Str(L"blend"), Str(L"blendDesc"), Toggle(L"IconBlend", ic.GetNamedBoolean(L"blend", false)));
+            x += Card(L"&#xE7F4;", Str(L"iconsDesktop"), Str(L"iconsDesktopDesc"), Toggle(L"IconDesk", ic.GetNamedBoolean(L"desktop", false)));
+            x += Section(Str(L"eachBox"));
+            auto boxes = g.data.GetNamedArray(L"boxes", JsonArray());
+            if (boxes.Size() == 0) x += Note(Str(L"noBoxes"));
+            for (auto const& b : boxes)
+            {
+                auto o = b.GetObject();
+                std::wstring id = std::to_wstring((long long)o.GetNamedNumber(L"id"));
+                x += Card(L"&#xE8A9;", Esc(std::wstring(o.GetNamedString(L"title", L"").c_str())), L"", TintBox(L"Tint" + id, o.GetNamedString(L"tint", L"").c_str(), true));
+            }
+            return x;
+        }
+
+        // Blend into wallpaper: its own page (it was on Icons, under the tint, and the Home tile
+        // named after it opened Icons, round 11).
+        std::wstring PageBlend()
+        {
+            auto ic = g.data.GetNamedObject(L"icons", JsonObject());
+            std::wstring x = Card(L"&#xE81E;", Str(L"blend"), Str(L"blendDesc"), Toggle(L"IconBlend", ic.GetNamedBoolean(L"blend", false)));
             x += Card(L"&#xE8B9;", Str(L"blendStrength"), L"",
                       L"<Slider x:Name=\"IconBlendS\" Minimum=\"10\" Maximum=\"100\" StepFrequency=\"5\" SnapsTo=\"StepValues\" Width=\"220\" Value=\"" + Num(std::round(ic.GetNamedNumber(L"blendStrength", 0.8) * 100.0)) + L"\"/>");
             x += Card(L"&#xE7F4;", Str(L"iconsDesktop"), Str(L"iconsDesktopDesc"), Toggle(L"IconDesk", ic.GetNamedBoolean(L"desktop", false)));
@@ -644,10 +662,35 @@ namespace dbx
                 auto o = b.GetObject();
                 std::wstring id = std::to_wstring((long long)o.GetNamedNumber(L"id"));
                 std::wstring bl = o.GetNamedString(L"blend", L"").c_str();
-                std::wstring ctl = L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\">" + TintBox(L"Tint" + id, o.GetNamedString(L"tint", L"").c_str(), true) +
-                                   L"<ComboBox x:Name=\"Blend" + id + L"\" MinWidth=\"210\">" + Opt(L"", Str(L"blendAll"), bl.empty()) + Opt(L"on", Str(L"blendOn"), bl == L"on") + Opt(L"off", Str(L"blendOff"), bl == L"off") + L"</ComboBox></StackPanel>";
-                x += Card(L"&#xE8A9;", Esc(std::wstring(o.GetNamedString(L"title", L"").c_str())), L"", ctl);
+                x += Card(L"&#xE8A9;", Esc(std::wstring(o.GetNamedString(L"title", L"").c_str())), L"",
+                          L"<ComboBox x:Name=\"Blend" + id + L"\" MinWidth=\"210\">" + Opt(L"", Str(L"blendAll"), bl.empty()) + Opt(L"on", Str(L"blendOn"), bl == L"on") + Opt(L"off", Str(L"blendOff"), bl == L"off") + L"</ComboBox>");
             }
+            return x;
+        }
+
+        // About: what Deskboxes is, how it works and why it is quick (round 11).
+        std::wstring PageAbout()
+        {
+            auto app = g.data.GetNamedObject(L"app", JsonObject());
+            std::wstring x = Note(Str(L"aboutIntro"));
+            auto part = [&](const wchar_t* glyph, const wchar_t* head, const wchar_t* body)
+            {
+                x += L"<Border Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"20,16\">"
+                     L"<Grid ColumnSpacing=\"16\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>"
+                     L"<FontIcon Glyph=\"" + std::wstring(glyph) + L"\" FontSize=\"20\" VerticalAlignment=\"Top\" Margin=\"0,2,0,0\" Foreground=\"{ThemeResource AccentTextFillColorPrimaryBrush}\"/>"
+                     L"<StackPanel Grid.Column=\"1\" Spacing=\"4\"><TextBlock Text=\"" + Str(head) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\"/>"
+                     L"<TextBlock Text=\"" + Str(body) + L"\" TextWrapping=\"Wrap\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/></StackPanel></Grid></Border>";
+            };
+            x += Section(Str(L"aboutHowHead"));
+            part(L"&#xE8A9;", L"aboutFilesHead", L"aboutFiles");
+            part(L"&#xE7F4;", L"aboutDrawHead", L"aboutDraw");
+            part(L"&#xE8B7;", L"aboutShellHead", L"aboutShell");
+            x += Section(Str(L"aboutFastHead"));
+            part(L"&#xE945;", L"aboutRustHead", L"aboutRust");
+            part(L"&#xE9D9;", L"aboutGpuHead", L"aboutGpu");
+            part(L"&#xE916;", L"aboutLazyHead", L"aboutLazy");
+            part(L"&#xE72E;", L"aboutSafeHead", L"aboutSafe");
+            x += L"<TextBlock Text=\"Deskboxes " + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" Margin=\"1,12,0,0\"/>";
             return x;
         }
 
@@ -770,16 +813,40 @@ namespace dbx
             return Card(L"&#xED1A;", Str(L"privacyAllow"), Str(L"privacyAllowDesc"), Toggle(L"Privacy", app.GetNamedBoolean(L"privacy", true)));
         }
 
+        std::wstring ExeDir()
+        {
+            wchar_t p[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, p, MAX_PATH);
+            std::wstring s = p;
+            return s.substr(0, s.find_last_of(L'\\'));
+        }
+
+        // The clip of a feature (settings/CLIP.mp4, CLIP_l.mp4 in the light theme), if there is one.
+        bool HasClip(const wchar_t* clip)
+        {
+            return clip && GetFileAttributesW((ExeDir() + L"\\settings\\" + clip + L".mp4").c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+
         // A feature's picture, filling a rounded frame: res/settings/NAME.jpg in the dark theme,
-        // NAME_l.jpg in the light one (drawn pictures, made by tools/art). `corner`: the CornerRadius.
-        std::wstring Pic(const std::wstring& name, const std::wstring& size, const wchar_t* corner = L"8")
+        // NAME_l.jpg in the light one (drawn scenes, made by tools/art). `corner`: the CornerRadius.
+        // `clip` (with `key`, naming the elements Clip_KEY and ClipG_KEY): the feature's clip, which
+        // WireClip plays over the picture while the pointer is on it; its first frame is the picture.
+        std::wstring Pic(const std::wstring& name, const std::wstring& size, const wchar_t* corner = L"8", const wchar_t* clip = nullptr, const std::wstring& key = L"")
         {
             auto img = [&](const wchar_t* theme, const std::wstring& file)
             { return std::wstring(L"<ResourceDictionary x:Key=\"") + theme + L"\"><BitmapImage x:Key=\"Pic\" UriSource=\"ms-appx:///settings/" + file + L".jpg\"/></ResourceDictionary>"; };
-            return L"<Border " + size + L" CornerRadius=\"" + corner + L"\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\">"
+            bool anim = HasClip(clip);
+            std::wstring x = L"<Border " + (anim ? std::wstring() : size) + L" CornerRadius=\"" + corner + L"\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\">"
                    L"<Border.Resources><ResourceDictionary><ResourceDictionary.ThemeDictionaries>" + img(L"Default", name) + img(L"Dark", name) + img(L"Light", name + L"_l") +
                    L"</ResourceDictionary.ThemeDictionaries></ResourceDictionary></Border.Resources>"
                    L"<Border.Background><ImageBrush ImageSource=\"{ThemeResource Pic}\" Stretch=\"UniformToFill\" AlignmentY=\"Center\"/></Border.Background></Border>";
+            if (!anim) return x;
+            // The corners go to WireClip in the tag (video is not clipped by a CornerRadius): CLIP;top;bottom.
+            std::wstring c = corner;
+            std::wstring top = c.substr(0, c.find(L',')), bottom = c.find(L',') == std::wstring::npos ? c : c.substr(c.rfind(L',') + 1);
+            return L"<Grid x:Name=\"ClipG_" + key + L"\" " + size + L">" + x +
+                   L"<Grid Margin=\"1\" IsHitTestVisible=\"False\"><MediaPlayerElement x:Name=\"Clip_" + key + L"\" Tag=\"" + clip + L";" + top + L";" + bottom + L"\" Stretch=\"UniformToFill\" Opacity=\"0\""
+                   L" AreTransportControlsEnabled=\"False\" AutoPlay=\"False\"/></Grid></Grid>";
         }
 
         // A key as a keycap.
@@ -797,7 +864,7 @@ namespace dbx
             { L"rollup", L"rollup", L"pageRollup", L"tileRollup", nullptr, nullptr },
             { L"rules", L"rules", L"pageRules", L"tileRules", nullptr, nullptr },
             { L"az", L"az", L"pageAz", L"tileAz", nullptr, nullptr },
-            { L"icons", L"icons", L"tileIconsTitle", L"tileIcons", L"icons", L"blend" },
+            { L"blend", L"blend", L"blend", L"tileBlend", L"icons", L"blend" },
             { L"colors", L"colors", L"pageColors", L"tileColors", nullptr, nullptr },
             { L"folder", L"folder", L"pageFolder", L"tileFolder", nullptr, nullptr },
             { L"above", L"above", L"pageAbove", L"tileAbove", nullptr, nullptr },
@@ -857,11 +924,11 @@ namespace dbx
                 // open the page) has its own column in the title row, so it never covers the
                 // description however the text wraps (it was placed over the tile at a fixed spot and
                 // ran into the description with larger text, round 10).
-                x += L"<Grid Margin=\"0,0,8,8\">"
+                x += L"<Grid x:Name=\"TileG_" + tag + L"\" Margin=\"0,0,8,8\">"
                      L"<Button x:Name=\"Tile_" + tag + L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\""
                      L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\"/>"
                      L"<Grid Margin=\"1\"><Grid.RowDefinitions><RowDefinition Height=\"123\"/><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
-                     L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0") + L"</Grid>"
+                     L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0", t.pic, L"t_" + tag) + L"</Grid>"
                      L"<Grid Grid.Row=\"1\" Margin=\"14,10,10,0\" ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
                      L"<TextBlock Text=\"" + Str(t.title) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" VerticalAlignment=\"Center\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/>";
                 if (t.scope)
@@ -886,7 +953,9 @@ namespace dbx
             };
             auto rollup = g.data.GetNamedObject(L"rollup", JsonObject());
             bool hide = g.data.GetNamedObject(L"hide", JsonObject()).GetNamedBoolean(L"doubleClick", false);
-            std::wstring rows = row(Str(L"scSearch"), Key(L"Ctrl") + Key(L"F")) + row(Str(L"scType"), words(L"scTypeHow")) +
+            // Searching is typing; Ctrl+F does the same and comes second (round 11: two rows read as
+            // if Ctrl+F were for searching from inside an app).
+            std::wstring rows = row(Str(L"scSearch"), words(L"scTypeHow") + words(L"scOr") + Key(L"Ctrl") + Key(L"F")) +
                                 row(Str(L"scUndo"), Key(L"Ctrl") + Key(L"Z")) + row(Str(L"scRedo"), Key(L"Ctrl") + Key(L"Y")) +
                                 row(Str(L"scRename"), Key(L"F2"));
             if (rollup.GetNamedBoolean(L"doubleClick", true)) rows += row(Str(L"scRoll"), words(L"scRollHow"));
@@ -930,6 +999,7 @@ namespace dbx
             { L"rollup", L"pageRollup", L"&#xE70E;", PageRollup, false, true, L"heroRollup", L"rollup" },
             { L"rules", L"pageRules", L"&#xE8CB;", PageRules, false, true, L"rulesIntro", L"rules" },
             { L"az", L"pageAz", L"&#xE8D2;", PageAz, false, true, L"heroAz", L"az" },
+            { L"blend", L"blend", L"&#xE81E;", PageBlend, false, true, L"heroBlend", L"blend" },
             { L"folder", L"pageFolder", L"&#xE8B7;", PageFolder, false, true, L"heroFolder", L"folder" },
             { L"above", L"pageAbove", L"&#xE8A0;", PageAbove, false, true, L"heroAbove", L"above" },
             { L"hide", L"pageHide", L"&#xE91B;", PageHide, false, true, L"heroHide", L"hide" },
@@ -937,6 +1007,7 @@ namespace dbx
             { L"search", L"pageSearch", L"&#xE721;", PageSearch, false, true, L"heroSearch", L"search" },
             { L"locks", L"pageLocks", L"&#xE72E;", PageLocks, false, true, L"heroLocks", L"locks" },
             { L"privacy", L"pagePrivacy", L"&#xED1A;", PagePrivacy, false, true, L"heroPrivacy", L"privacy" },
+            { L"about", L"pageAbout", L"&#xE946;", PageAbout, false, false, nullptr, nullptr },
         };
 
         // A page's top: a picture of the feature on a desktop, and what it does beside it.
@@ -945,7 +1016,7 @@ namespace dbx
             if (!p->pic)
                 return L"<TextBlock Text=\"" + Str(p->hero) + L"\" TextWrapping=\"Wrap\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" Margin=\"0,0,0,16\"/>";
             return L"<Grid ColumnSpacing=\"24\" Margin=\"0,0,0,20\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>" +
-                   Pic(p->pic, L"Width=\"336\" Height=\"189\"") +
+                   Pic(p->pic, L"Width=\"336\" Height=\"189\"", L"8", p->pic, L"hero") +
                    L"<StackPanel Grid.Column=\"1\" VerticalAlignment=\"Center\" Spacing=\"6\"><FontIcon Glyph=\"" + std::wstring(p->glyph) + L"\" FontSize=\"24\" HorizontalAlignment=\"Left\" Foreground=\"{ThemeResource AccentTextFillColorPrimaryBrush}\"/>"
                    L"<TextBlock Text=\"" + Str(p->hero) + L"\" TextWrapping=\"Wrap\" Style=\"{StaticResource BodyTextBlockStyle}\"/></StackPanel></Grid>";
         }
@@ -1014,9 +1085,14 @@ namespace dbx
                     headerDone = true;
                     x += L"<NavigationViewItemHeader Content=\"" + Str(L"navFeatures") + L"\"/>";
                 }
+                if (std::wstring(p.tag) == L"about") continue;
                 x += item(p);
             }
-            x += L"</NavigationView.MenuItems>" + PageXaml(cur, false, false) + L"</NavigationView></Grid>";
+            // About sits at the bottom of the pane, as in Windows' own apps.
+            x += L"</NavigationView.MenuItems><NavigationView.FooterMenuItems>";
+            for (auto const& p : kPages)
+                if (std::wstring(p.tag) == L"about") x += item(p);
+            x += L"</NavigationView.FooterMenuItems>" + PageXaml(cur, false, false) + L"</NavigationView></Grid>";
             return x;
         }
 
@@ -1164,8 +1240,103 @@ namespace dbx
             g.window.DispatcherQueue().TryEnqueue([] { Build(); });
         }
 
+        // A feature's clip (see Pic): while the pointer is on `hover` it plays, muted and looping,
+        // over the picture, which is its first frame; it fades in once it runs and goes when the
+        // pointer leaves. Nothing plays when Windows' animation effects are off. The player is made
+        // on the first hover and kept out of the system's media controls.
+        void WireClip(mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el)
+        {
+            if (!hover || !el) return;
+            std::wstring tag = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
+            size_t a = tag.find(L';'), b = tag.rfind(L';');
+            if (a == std::wstring::npos || a == b) return;
+            std::wstring clip = tag.substr(0, a);
+            float rt = std::max(0.f, (float)_wtof(tag.substr(a + 1, b - a - 1).c_str()) - 1), rb = std::max(0.f, (float)_wtof(tag.substr(b + 1).c_str()) - 1);
+            winrt::weak_ref<muxc::MediaPlayerElement> weak = el;
+            // The corners are cut on the frame around the player (an element with an
+            // OpacityTransition gives no composition visual), found once it is laid out.
+            el.SizeChanged([weak, rt, rb](auto&&, auto&&)
+                {
+                    auto e = weak.get();
+                    if (!e) return;
+                    auto frame = mux::Media::VisualTreeHelper::GetParent(e).try_as<mux::UIElement>();
+                    if (!frame) return;
+                    auto vis = mux::Hosting::ElementCompositionPreview::GetElementVisual(frame);
+                    vis.Clip(vis.Compositor().CreateRectangleClip(0, 0, (float)e.ActualWidth(), (float)e.ActualHeight(), { rt, rt }, { rt, rt }, { rb, rb }, { rb, rb }));
+                });
+            mux::ScalarTransition fade;
+            fade.Duration(std::chrono::milliseconds(160));
+            el.OpacityTransition(fade);
+            // The tile's button marks pointer events handled, so these listen to handled ones too.
+            auto play = [weak, clip](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
+                {
+                    auto e = weak.get();
+                    if (!e || !winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) return;
+                    // The element comes with an empty player of its own: ours is the one with a source.
+                    auto had = e.MediaPlayer();
+                    if (had && had.Source())
+                    {
+                        had.PlaybackSession().Position(std::chrono::seconds(0));
+                        had.Play();
+                        return;
+                    }
+                    std::wstring file = ExeDir() + L"\\settings\\" + clip + (e.ActualTheme() == mux::ElementTheme::Light ? L"_l" : L"") + L".mp4";
+                    if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+                    namespace wmp = winrt::Windows::Media::Playback;
+                    try
+                    {
+                        wmp::MediaPlayer mp;
+                        mp.CommandManager().IsEnabled(false);
+                        mp.IsMuted(true);
+                        mp.IsLoopingEnabled(true);
+                        mp.AutoPlay(false);
+                        mp.PlaybackSession().PlaybackStateChanged([weak](wmp::MediaPlaybackSession const& s, auto&&)
+                            {
+                                if (s.PlaybackState() != wmp::MediaPlaybackState::Playing) return;
+                                g.window.DispatcherQueue().TryEnqueue([weak]
+                                    {
+                                        // Still playing (the pointer may have left meanwhile): show it.
+                                        auto e = weak.get();
+                                        if (e && e.MediaPlayer() && e.MediaPlayer().PlaybackSession().PlaybackState() == wmp::MediaPlaybackState::Playing) e.Opacity(1);
+                                    });
+                            });
+                        mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f) { Log(L"settings: clip %s failed: %s", clip.c_str(), f.ErrorMessage().c_str()); });
+                        e.SetMediaPlayer(mp);
+                        // file:///C:/... with anything but letters, digits and -._~: escaped (a space in the user's name).
+                        std::wstring u = L"file:///";
+                        for (wchar_t ch : file)
+                        {
+                            if (ch == L'\\') u += L'/';
+                            else if ((ch < 128 && iswalnum(ch)) || wcschr(L"-._~:", ch)) u += ch;
+                            else
+                            {
+                                char utf8[8]{};
+                                int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, sizeof utf8, nullptr, nullptr);
+                                for (int i = 0; i < n; i++) { wchar_t h[4]; swprintf_s(h, L"%%%02X", (unsigned char)utf8[i]); u += h; }
+                            }
+                        }
+                        mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(u)));
+                        mp.Play();
+                    }
+                    catch (winrt::hresult_error const& x) { Log(L"settings: clip %s: %s", clip.c_str(), x.message().c_str()); }
+                };
+            auto stop = [weak](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
+            {
+                auto e = weak.get();
+                if (!e) return;
+                e.Opacity(0);
+                if (auto mp = e.MediaPlayer()) mp.Pause();
+            };
+            hover.AddHandler(mux::UIElement::PointerEnteredEvent(), winrt::box_value(mux::Input::PointerEventHandler(play)), true);
+            for (auto ev : { mux::UIElement::PointerExitedEvent(), mux::UIElement::PointerCanceledEvent(), mux::UIElement::PointerCaptureLostEvent() })
+                hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(stop)), true);
+        }
+
         void Wire(mux::FrameworkElement const& root)
         {
+            for (auto const& t : kTiles)
+                WireClip(Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<muxc::MediaPlayerElement>(root, L"Clip_t_" + std::wstring(t.page)));
+            WireClip(Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"));
             if (auto nav = Find<muxc::NavigationView>(root, L"Nav"))
                 nav.SelectionChanged([](auto&&, muxc::NavigationViewSelectionChangedEventArgs const& e)
                 {

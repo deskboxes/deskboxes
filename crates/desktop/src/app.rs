@@ -1,10 +1,10 @@
 //! The core's UI thread: windows, state, input, menus, boxes, persistence (ARCHITECTURE §2–§10).
 
-use crate::events::{self, Ev, WM_APP_DRAW, WM_APP_EVENTS, WM_APP_REFOCUS};
+use crate::events::{self, Ev, WM_APP_DRAW, WM_APP_EVENTS, WM_APP_REFOCUS, WM_APP_RENAME_END};
 use crate::textedit::TextEdit;
 use crate::worker::{self, Req};
 use crate::{Args, Paths};
-use deskboxes_core::layout::{self, History};
+use deskboxes_core::layout::{self, FileOp, FileStep, History, Step};
 use deskboxes_core::persist;
 use deskboxes_core::selection::Selection;
 use deskboxes_core::snapshot::{IconImage, Snapshot};
@@ -21,6 +21,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{EM_GETLINECOUNT, EM_GETSEL, EM_REPLACESEL, EM_SETMARGINS, EM_SETSEL, EM_UNDO};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -249,12 +250,10 @@ pub struct Dock {
     pub right: bool,
 }
 
-/// A name being edited in place, drawn by us: a box (tab) title in its header, or an icon's
-/// name under it (`item`; `id` is then the box holding it, or 0).
+/// A box (tab) title being edited in place in its header, drawn by us.
 pub struct BoxEdit {
     pub id: u32,
     pub tab: usize,
-    pub item: Option<ItemKey>,
     /// When the field appeared (it fades in).
     pub since: Instant,
     pub ed: TextEdit,
@@ -263,6 +262,18 @@ pub struct BoxEdit {
     pub selecting: bool,
     /// First half of a surrogate pair typed (WM_CHAR delivers them one at a time).
     pub hi: Option<u16>,
+}
+
+/// An icon's name being edited: Windows' own text box under the icon (as Explorer's desktop
+/// has it: the name wraps onto more lines, the field grows with it, the I-beam, arrows,
+/// selecting with the mouse, Ctrl+Z, the clipboard all work).
+pub struct ItemRename {
+    pub edit: HWND,
+    pub key: ItemKey,
+    pub since: Instant,
+    font: HFONT,
+    brush: HBRUSH,
+    dark: bool,
 }
 
 /// Box background blur presets for the box menu (DIPs).
@@ -377,6 +388,23 @@ pub struct App {
     pub menu: Option<(u32, MenuCtx)>,
     /// An icon created from the "New" menu: sorted by the rules once its name is given.
     pub sort_after_rename: Option<ItemKey>,
+    /// An icon's name being edited (Windows' text box).
+    pub rename: Option<ItemRename>,
+    /// Boxes above windows: where its window is from the surface's top-left (px), the wallpaper
+    /// backdrops put aside meanwhile, and what is behind the boxes then (sharp).
+    pub above_off: (i32, i32),
+    /// A folder picker asked for (folder boxes).
+    pub pick_req: Option<crate::folderbox::PickReq>,
+    pub saved_backdrops: Option<HashMap<i32, Bitmap>>,
+    pub above_wall: Option<Bitmap>,
+    /// Windows' drag and drop over our surface: where, the icon that would take it, the box slot.
+    pub drop_at: Option<Pt>,
+    pub drop_hl: Option<ItemKey>,
+    drop_slot: Option<(u32, usize)>,
+    /// Windows' drag and drop could not start for this drag: ours, on the surface.
+    ole_fallback: bool,
+    /// Icons an undo is bringing back, and where they go (until they show up, 10 s at most).
+    returning: Option<(Instant, Vec<(ItemKey, Place, usize)>)>,
     /// Edit this icon's name once the layout is redrawn (it was just created).
     pub pending_rename: Option<ItemKey>,
     /// "New" chosen in a menu: when, where (point, box), and the icons there were before.
@@ -725,6 +753,13 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
             let _ = SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
         });
     }
+    // The UI thread (this one) a step above the rest: on a busy PC (startup apps, a slower CPU)
+    // the selection rectangle and drags kept up badly behind other work (round 11, i5 + 1060).
+    // It is idle unless you use the desktop; scans and icons stay on normal worker threads.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
     let desktop_mode = !args.window;
     let fixture = args.desktop_dir.clone();
     let lang = Lang::pick(&settings.language, windows::Win32::Globalization::GetUserDefaultUILanguage());
@@ -891,6 +926,16 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         host_starts: vec![],
         menu: None,
         sort_after_rename: None,
+        rename: None,
+        returning: None,
+        above_off: (0, 0),
+        pick_req: None,
+        saved_backdrops: None,
+        above_wall: None,
+        drop_at: None,
+        drop_hl: None,
+        drop_slot: None,
+        ole_fallback: false,
         pending_rename: None,
         pending_new: None,
         box_edit: None,
@@ -1042,7 +1087,12 @@ impl App {
         let mons = wallpaper::monitors();
         let m = mons.iter().find(|m| m.rect.left == self.mon.left && m.rect.top == self.mon.top).or(mons.first()).cloned();
         let (mw, mh) = ((self.mon.right - self.mon.left) as u32, (self.mon.bottom - self.mon.top) as u32);
-        let (path, pos, color) = m.map(|m| (m.path, m.position, m.color)).unwrap_or_default();
+        let (mut path, mut pos, color) = m.map(|m| (m.path, m.position, m.color)).unwrap_or_default();
+        // DESKBOXES_WALLPAPER: a test copy on another picture (filled), for screenshots.
+        if let Ok(p) = std::env::var("DESKBOXES_WALLPAPER") {
+            path = p;
+            pos = 4;
+        }
         let bg = deskboxes_render::rgba((color & 0xff) as u8, ((color >> 8) & 0xff) as u8, ((color >> 16) & 0xff) as u8, 1.0);
         // We draw the wallpaper ourselves in both modes. On the desktop, Windows 11 (24H2+) paints
         // the wallpaper in a separate child of Progman that our full-screen surface covers, so it is
@@ -1704,7 +1754,7 @@ impl App {
     /// The pointer rested on an icon: ask the worker for Explorer's tooltip text.
     fn tip_due(&mut self) {
         // Privacy mode: no names in tooltips either.
-        if !matches!(self.drag, Drag::None) || self.menu.is_some() || self.box_edit.as_ref().map(|e| e.item.is_some()).unwrap_or(false) || self.privacy_on() {
+        if !matches!(self.drag, Drag::None) || self.menu.is_some() || self.rename.is_some() || self.privacy_on() {
             return;
         }
         let Some(k) = self.hover.clone() else { return };
@@ -1764,6 +1814,66 @@ impl App {
         }
     }
 
+    /// The icons a selection band touches: in its box (`scope`), or loose on the desktop.
+    fn band_hits(&self, band: Rect, scope: Option<u32>) -> BTreeSet<ItemKey> {
+        self.cells_in_view()
+            .into_iter()
+            .filter(|(k, cell, b)| {
+                // (A cell far from the band can't be touched: its long name reaches a cell down at most.)
+                if *b != scope || !cell.intersects(&band.inflate(self.grid.cell_h)) {
+                    return false;
+                }
+                let visible = b.and_then(|id| self.box_by_id(id)).map(|bx| Self::content_rect(bx).intersects(cell)).unwrap_or(true);
+                visible && self.hit_rect(k, *cell).intersects(&band)
+            })
+            .map(|(k, _, _)| k)
+            .collect()
+    }
+
+    /// Something dragged over us (our icons or files from an app): a rolled-up box opens, a tab
+    /// held over switches, a box's icons scroll near its top or bottom.
+    fn drag_hover(&mut self, p: Pt) {
+        self.hover_reveal(p, true);
+        match self.hit_test(p) {
+            Hit::Header { id, tab: Some(t), .. } => self.arm_tab_switch(id, t, 450),
+            _ => self.pending_tab = None,
+        }
+        if let Some(b) = self.drop_box(p).and_then(|id| self.box_by_id(id)) {
+            let (c, max, id) = (Self::content_rect(b), self.max_scroll(b), b.id);
+            let step = if p.y < c.y + 24.0 {
+                -12.0
+            } else if p.y > c.bottom() - 24.0 {
+                12.0
+            } else {
+                0.0
+            };
+            if step != 0.0 && max > 0.0 {
+                let s = self.scroll.entry(id).or_insert(0.0);
+                *s = (*s + step).clamp(0.0, max);
+                self.invalidate();
+            }
+        }
+    }
+
+    /// Windows' drag and drop over our surface (`p` None: it left or dropped), and the icon that
+    /// would take the drop (highlighted, as Explorer does).
+    pub fn ole_drag_over(&mut self, p: Option<Pt>, hl: Option<ItemKey>) {
+        if let Some(p) = p {
+            self.drag_hover(p);
+        } else {
+            self.pending_tab = None;
+            self.pending_reveal = None;
+        }
+        // Redrawn only when the feedback changes: the insertion marker moves by slot.
+        let slot = p.and_then(|p| self.drop_box(p).and_then(|id| self.box_by_id(id)).map(|b| (b.id, self.box_drop_slot(b, p).0)));
+        if hl != self.drop_hl || slot != self.drop_slot || p.is_some() != self.drop_at.is_some() {
+            self.drop_slot = slot;
+            self.drop_hl = hl;
+            self.invalidate();
+        }
+        self.drop_at = p;
+    }
+
     /// The window under the pointer is our surface (or the desktop it sits on).
     pub fn pointer_over_us(&self) -> bool {
         let mut c = POINT::default();
@@ -1774,9 +1884,10 @@ impl App {
         }
     }
 
-    /// A box's color as shown now: its open tab's own, else the box's (None = automatic).
+    /// A box's color as shown now: its open tab's box color, else that tab's own color (a
+    /// colored tab colors the box behind it), else the box's (None = automatic).
     pub fn box_color(b: &BoxModel) -> Option<Rgba> {
-        b.tabs.get(b.active_tab).and_then(|t| t.box_color).or(b.style.color)
+        b.tabs.get(b.active_tab).and_then(|t| t.box_color.or(t.color)).or(b.style.color)
     }
 
     pub fn cursor_dip(&self) -> Pt {
@@ -1799,6 +1910,8 @@ impl App {
     /// its menu open).
     fn roll_check(&mut self) {
         let p = self.cursor_dip();
+        // Over another window (an app above the box): the box is not pointed at any more.
+        let over_us = self.pointer_over_us();
         let menu_box = match self.menu.as_ref().map(|(_, c)| &c.hit) {
             Some(Hit::Header { id, .. } | Hit::BoxBody { id } | Hit::Edge { id, .. } | Hit::Item { in_box: Some(id), .. }) => Some(*id),
             _ => None,
@@ -1809,8 +1922,15 @@ impl App {
             .copied()
             .filter(|id| {
                 let Some(b) = self.box_by_id(*id) else { return false };
-                let busy = matches!(self.drag, Drag::MoveBox { id: d, .. } | Drag::Resize { id: d, .. } if d == *id) || matches!(self.drag, Drag::Items { .. });
-                b.rect.inflate(12.0).contains(p) || busy || menu_box == Some(*id) || self.box_edit.as_ref().map(|e| e.id == *id).unwrap_or(false)
+                // Busy with it: moved, resized, icons dragged (ours or Windows' drag), a selection
+                // band started in it (it stays open however far the band goes).
+                let busy = matches!(self.drag, Drag::MoveBox { id: d, .. } | Drag::Resize { id: d, .. } if d == *id)
+                    || matches!(self.drag, Drag::Items { .. })
+                    || matches!(self.drag, Drag::Rubber { scope: Some(s), .. } if s == *id)
+                    || matches!(self.drag, Drag::RightRubber { start, .. } if b.rect.contains(start))
+                    || self.own_drag.is_some()
+                    || self.drop_at.map(|q| b.rect.inflate(12.0).contains(q)).unwrap_or(false);
+                (over_us && b.rect.inflate(12.0).contains(p)) || busy || menu_box == Some(*id) || self.box_edit.as_ref().map(|e| e.id == *id).unwrap_or(false)
             })
             .collect();
         if keep.len() != self.revealed.len() {
@@ -1819,7 +1939,7 @@ impl App {
         }
         // The pointer is over another window now (maybe still above the box): the box is not
         // pointed at any more, so it blends into the wallpaper again.
-        if !self.pointer_over_us() {
+        if !over_us {
             self.blend_pointer(Pt { x: -1.0e6, y: -1.0e6 });
         }
         if !self.revealed.is_empty() {
@@ -2168,6 +2288,12 @@ impl App {
         (self.origin_px.x + (p.x * self.scale).round() as i32, self.origin_px.y + (p.y * self.scale).round() as i32)
     }
 
+    /// A point in our window's client area (the boxes-above window starts lower when the
+    /// taskbar is at the top).
+    pub fn client_dip(&self, x: i32, y: i32) -> Pt {
+        self.to_dip(x + self.above_off.0, y + self.above_off.1)
+    }
+
     pub fn screen_to_dip(&self, x: i32, y: i32) -> Pt {
         self.to_dip(x - self.origin_px.x, y - self.origin_px.y)
     }
@@ -2446,8 +2572,12 @@ impl App {
                 self.pending_new = None;
             }
         }
+        // Icons an undo brought back: where they were.
+        let back = self.place_returning(&old, &present);
+        dropped.extend(back.iter().cloned());
+        self.no_glide.extend(back);
         // A new icon named after "New": the rules sort it now.
-        let renamed_new = self.sort_after_rename.clone().filter(|k| self.box_edit.as_ref().and_then(|e| e.item.as_ref()) != Some(k) && !old.is_empty());
+        let renamed_new = self.sort_after_rename.clone().filter(|k| self.rename.as_ref().map(|r| &r.key) != Some(k) && !old.is_empty());
         let changed = layout::reconcile(&mut self.layout, &present, &self.grid);
         let changed = self.sort_new_items(&old, &dropped) | changed;
         let changed = match renamed_new {
@@ -2625,9 +2755,13 @@ impl App {
                             json!({ "id": format!("dbx.fbknown:{}", p.display()), "text": t(self.lang, s), "glyph": "\u{E8B7}" })
                         })
                         .collect();
+                    // Any folder: Windows' folder picker.
+                    let mut kf = kf;
                     if !kf.is_empty() {
-                        sub.push(json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
+                        kf.push(json!({ "separator": true }));
                     }
+                    kf.push(json!({ "id": "dbx.fbchoose", "text": t(self.lang, S::FolderBoxChoose), "glyph": "\u{ED25}" }));
+                    sub.push(json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
                     sub.push(json!({ "separator": true }));
                 }
                 sub.push(json!({ "id": "dbx.sortnow", "text": t(self.lang, S::SortNow), "glyph": "\u{E8CB}" }));
@@ -2673,9 +2807,9 @@ impl App {
                 ];
                 // In a folder box: its folder's menu (New, Paste go there).
                 if let Some(f) = bid.and_then(|id| self.box_by_id(id)).filter(|b| b.is_folder()).map(|b| b.folder_now().to_string()) {
-                    return json!({ "kind": "background", "folder": f, "desktop": false, "shift": key_down(VK_SHIFT), "undo": self.hist.can_undo(), "redo": self.hist.can_redo(), "extra": extra, "own": { "view": view, "arrange": sort } });
+                    return json!({ "kind": "background", "folder": f, "desktop": false, "shift": key_down(VK_SHIFT), "undo": self.hist.can_undo(), "redo": self.hist.can_redo(), "undo_text": self.undo_text(true), "redo_text": self.undo_text(false), "extra": extra, "own": { "view": view, "arrange": sort } });
                 }
-                json!({ "kind": "background", "folder": self.folder_arg(), "desktop": true, "shift": key_down(VK_SHIFT), "undo": self.hist.can_undo(), "redo": self.hist.can_redo(), "extra": extra, "own": { "view": view, "arrange": sort } })
+                json!({ "kind": "background", "folder": self.folder_arg(), "desktop": true, "shift": key_down(VK_SHIFT), "undo": self.hist.can_undo(), "redo": self.hist.can_redo(), "undo_text": self.undo_text(true), "redo_text": self.undo_text(false), "extra": extra, "own": { "view": view, "arrange": sort } })
             }
         }
     }
@@ -3324,6 +3458,7 @@ impl App {
                 top.push(json!({ "id": "dbx.folderup", "text": t(l, S::FolderUp), "glyph": "\u{E72B}", "placement": "top" }));
             }
             top.push(json!({ "id": "dbx.folderexplore", "text": t(l, S::FolderOpenExplorer), "glyph": "\u{EC50}", "placement": "top" }));
+            top.push(json!({ "id": "dbx.fbchange", "text": t(l, S::FolderBoxChange), "glyph": "\u{ED25}", "placement": "top" }));
         }
         // Right-clicked a tab: what you do to a tab, right there.
         if at_tab.is_some() && b.tabs.len() > 1 && !self.locks(b).tabs {
@@ -3432,6 +3567,11 @@ impl App {
                 let ctx = self.menu.as_ref().map(|(_, c)| c.clone());
                 self.on_command(&cmd, ctx);
             }
+            // A menu closed for a newer one (a right-click elsewhere while it was open): the new
+            // one is the open menu now.
+            "closed" if self.menu.as_ref().map(|(id, _)| v["id"].as_f64() != Some(*id as f64)).unwrap_or(false) => {
+                log::info!("menu {} closed for the next one", v["id"]);
+            }
             "closed" => {
                 log::info!("menu closed invoked={} {}", v["invoked"], v["error"]);
                 if v["invoked"].as_str().map(is_new_verb).unwrap_or(false) {
@@ -3486,6 +3626,8 @@ impl App {
             }
             "undo" => self.undo(),
             "redo" => self.redo(),
+            // Windows' Delete, run by us so it can be undone.
+            "delete" => self.delete_selection(!key_down(VK_SHIFT)),
             "paste" | "pastelink" => {
                 let (x, y) = self.to_screen(at);
                 self.pending_drop = Some((Instant::now(), at, box_id));
@@ -3559,6 +3701,12 @@ impl App {
             "dbx.folderexplore" => {
                 if let Some(f) = box_id.and_then(|id| self.box_by_id(id)).map(|b| b.folder_now().to_string()) {
                     deskboxes_shell::open_default(vec![f], self.hwnd.0 as isize);
+                }
+            }
+            "dbx.fbchoose" => self.ask_folder(None, at),
+            "dbx.fbchange" => {
+                if let Some(id) = box_id {
+                    self.ask_folder(Some(id), at);
                 }
             }
             c if c.starts_with("dbx.fbknown:") => {
@@ -3857,16 +4005,112 @@ impl App {
         self.invalidate();
     }
 
+    /// Delete the selected files (Delete, the menu's Delete): into the Recycle Bin, or for good
+    /// with Windows' own confirmation.
+    pub fn delete_selection(&mut self, recycle: bool) {
+        let order = self.order();
+        let paths: Vec<String> = self
+            .sel
+            .ordered(&order)
+            .iter()
+            .filter_map(|k| self.items.get(k))
+            .filter(|i| i.kind != ItemKind::Virtual)
+            .map(|i| i.parsing_name.clone())
+            .collect();
+        if !paths.is_empty() {
+            let _ = self.worker.send(Req::Delete { paths, recycle });
+        }
+    }
+
+    /// Undo goes back through what was done, as Explorer's: icon moves and box changes here,
+    /// and moves into folders, the Recycle Bin and renames on disk.
     fn undo(&mut self) {
-        if self.hist.undo(&mut self.layout) {
-            self.layout_changed();
+        match self.hist.undo(&mut self.layout) {
+            Some(Step::Layout) => self.layout_changed(),
+            Some(Step::Files(s)) => self.run_file_step(s, true),
+            None => {}
         }
     }
 
     fn redo(&mut self) {
-        if self.hist.redo(&mut self.layout) {
-            self.layout_changed();
+        match self.hist.redo(&mut self.layout) {
+            Some(Step::Layout) => self.layout_changed(),
+            Some(Step::Files(s)) => self.run_file_step(s, false),
+            None => {}
         }
+    }
+
+    /// The menu's "Undo Move" / "Redo Delete" for a file step next ("" for a layout change: plain Undo).
+    fn undo_text(&self, undo: bool) -> &'static str {
+        let next = if undo { self.hist.next_undo() } else { self.hist.next_redo() };
+        let s = match next.flatten() {
+            Some(FileOp::Moved(_)) => if undo { S::UndoMove } else { S::RedoMove },
+            Some(FileOp::Copied(_)) => if undo { S::UndoCopy } else { S::RedoCopy },
+            Some(FileOp::Recycled(_)) => if undo { S::UndoDelete } else { S::RedoDelete },
+            Some(FileOp::Renamed(..)) => if undo { S::UndoRename } else { S::RedoRename },
+            None => return "",
+        };
+        t(self.lang, s)
+    }
+
+    fn run_file_step(&mut self, s: FileStep, undo: bool) {
+        // Icons coming back (an undone move or delete) go back where they were.
+        if undo && matches!(s.op, FileOp::Moved(_) | FileOp::Recycled(_)) && !s.places.is_empty() {
+            self.returning = Some((Instant::now(), s.places.clone()));
+        }
+        let _ = self.worker.send(Req::UndoFiles { op: s.op, undo });
+    }
+
+    /// A file operation went through: a new one goes into the undo history with where its icons
+    /// were; an undone or redone one keeps what really happened (new names, bin files).
+    pub fn on_file_done(&mut self, op: FileOp, undo: Option<bool>) {
+        if let Some(u) = undo {
+            self.hist.update_last(u, op);
+            return;
+        }
+        let froms: Vec<String> = match &op {
+            FileOp::Moved(v) | FileOp::Recycled(v) => v.iter().map(|(a, _)| a.to_lowercase()).collect(),
+            FileOp::Copied(_) | FileOp::Renamed(..) => vec![],
+        };
+        let mut places = vec![];
+        for it in self.items.values().filter(|i| froms.contains(&i.parsing_name.to_lowercase())) {
+            if let Some(p) = layout::place_of(&self.layout, &it.key) {
+                let ix = match &p {
+                    Place::Box { box_id, .. } => self.box_by_id(*box_id).and_then(|b| b.contains(&it.key)).map(|(_, i)| i).unwrap_or(0),
+                    Place::Grid(_) => 0,
+                };
+                places.push((it.key.clone(), p, ix));
+            }
+        }
+        log::info!("undo step: {op:?}, {} icon place(s)", places.len());
+        self.hist.record_files(FileStep { op, places });
+    }
+
+    /// Icons an undo brought back (from a folder, the Recycle Bin): put at their old place.
+    fn place_returning(&mut self, old: &BTreeSet<ItemKey>, present: &[ItemKey]) -> Vec<ItemKey> {
+        let Some((when, mut places)) = self.returning.take() else { return vec![] };
+        if when.elapsed().as_secs() >= 10 {
+            return vec![];
+        }
+        let (mut back, rest): (Vec<_>, Vec<_>) = places.drain(..).partition(|(k, _, _)| present.contains(k) && !old.contains(k));
+        if !rest.is_empty() {
+            self.returning = Some((when, rest));
+        }
+        back.sort_by_key(|(_, _, ix)| *ix);
+        if !back.is_empty() {
+            log::info!("undo: {} icon(s) back in place", back.len());
+        }
+        for (k, p, ix) in &back {
+            match p {
+                Place::Grid(c) => layout::move_to_grid_at(&mut self.layout, &[(k.clone(), *c)], &self.grid),
+                Place::Box { box_id, tab } => {
+                    if let Some(ti) = self.box_by_id(*box_id).and_then(|b| b.tabs.iter().position(|t| t.id == *tab)) {
+                        layout::move_to_tab(&mut self.layout, std::slice::from_ref(k), *box_id, ti, Some(*ix));
+                    }
+                }
+            }
+        }
+        back.into_iter().map(|(k, _, _)| k).collect()
     }
 
     // ---------------------------------------------------------------- rename
@@ -3880,7 +4124,6 @@ impl App {
             self.box_edit = Some(BoxEdit {
                 id,
                 tab,
-                item: None,
                 since: Instant::now(),
                 ed: TextEdit::new(&title),
                 caret_on: true,
@@ -3898,24 +4141,67 @@ impl App {
         }
         let RenameTarget::Item(k) = target else { return };
         let Some(it) = self.items.get(&k) else { return };
-        if self.visible_cells().iter().all(|(x, _, _)| *x != k) {
-            return;
-        }
+        let Some((_, cell, _)) = self.visible_cells().into_iter().find(|(x, _, _)| *x == k) else { return };
+        let (_, label) = self.item_parts(&k, cell, true);
         let text = it.display_name.clone();
-        let mut ed = TextEdit::new(&text);
         // Explorer selects the name without the extension.
-        if let Some(dot) = text.rfind('.').filter(|d| *d > 0 && !it.is_folder()) {
-            ed.move_to(0, false);
-            ed.move_to(text[..dot].chars().count(), true);
-        }
-        let id = self.layout.boxes.iter().find(|b| b.tabs.iter().any(|t| t.items.contains(&k))).map(|b| b.id).unwrap_or(0);
-        self.box_edit = Some(BoxEdit { id, tab: 0, item: Some(k), since: Instant::now(), ed, caret_on: true, selecting: false, hi: None });
+        let sel_end = match text.rfind('.') {
+            Some(dot) if dot > 0 && !it.is_folder() => text[..dot].encode_utf16().count(),
+            _ => text.encode_utf16().count(),
+        };
+        // A little wider than the icon's cell, under the icon, kept on the screen.
+        let fw = cell.w + 16.0;
+        let fx = (cell.x - 8.0).clamp(0.0, (self.size_dip.0 - fw).max(0.0));
+        let (x, y) = self.to_screen(Pt { x: fx, y: label.y - 3.0 });
+        let w = (fw * self.scale).round() as i32;
+        let dark = !self.light;
         unsafe {
-            let root = GetAncestor(self.hwnd, GA_ROOT);
-            let _ = SetForegroundWindow(root);
-            let _ = SetFocus(Some(self.hwnd));
+            let wt: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            // Multi-line without horizontal scrolling: long names wrap, centred, as on Explorer's desktop.
+            let style = WS_POPUP | WS_BORDER | WINDOW_STYLE((ES_CENTER | ES_MULTILINE | ES_AUTOVSCROLL) as u32);
+            let Ok(edit) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("EDIT"), PCWSTR(wt.as_ptr()), style, x, y, w, 20, Some(self.hwnd), None, None, None) else {
+                return;
+            };
+            let font = CreateFontW(
+                -((self.font.1 * self.scale).round() as i32),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                0,
+                &windows::core::HSTRING::from(self.font.0.as_str()),
+            );
+            SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(0)));
+            // One line's height in this font.
+            let line_px = {
+                let dc = GetDC(Some(edit));
+                let old = SelectObject(dc, font.into());
+                let mut tm = TEXTMETRICW::default();
+                let _ = GetTextMetricsW(dc, &mut tm);
+                SelectObject(dc, old);
+                ReleaseDC(Some(edit), dc);
+                tm.tmHeight.max(1)
+            };
+            let m = (2.0 * self.scale).round() as usize;
+            SendMessageW(edit, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM((m | (m << 16)) as isize)));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(sel_end as isize)));
+            let brush = CreateSolidBrush(COLORREF(if dark { 0x002B2B2B } else { 0x00FFFFFF }));
+            SetWindowLongPtrW(edit, GWLP_USERDATA, line_px as isize);
+            RENAME_OLD_PROC.with(|o| o.set(SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_proc as *const () as isize)));
+            self.rename = Some(ItemRename { edit, key: k, since: Instant::now(), font, brush, dark });
+            fit_rename(edit, line_px);
+            let _ = ShowWindow(edit, SW_SHOW);
+            let _ = SetForegroundWindow(edit);
+            let _ = SetFocus(Some(edit));
         }
-        self.restart_caret();
+        // Its label under the field is not drawn meanwhile.
         self.invalidate();
     }
 
@@ -3945,25 +4231,6 @@ impl App {
     /// while it fits, else scrolled so the caret stays visible).
     pub fn box_edit_layout(&self) -> Option<(Rect, TextLayout, f32)> {
         let be = self.box_edit.as_ref()?;
-        if let Some(k) = &be.item {
-            // An icon's name: a field under the icon as wide as the name (at least the cell, at
-            // most two and a half cells), centred on the cell and kept on the screen.
-            let (_, cell, _) = self.visible_cells().into_iter().find(|(x, _, _)| x == k)?;
-            let (_, label) = self.item_parts(k, cell, true);
-            let l = self.gpu.label(&self.label_tf, &be.ed.string(), 10_000.0, self.line_h, 0, false).ok()?;
-            let w = deskboxes_render::text_width(&l);
-            let fw = (w + 20.0).clamp(cell.w + 8.0, cell.w * 2.5).round();
-            let fx = (cell.x + (cell.w - fw) / 2.0).clamp(2.0, (self.size_dip.0 - fw - 2.0).max(2.0)).round();
-            let field = Rect::new(fx, (label.y - 4.0).round(), fw, (self.line_h + 9.0).round());
-            let inner = field.w - 16.0;
-            let x = if w <= inner {
-                field.x + (field.w - w) / 2.0
-            } else {
-                let cx = deskboxes_render::caret_x(&l, be.ed.utf16_pos(be.ed.caret));
-                field.x + 8.0 - (cx - inner + 2.0).max(0.0)
-            };
-            return Some((field, l, x));
-        }
         let b = self.box_by_id(be.id)?;
         let field = self.title_field(b, be.tab);
         let l = self.gpu.label(&self.title_tf_bold, &be.ed.string(), 10_000.0, self.title_line_h, 0, false).ok()?;
@@ -4046,22 +4313,33 @@ impl App {
     }
 
     pub fn end_rename(&mut self, commit: bool) {
+        if let Some(r) = self.rename.take() {
+            let text = unsafe {
+                let n = GetWindowTextLengthW(r.edit);
+                let mut buf = vec![0u16; n as usize + 1];
+                let got = GetWindowTextW(r.edit, &mut buf);
+                let _ = DestroyWindow(r.edit);
+                let _ = DeleteObject(r.font.into());
+                let _ = DeleteObject(r.brush.into());
+                String::from_utf16_lossy(&buf[..got as usize])
+            };
+            // A pasted line break is no part of a name.
+            let text: String = text.chars().filter(|c| *c != '\r' && *c != '\n').collect::<String>().trim().to_string();
+            let k = r.key;
+            if let Some(it) = self.items.get(&k).filter(|it| commit && !text.is_empty() && it.display_name != text && it.kind != ItemKind::Virtual) {
+                let _ = self.worker.send(Req::Rename { path: it.parsing_name.clone(), new_name: text });
+            } else if self.sort_after_rename.as_ref() == Some(&k) {
+                // Not renamed (Esc, or the name kept): the rules can sort it now.
+                self.sort_after_rename = None;
+                self.sort_created(&k);
+            }
+            self.invalidate();
+        }
         if let Some(be) = self.box_edit.take() {
             unsafe {
                 let _ = KillTimer(Some(self.msg_hwnd), T_CARET);
             }
             let text = be.ed.string().trim().to_string();
-            if let Some(k) = be.item {
-                if let Some(it) = self.items.get(&k).filter(|it| commit && !text.is_empty() && it.display_name != text && it.kind != ItemKind::Virtual) {
-                    let _ = self.worker.send(Req::Rename { path: it.parsing_name.clone(), new_name: text });
-                } else if self.sort_after_rename.as_ref() == Some(&k) {
-                    // Not renamed (Esc, or the name kept): the rules can sort it now.
-                    self.sort_after_rename = None;
-                    self.sort_created(&k);
-                }
-                self.invalidate();
-                return;
-            }
             let (id, tab) = (be.id, be.tab);
             let old = self.box_by_id(id).and_then(|b| b.tabs.get(tab)).map(|t| t.title.clone());
             if commit && !text.is_empty() && old.as_deref() != Some(text.as_str()) {
@@ -4261,6 +4539,7 @@ impl App {
                                     self.sel.select_only(&key);
                                 }
                             }
+                            self.ole_fallback = false;
                             Drag::Items {
                                 keys: self.sel.ordered(&self.order()),
                                 start,
@@ -4301,30 +4580,21 @@ impl App {
                 }
             }
             Drag::Rubber { start, base, ctrl, scope, .. } => {
-                let band = Rect::from_points(start, p);
-                let hit: BTreeSet<ItemKey> = self
-                    .cells_in_view()
-                    .into_iter()
-                    .filter(|(k, cell, b)| {
-                        if *b != scope {
-                            return false;
-                        }
-                        let visible = b.and_then(|id| self.box_by_id(id)).map(|bx| Self::content_rect(bx).intersects(cell)).unwrap_or(true);
-                        visible && self.hit_rect(k, *cell).intersects(&band)
-                    })
-                    .map(|(k, _, _)| k)
-                    .collect();
+                let hit = self.band_hits(Rect::from_points(start, p), scope);
                 self.sel.rubber_band(&base, &hit, ctrl);
                 Drag::Rubber { start, cur: p, base, ctrl, scope }
             }
             Drag::Items { keys, start, .. } => {
-                // Leaving our surface for another window: hand over to OLE drag and drop.
+                // Windows' own drag and drop from the start, as on Explorer's desktop: its drag
+                // image, its "Move to …" / "Open with …" captions over folders, the Recycle Bin
+                // and programs, the same over other apps (the drop target below handles our
+                // surface). Our own drag only if Windows' could not start, until the surface is left.
                 let (sx, sy) = self.to_screen(p);
                 let over = unsafe { WindowFromPoint(POINT { x: sx, y: sy }) };
                 let ours = over == self.hwnd || unsafe { GetAncestor(over, GA_ROOT) } == unsafe { GetAncestor(self.hwnd, GA_ROOT) } && !self.desktop_mode;
                 let progman = hide::progman();
                 let desktop_bg = self.desktop_mode && (over == progman || unsafe { GetAncestor(over, GA_ROOT) } == progman);
-                if !ours && !desktop_bg {
+                if !self.ole_fallback || (!ours && !desktop_bg) {
                     let paths: Vec<String> = keys.iter().filter_map(|k| self.items.get(k)).map(|i| i.parsing_name.clone()).collect();
                     let ghost = self.ghost_pixels(&keys, start);
                     self.own_drag = Some((keys.clone(), start));
@@ -4335,26 +4605,7 @@ impl App {
                     self.invalidate();
                     return After::OleDrag(paths, ghost);
                 }
-                self.hover_reveal(p, true);
-                match self.hit_test(p) {
-                    Hit::Header { id, tab: Some(t), .. } => self.arm_tab_switch(id, t, 450),
-                    _ => self.pending_tab = None,
-                }
-                // Near the top or bottom of a box's icons: scroll it.
-                if let Some(b) = self.drop_box(p).and_then(|id| self.box_by_id(id)) {
-                    let (c, max, id) = (Self::content_rect(b), self.max_scroll(b), b.id);
-                    let step = if p.y < c.y + 24.0 {
-                        -12.0
-                    } else if p.y > c.bottom() - 24.0 {
-                        12.0
-                    } else {
-                        0.0
-                    };
-                    if step != 0.0 && max > 0.0 {
-                        let s = self.scroll.entry(id).or_insert(0.0);
-                        *s = (*s + step).clamp(0.0, max);
-                    }
-                }
+                self.drag_hover(p);
                 Drag::Items { keys, start, cur: p }
             }
             Drag::MoveBox { id, start, orig, .. } => {
@@ -4428,7 +4679,12 @@ impl App {
                 self.update_preview();
                 Drag::Resize { id, start, orig, l, t, r, b }
             }
-            Drag::RightRubber { start, .. } => Drag::RightRubber { start, cur: p },
+            // The right button's band selects too (Explorer's); its menu is then for them.
+            Drag::RightRubber { start, .. } => {
+                let hit = self.band_hits(Rect::from_points(start, p), None);
+                self.sel.rubber_band(&BTreeSet::new(), &hit, false);
+                Drag::RightRubber { start, cur: p }
+            }
             Drag::Scrub { id } => {
                 self.az_jump(id, p.x);
                 Drag::Scrub { id }
@@ -4754,11 +5010,19 @@ impl App {
         unsafe {
             let _ = ReleaseCapture();
         }
-        let hit = self.hit_test(p);
+        let mut hit = self.hit_test(p);
         let new_rect = match drag {
             Drag::RightRubber { start, cur } => {
-                let r = Rect::from_points(start, cur);
-                (r.w > self.grid.cell_w && r.h > header_h()).then_some(r)
+                // Icons the band selected: their menu (Explorer's). None: the desktop's, with
+                // "Create box here" the band's size.
+                if let Some(k) = self.sel.ordered(&self.order()).first().cloned() {
+                    self.sel.focus = Some(k.clone());
+                    hit = Hit::Item { key: k, in_box: None };
+                    None
+                } else {
+                    let r = Rect::from_points(start, cur);
+                    (r.w > self.grid.cell_w && r.h > header_h()).then_some(r)
+                }
             }
             _ => None,
         };
@@ -4878,19 +5142,7 @@ impl App {
             VK_F12 if ctrl && shift => {
                 self.diag = !self.diag;
             }
-            VK_DELETE => {
-                let paths: Vec<String> = self
-                    .sel
-                    .ordered(&order)
-                    .iter()
-                    .filter_map(|k| self.items.get(k))
-                    .filter(|i| i.kind != ItemKind::Virtual)
-                    .map(|i| i.parsing_name.clone())
-                    .collect();
-                if !paths.is_empty() {
-                    let _ = self.worker.send(Req::Delete { paths, recycle: !shift });
-                }
-            }
+            VK_DELETE => self.delete_selection(!shift),
             _ if ctrl => match vk.0 as u8 {
                 b'A' => {
                     self.sel.set = order.iter().cloned().collect();
@@ -5080,6 +5332,17 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 
 /// `None` = App busy (re-entered) or unhandled → DefWindowProc.
 unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESULT>> {
+    // The folder picker for a folder box: modal, so outside the App's borrow (our windows keep
+    // drawing and answering meanwhile).
+    if m == crate::events::WM_APP_PICKFOLDER {
+        let req = with(|app| app.pick_req.take().map(|r| (r, app.hwnd, t(app.lang, S::FolderBoxChoose).trim_end_matches('…').to_string(), app.pick_start(&r)))).flatten();
+        if let Some((r, owner, title, start)) = req {
+            if let Some(p) = crate::folderbox::pick_folder(owner, &title, &start) {
+                with(|app| app.apply_pick(r, &p));
+            }
+        }
+        return Some(Some(LRESULT(0)));
+    }
     let mut after = After::None;
     let r = with(|app| {
         let is_surface = h == app.hwnd;
@@ -5094,27 +5357,27 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             WM_NCHITTEST if is_surface => Some(LRESULT(HTCLIENT as isize)),
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if is_surface => {
                 let (x, y) = lparam_pt(l);
-                app.on_lbutton_down(app.to_dip(x, y), m == WM_LBUTTONDBLCLK);
+                app.on_lbutton_down(app.client_dip(x, y), m == WM_LBUTTONDBLCLK);
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE if is_surface => {
                 let (x, y) = lparam_pt(l);
-                after = app.on_mouse_move(app.to_dip(x, y));
+                after = app.on_mouse_move(app.client_dip(x, y));
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP if is_surface => {
                 let (x, y) = lparam_pt(l);
-                app.on_lbutton_up(app.to_dip(x, y));
+                app.on_lbutton_up(app.client_dip(x, y));
                 Some(LRESULT(0))
             }
             WM_RBUTTONDOWN if is_surface => {
                 let (x, y) = lparam_pt(l);
-                app.on_rbutton_down(app.to_dip(x, y));
+                app.on_rbutton_down(app.client_dip(x, y));
                 Some(LRESULT(0))
             }
             WM_RBUTTONUP if is_surface => {
                 let (x, y) = lparam_pt(l);
-                app.on_rbutton_up(app.to_dip(x, y));
+                app.on_rbutton_up(app.client_dip(x, y));
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL if is_surface => {
@@ -5151,22 +5414,34 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 Some(LRESULT(0))
             }
             WM_KILLFOCUS if is_surface && app.box_edit.is_some() => {
-                // An icon's name field that just opened (after "New", Windows' own handler may
-                // take the focus for a moment): it keeps the focus instead of closing.
-                let fresh = app.box_edit.as_ref().map(|e| e.item.is_some() && e.since.elapsed().as_millis() < 500).unwrap_or(false);
-                if fresh {
+                app.end_rename(true);
+                Some(LRESULT(0))
+            }
+            WM_APP_RENAME_END => {
+                // The name field lost the focus just after it opened (after "New", Windows' own
+                // handler may take the focus for a moment): it keeps the focus instead of closing.
+                let fresh = app.rename.as_ref().map(|r| r.since.elapsed().as_millis() < 500).unwrap_or(false);
+                if w.0 == 2 && fresh {
                     let _ = PostMessageW(Some(h), WM_APP_REFOCUS, WPARAM(0), LPARAM(0));
-                } else {
-                    app.end_rename(true);
+                } else if app.rename.is_some() {
+                    app.end_rename(w.0 != 0);
                 }
                 Some(LRESULT(0))
             }
             WM_APP_REFOCUS => {
-                if app.box_edit.is_some() {
-                    let _ = SetForegroundWindow(GetAncestor(h, GA_ROOT));
-                    let _ = SetFocus(Some(h));
+                if let Some(r) = app.rename.as_ref() {
+                    let _ = SetForegroundWindow(r.edit);
+                    let _ = SetFocus(Some(r.edit));
                 }
                 Some(LRESULT(0))
+            }
+            WM_CTLCOLOREDIT if is_surface && app.rename.as_ref().map(|r| r.edit.0 as isize == l.0).unwrap_or(false) => {
+                let r = app.rename.as_ref().unwrap();
+                let hdc = HDC(w.0 as _);
+                let (fg, bg) = if r.dark { (0x00FFFFFF, 0x002B2B2B) } else { (0x00000000, 0x00FFFFFF) };
+                SetTextColor(hdc, COLORREF(fg));
+                SetBkColor(hdc, COLORREF(bg));
+                Some(LRESULT(r.brush.0 as isize))
             }
             WM_CHAR if is_surface => {
                 if app.type_to_search(w.0 as u32) {
@@ -5250,6 +5525,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         }
                         Ev::HostMsg(v) => app.on_host_msg(v),
                         Ev::InfoTip { key, text } => app.on_info_tip(key, text),
+                        Ev::FileDone { op, undo } => app.on_file_done(op, undo),
                         Ev::Update => {
                             if app.host.is_some() && app.settings_sig() != app.settings_sent {
                                 app.send_settings(false, None);
@@ -5430,12 +5706,20 @@ unsafe fn ole_drag(h: HWND, paths: Vec<String>, ghost: Option<(u32, u32, Vec<u8>
             log::info!("OLE drag of {} item(s) -> {r:?}", paths.len());
             with(|app| {
                 app.own_drag = None;
+                app.ole_drag_over(None, None);
                 let _ = app.worker.send(Req::Scan);
             });
         }
         Err(e) => {
+            // (Items Windows can't drag:) our own drag on the surface instead.
             log::warn!("drag data object: {e}");
-            with(|app| app.own_drag = None);
+            with(|app| {
+                if let Some((keys, start)) = app.own_drag.take() {
+                    app.ole_fallback = true;
+                    app.drag = Drag::Items { keys, start, cur: app.cursor_dip() };
+                    let _ = SetCapture(h);
+                }
+            });
         }
     }
 }
@@ -5491,4 +5775,88 @@ fn keep_taskbar_on_top() {
             }
         }
     }
+}
+
+thread_local! {
+    static RENAME_OLD_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// The name field as tall as its lines (one at least, twelve at most), as Explorer's grows.
+fn fit_rename(edit: HWND, line_px: i32) {
+    unsafe {
+        let lines = SendMessageW(edit, EM_GETLINECOUNT, None, None).0.clamp(1, 12) as i32;
+        let mut wr = RECT::default();
+        let mut cr = RECT::default();
+        let _ = GetWindowRect(edit, &mut wr);
+        let _ = GetClientRect(edit, &mut cr);
+        let frame = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+        let h = lines * line_px + 4 + frame;
+        if wr.bottom - wr.top != h {
+            let _ = SetWindowPos(edit, None, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// Windows' text box for an icon's name: Enter keeps the name, Esc goes back, no line breaks, no
+/// characters a file name can't have, Ctrl+A and Ctrl+Backspace as in Explorer; it grows with
+/// its lines and tells the core when it is done.
+extern "system" fn rename_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        let owner = GetWindow(h, GW_OWNER).unwrap_or_default();
+        let ctrl = key_down(VK_CONTROL);
+        match m {
+            WM_KEYDOWN if w.0 == VK_RETURN.0 as usize => {
+                let _ = PostMessageW(Some(owner), WM_APP_RENAME_END, WPARAM(1), LPARAM(0));
+                return LRESULT(0);
+            }
+            WM_KEYDOWN if w.0 == VK_ESCAPE.0 as usize => {
+                let _ = PostMessageW(Some(owner), WM_APP_RENAME_END, WPARAM(0), LPARAM(0));
+                return LRESULT(0);
+            }
+            WM_KEYDOWN if ctrl && w.0 == b'A' as usize => {
+                SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                return LRESULT(0);
+            }
+            // Ctrl+Backspace: delete the previous word (the plain text box types a box char).
+            WM_KEYDOWN if ctrl && w.0 == VK_BACK.0 as usize => {
+                let n = GetWindowTextLengthW(h);
+                let mut buf = vec![0u16; n as usize + 1];
+                let got = GetWindowTextW(h, &mut buf) as usize;
+                let (mut a, mut b) = (0u32, 0u32);
+                SendMessageW(h, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
+                if a == b {
+                    let ed = TextEdit::new(&String::from_utf16_lossy(&buf[..got]));
+                    let from = ed.utf16_pos(ed.prev_word(ed.char_pos(b)));
+                    SendMessageW(h, EM_SETSEL, Some(WPARAM(from as usize)), Some(LPARAM(b as isize)));
+                }
+                let empty = [0u16];
+                SendMessageW(h, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(empty.as_ptr() as isize)));
+                fit_rename(h, rename_line_px(h));
+                return LRESULT(0);
+            }
+            WM_CHAR if w.0 == 13 || w.0 == 10 || w.0 == 27 || w.0 == 0x7F || w.0 == 1 => return LRESULT(0),
+            // Characters no file name can have: refused, as Explorer does.
+            WM_CHAR if char::from_u32(w.0 as u32).map(|c| "\\/:*?\"<>|".contains(c)).unwrap_or(false) => {
+                let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK);
+                return LRESULT(0);
+            }
+            WM_KILLFOCUS => {
+                let _ = PostMessageW(Some(owner), WM_APP_RENAME_END, WPARAM(2), LPARAM(0));
+            }
+            _ => {}
+        }
+        let old = RENAME_OLD_PROC.with(|o| o.get());
+        let f: WNDPROC = std::mem::transmute(old);
+        let r = CallWindowProcW(f, h, m, w, l);
+        if matches!(m, WM_CHAR | WM_KEYDOWN | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO | EM_UNDO) {
+            fit_rename(h, rename_line_px(h));
+        }
+        r
+    }
+}
+
+/// The name field's line height (kept on the window when it was made).
+fn rename_line_px(h: HWND) -> i32 {
+    let v = unsafe { GetWindowLongPtrW(h, GWLP_USERDATA) } as i32;
+    if v > 0 { v } else { 16 }
 }

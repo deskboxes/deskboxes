@@ -26,6 +26,7 @@ namespace dbx
         std::shared_ptr<BuiltMenu> g_prefetched;   // last prefetch result
         std::wstring g_prefetchKey;
         bool g_menuOpen = false;
+        JsonObject g_nextShow{ nullptr };   // a "show" that came while a menu was open
 
         bool IoWait(BOOL ok, OVERLAPPED& ov, DWORD& n)
         {
@@ -118,6 +119,8 @@ namespace dbx
             r.keyboard = Bool(o, L"keyboard");
             r.coreUndo = Bool(o, L"undo");
             r.coreRedo = Bool(o, L"redo");
+            r.coreUndoText = Str(o, L"undo_text");
+            r.coreRedoText = Str(o, L"redo_text");
             r.desktop = r.background && (r.folder.empty() || Bool(o, L"desktop"));
             r.pt.x = (LONG)o.GetNamedNumber(L"x", 0);
             r.pt.y = (LONG)o.GetNamedNumber(L"y", 0);
@@ -159,7 +162,15 @@ namespace dbx
             }
             else if (t == L"show")
             {
-                if (g_menuOpen) { Log(L"show %.0f ignored: a menu is open", id); return; }
+                // A right-click elsewhere while a menu is open: that menu closes and the new one
+                // opens where the click was, as Explorer's do.
+                if (g_menuOpen)
+                {
+                    Log(L"show %.0f: closing the open menu first", id);
+                    g_nextShow = o;
+                    HideMenuView();
+                    return;
+                }
                 double t0 = NowMs();
                 MenuRequest r = Request(o);
                 std::shared_ptr<BuiltMenu> m;
@@ -203,6 +214,14 @@ namespace dbx
                     auto c = Msg(L"closed", id);
                     c.SetNamedValue(L"invoked", invoked.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(invoked));
                     Send(c);
+                    // The menu asked for while this one was open.
+                    if (g_nextShow)
+                    {
+                        auto next = g_nextShow;
+                        g_nextShow = nullptr;
+                        // After the old view is torn down (queued by its Closed handler).
+                        g_ui.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [next] { try { Handle(next); } catch (...) {} });
+                    }
                 };
                 ShowMenuView(m, std::move(ev));
             }

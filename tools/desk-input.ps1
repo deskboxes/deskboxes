@@ -20,7 +20,7 @@ if ($AlsoPid) { [void][TestInput]::Allowed.Add($AlsoPid) }  # a test window of o
 $held = Join-Path $env:TEMP 'desk-input-held.txt'
 if ($Only) {
     [void][TestInput]::Allowed.Add($Only)
-    if ($Op -in 'rclick', 'click', 'wheel', 'dclick', 'drag', 'down', 'path', 'move', 'up' -and $A.Count -ge 2) {
+    if ($Op -in 'rclick', 'click', 'wheel', 'dclick', 'drag', 'rdrag', 'down', 'path', 'move', 'up' -and $A.Count -ge 2) {
         for ($i = 0; $i + 1 -lt $A.Count -and ($Op -ne 'wheel' -or $i -eq 0); $i += 2) {
             $p = [TestInput]::PidAt($A[$i], $A[$i + 1])
             # Our menu host (a menu the test window opened) is fine too.
@@ -40,6 +40,7 @@ switch ($Op) {
     'wheel' { [TestInput]::Wheel($A[0], $A[1], $A[2]) }
     'dclick' { [TestInput]::Click($A[0], $A[1], 0); Start-Sleep -Milliseconds 60; [TestInput]::Click($A[0], $A[1], 0) }
     'drag' { Assert-Same $A[0] $A[1] $A[2] $A[3]; [TestInput]::Drag($A[0], $A[1], $A[2], $A[3], 0, 30) }
+    'rdrag' { Assert-Same $A[0] $A[1] $A[2] $A[3]; [TestInput]::Drag($A[0], $A[1], $A[2], $A[3], 1, 30) }
     { $_ -in 'esc', 'key' } {
         # Keys go to the foreground window: allow it only if it is ours or the desktop (Progman /
         # WorkerW, whose focused child is our surface).

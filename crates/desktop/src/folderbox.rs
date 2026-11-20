@@ -217,6 +217,86 @@ impl App {
     }
 }
 
+/// "Choose folder…" for a new folder box (`change` None, made at `at`) or "Change folder…" for
+/// box `change`: the folder picker opens once the menu is gone (it is modal: it runs outside
+/// the App's borrow, from a posted message).
+#[derive(Clone, Copy)]
+pub struct PickReq {
+    pub change: Option<u32>,
+    pub at: Pt,
+}
+
+impl App {
+    pub fn ask_folder(&mut self, change: Option<u32>, at: Pt) {
+        self.pick_req = Some(PickReq { change, at });
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(Some(self.msg_hwnd), crate::events::WM_APP_PICKFOLDER, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+        }
+    }
+
+    /// Where the picker starts: the box's folder, else Documents.
+    pub fn pick_start(&self, r: &PickReq) -> String {
+        r.change
+            .and_then(|id| self.box_by_id(id))
+            .map(|b| b.folder.clone())
+            .or_else(|| deskboxes_shell::items::known_folders().into_iter().find(|(n, _)| *n == "documents").map(|(_, p)| p.display().to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The folder was picked: a new folder box for it, or the box shows it from now on.
+    pub fn apply_pick(&mut self, r: PickReq, path: &str) {
+        if !self.can_show_folder(path) {
+            log::info!("folder box: {path} can't be shown (a desktop folder, or not on this PC)");
+            return;
+        }
+        match r.change {
+            None => self.new_folder_box(path, r.at),
+            Some(id) => {
+                let title = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+                let p = path.to_string();
+                self.change_layout(|l, _| {
+                    if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id && b.is_folder()) {
+                        // Its title follows the folder when it was the old folder's name.
+                        let old = std::path::Path::new(&b.folder).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if let Some(t) = b.tabs.first_mut() {
+                            if t.title == old || t.title.is_empty() {
+                                t.title = title.clone();
+                            }
+                        }
+                        b.folder = p.clone();
+                        b.folder_at = String::new();
+                    }
+                });
+                self.folder_moved(id);
+                log::info!("folder box {id} shows {path}");
+            }
+        }
+    }
+}
+
+/// Windows' folder picker, over `owner`, starting in `start`.
+pub fn pick_folder(owner: windows::Win32::Foundation::HWND, title: &str, start: &str) -> Option<String> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::*;
+    use windows::Win32::UI::Shell::*;
+    unsafe {
+        let d: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let _ = d.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        let _ = d.SetTitle(&HSTRING::from(title));
+        if !start.is_empty() {
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start), None) {
+                let _ = d.SetFolder(&item);
+            }
+        }
+        d.Show(Some(owner)).ok()?;
+        let item = d.GetResult().ok()?;
+        let p = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as _));
+        s
+    }
+}
+
 /// Names compared as Explorer sorts them: numbers by value ("2" before "10"), case ignored.
 pub fn natural(a: &str, b: &str) -> std::cmp::Ordering {
     let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());

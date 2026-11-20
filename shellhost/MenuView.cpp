@@ -346,6 +346,67 @@ namespace dbx
     };
     static std::shared_ptr<View> g_view;
 
+    // ---- dismissal ---------------------------------------------------------------------
+    // The flyout closes by itself when its window loses the activation. A menu that never got
+    // it (a click into another app right after the right-click, before Windows let our window
+    // come to the front) never would: it stayed up, half behind that app, and blocked every
+    // later menu. So while a menu is open, a press anywhere outside our windows, or another app
+    // coming to the front, closes it, as Explorer's menus close.
+    static HHOOK g_mouseHook = nullptr;
+    static HWINEVENTHOOK g_fgHook = nullptr;
+
+    static bool IsOurs(HWND h)
+    {
+        DWORD pid = 0;
+        if (h) GetWindowThreadProcessId(h, &pid);
+        return pid == GetCurrentProcessId();
+    }
+
+    static void DismissSoon()
+    {
+        auto v = g_view;
+        if (!v || !v->window) return;
+        v->window.DispatcherQueue().TryEnqueue([wv = std::weak_ptr<View>(v)]
+        {
+            auto v = wv.lock();
+            if (v && v->flyout) { try { v->flyout.Hide(); } catch (winrt::hresult_error const&) {} }
+        });
+    }
+
+    static LRESULT CALLBACK DismissMouseProc(int code, WPARAM w, LPARAM l)
+    {
+        if (code == HC_ACTION && (w == WM_LBUTTONDOWN || w == WM_RBUTTONDOWN || w == WM_MBUTTONDOWN || w == WM_XBUTTONDOWN))
+        {
+            auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
+            if (!IsOurs(WindowFromPoint(m->pt))) DismissSoon();
+        }
+        return CallNextHookEx(nullptr, code, w, l);
+    }
+
+    static void CALLBACK DismissForegroundProc(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD)
+    {
+        if (h && !IsOurs(h)) DismissSoon();
+    }
+
+    static void WatchDismiss(bool on)
+    {
+        if (on)
+        {
+            if (!g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, DismissMouseProc, GetModuleHandleW(nullptr), 0);
+            if (!g_fgHook) g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, DismissForegroundProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        else
+        {
+            if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+            if (g_fgHook) { UnhookWinEvent(g_fgHook); g_fgHook = nullptr; }
+        }
+    }
+
+    void HideMenuView()
+    {
+        DismissSoon();
+    }
+
     // Access keys (KeyTips). Explorer numbers keys that occur more than once in one menu, in
     // display order, command row first: Copy "C1" ... Customize menu "C2" (verified in the
     // captures docs/fidelity/explorer/*.png). Unique keys stay single letters.
@@ -394,6 +455,8 @@ namespace dbx
         case Source::Classic:
             if (_wcsicmp(e->id.c_str(), L"rename") == 0)
                 Choose(e->id, [ev = g_view->ev] { if (ev.command) ev.command(L"rename"); }); // the core edits in place
+            else if (_wcsicmp(e->id.c_str(), L"delete") == 0)
+                Choose(e->id, [ev = g_view->ev] { if (ev.command) ev.command(L"delete"); }); // the core deletes, so Undo can bring it back
             else
                 Choose(e->id, [m, e, owner, pt] { HRESULT hr = InvokeClassic(*m, *e, owner, pt); Log(L"classic %s -> 0x%08X", e->id.c_str(), hr); });
             break;
@@ -753,6 +816,7 @@ namespace dbx
         {
             auto v = wv.lock();
             if (!v) return;
+            WatchDismiss(false);
             if (v->pending) v->pending();
             auto id = v->invoked;
             auto done = v->ev.done;
@@ -802,5 +866,6 @@ namespace dbx
         });
         v->window.Activate();
         SetForegroundWindow(v->hwnd);
+        WatchDismiss(true);
     }
 }

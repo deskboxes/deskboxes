@@ -59,7 +59,13 @@ pub fn delete_value(key: &str, value: &str) -> bool {
 }
 
 /// Windows app mode: true = light (`AppsUseLightTheme`, default light).
+/// DESKBOXES_THEME=light|dark overrides it (test copies; the menu host reads it too).
 pub fn apps_use_light_theme() -> bool {
+    match std::env::var("DESKBOXES_THEME").as_deref() {
+        Ok("light") => return true,
+        Ok("dark") => return false,
+        _ => {}
+    }
     get_dword(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme").map(|v| v != 0).unwrap_or(true)
 }
 

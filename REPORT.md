@@ -544,3 +544,53 @@ double-click rolled it up again. Settings pages now come in as one fade-and-rise
 page (off when Windows' animation effects are off); the per-card entrance animation started a
 moment late, so the new page blinked and its picture popped back in. VERIFIED on the test
 desktop, the animation frame by frame (screen captures every 7 ms).
+
+## 19. Round 11 (2026-11-20): Explorer-like file handling, polish, designed Settings pictures
+
+- Undo and redo (Ctrl+Z / Ctrl+Y) now cover moving icons into a folder, deleting to the
+  Recycle Bin (also by dropping on it) and renaming, as in Explorer.
+- Dragging works like Explorer: the icon follows the pointer over the desktop, with a caption
+  saying what the drop will do ("Move to …", "Move to Recycle Bin", "Open with …"). A folder
+  lights up under the pointer, also after the drag went over an app and back.
+- The desktop menu closes when you click into another app; right-clicking somewhere else while
+  it is open opens a new one there.
+- Dragging a rectangle with the right button selects, then opens the menu for the selection.
+  Selecting inside a rolled-up box that slid open no longer rolls it up.
+- A long name of a selected icon now overlaps the icon below it the same way every time.
+- Boxes above windows: no more black wallpaper, nothing shows under the taskbar, and blended
+  boxes use the normal box look while they are above.
+- A tab's color is now the box's background while that tab is shown.
+- Folder boxes: "Choose folder…" picks any folder, and "Change folder…" changes it later.
+- Settings:
+  - Blend into wallpaper has its own page; every Home tile opens the page it shows.
+  - New About page: how Deskboxes works and why it is fast.
+  - The search shortcut row reads "just type on the desktop", then Ctrl+F.
+- Speed: the desktop's UI thread runs at above-normal priority, and the GPU queues at most one
+  frame ahead, so the pointer and the selection rectangle lag less on slow PCs. A slow start
+  seen on another PC came from the Run key's logon delay; the logon task from round 10 avoids it.
+- Settings pictures are designed scenes, not screenshots.
+  - `tools/art` holds the scenes:
+    - the WIP wallpapers (dark and light);
+    - the real icons of popular apps on this PC (`icons.ps1`);
+    - boxes styled as Deskboxes draws them;
+    - a pointer, clicks, keycaps and outlines that show what each feature does.
+  - Each scene is a short loop. Its first frame is the picture.
+  - The 13 feature tiles and their pages play the loop while the pointer is on the picture, as
+    a muted 640x360 video of about 100–200 KB. They stay still otherwise, and also when Windows'
+    animation effects are off.
+  - Saved layouts now shows boxes gliding back into the dashed outlines of a saved
+    arrangement; before, it showed a context menu.
+  - To remake them, run these in order:
+    - `tools/art/assets.ps1` (the sample items);
+    - `icons.ps1`;
+    - `node tools/art/render.mjs` (needs Chrome and ffmpeg; it replaces render.ps1);
+    - `python tools/art/export.py`.
+
+VERIFIED, on a test copy, in dark and light: the Home tiles and a feature page's picture play
+their clip on hover and show the still again when the pointer leaves. Light mode picks the light
+clip.
+
+UNVERIFIED:
+- Windows N editions, which have no video codecs; the pictures should simply stay still there.
+- A Windows user name with a space in it (the clip's path is escaped for that case).
+- The speed changes on a slow PC.
