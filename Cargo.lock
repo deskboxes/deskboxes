@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "deskboxes"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deskboxes-core",
  "deskboxes-i18n",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -29,11 +29,11 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-i18n"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "deskboxes-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "serde_json",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deskboxes-core",
  "windows",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-setup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deskboxes-shell",
  "serde",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deskboxes-core",
  "log",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "deskboxes-watchdog"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "deskboxes-shell",
  "log",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "fixture-gen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "windows",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "run-as-user"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows",
 ]
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "spike-desktop-layer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows",
  "windows-core",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "spike-explorer-command"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows",
  "windows-core",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "spike-hide-icons"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows",
  "windows-core",
