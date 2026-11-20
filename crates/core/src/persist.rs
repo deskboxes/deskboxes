@@ -20,7 +20,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn load_settings(path: &Path) -> Settings {
-    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let mut s: Settings = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    if s.icons.fx_v < 2 {
+        s.icons.tint_strength = 1.0;
+        s.icons.fx_v = 2;
+    }
+    s
 }
 
 pub fn save_settings(path: &Path, s: &Settings) -> std::io::Result<()> {

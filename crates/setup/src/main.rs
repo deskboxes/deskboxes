@@ -181,6 +181,7 @@ fn main() {
                         start_menu: if keep { ops::start_menu_link().map(|l| l.exists()).unwrap_or(false) } else { !args.no_start_menu },
                         launch: args.launch,
                         update: args.update,
+                        ask_admin: false,
                         shortcut_desc: text::t(lang, text::T::ShortcutDesc).into(),
                     };
                     exit_code(ops::install(p, &o, &report).map(|_| ()))

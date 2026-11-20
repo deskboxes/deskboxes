@@ -1,19 +1,21 @@
-//! What setup does to the PC. Everything is per user (HKCU, the user's own folders); nothing needs
-//! administrator rights and nothing outside these is touched:
+//! What setup does to the PC. Everything is per user (HKCU, the user's own folders); only the
+//! desktop-menu package asks for administrator rights (once, and it is optional), and nothing
+//! outside these is touched:
 //!
 //! | What | Where |
 //! |---|---|
 //! | Program files | `%LOCALAPPDATA%\Programs\Deskboxes` (or the folder chosen), listed in `install.json` |
 //! | Uninstaller | `uninstall.exe` there (this program without its payload) |
 //! | Apps list entry | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Deskboxes` |
-//! | Autostart | `HKCU\...\Run` value `Deskboxes` = `"<dir>\deskboxes-watchdog.exe" --launch` (as the app's own Settings switch writes it) |
+//! | Autostart | Task Scheduler logon task `Deskboxes` for this user (no delay, above-normal priority, normal rights), else the `HKCU\...\Run` value `Deskboxes` (deskboxes_shell::autostart, as the app's own Settings switch does) |
+//! | Desktop menu | the sparse package `Deskboxes.DesktopMenu` (files in the install folder): "Turn on Deskboxes" in Windows 11's desktop menu while Deskboxes is off. Unsigned, so registering it needs admin (one prompt; skipped if refused) |
 //! | Start menu | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Deskboxes.lnk` |
 //!
 //! The user's data (`%APPDATA%\Deskboxes`, `%LOCALAPPDATA%\Deskboxes`) is only removed when the
 //! user asks for it in the uninstaller.
 
 use crate::payload::Payload;
-use deskboxes_shell::{hide, reg};
+use deskboxes_shell::{autostart, hide, reg};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -100,7 +102,138 @@ pub fn installed() -> Option<Installed> {
 }
 
 pub fn autostart_on() -> bool {
-    reg::get_string(reg::RUN, RUN_VALUE).is_some()
+    autostart::is_on()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The desktop-menu package ("Turn on Deskboxes" in Windows 11's main desktop menu).
+
+pub const MENU_PACKAGE: &str = "Deskboxes.DesktopMenu";
+/// Its package family name (name + hash of the manifest's publisher).
+pub const MENU_PFN: &str = "Deskboxes.DesktopMenu_hq7sd8dcym9vw";
+pub const MENU_MSIX: &str = "deskboxes-menu.msix";
+/// Windows 26H2's "Customize menu": packaged extensions listed here with Enabled=1 sit in the
+/// menu itself, the others go into "App extensions".
+const MENU_PREFS: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\ContextMenu\Preferences";
+
+fn powershell(script: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = std::process::Command::new("powershell.exe");
+    c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]).creation_flags(0x0800_0000);
+    c
+}
+
+/// Where the menu package's files are registered from, if it is registered for this user.
+pub fn menu_package_location() -> Option<PathBuf> {
+    let out = powershell(&format!("(Get-AppxPackage -Name {MENU_PACKAGE} | Select-Object -First 1).EffectiveExternalLocation")).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then(|| PathBuf::from(s))
+}
+
+/// Register the menu package from `dir` (Windows 11 only). It is unsigned, which Windows accepts
+/// only from an administrator: one UAC prompt (`ask`), skipped if refused. Returns whether it is
+/// registered from `dir` afterwards.
+pub fn register_menu_package(dir: &Path, ask: bool) -> bool {
+    if windows_build() < 22000 || !dir.join(MENU_MSIX).exists() {
+        return false;
+    }
+    if menu_package_location().map(|l| same_dir(&l, dir)).unwrap_or(false) {
+        log("menu package: already registered here");
+        show_menu_on_top();
+        return true;
+    }
+    if !ask {
+        log("menu package: not registered; not asking now");
+        return false;
+    }
+    let q = |p: &Path| p.display().to_string().replace('\'', "''");
+    let script = format!(
+        "try {{ Get-AppxPackage -Name {MENU_PACKAGE} | Remove-AppxPackage -ErrorAction SilentlyContinue; Add-AppxPackage -Path '{}' -ExternalLocation '{}' -AllowUnsigned -ErrorAction Stop; exit 0 }} catch {{ Add-Content -Path '{}' -Value ('menu package (elevated): ' + $_); exit 1 }}",
+        q(&dir.join(MENU_MSIX)),
+        q(dir),
+        q(&std::env::temp_dir().join("deskboxes-setup.log"))
+    );
+    let code = if token_elevated() { powershell(&script).status().ok().and_then(|s| s.code()) } else { run_elevated_powershell(&script) };
+    log(&format!("menu package: elevated registration exit {code:?}"));
+    let ok = menu_package_location().map(|l| same_dir(&l, dir)).unwrap_or(false);
+    if ok {
+        show_menu_on_top();
+    }
+    ok
+}
+
+fn windows_build() -> u32 {
+    reg_hklm_string(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber").and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn reg_hklm_string(key: &str, value: &str) -> Option<String> {
+    let (k, v) = (HSTRING::from(key), HSTRING::from(value));
+    let mut buf = [0u16; 64];
+    let mut sz = (buf.len() * 2) as u32;
+    unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, PCWSTR(k.as_ptr()), PCWSTR(v.as_ptr()), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut sz)).ok().ok()? };
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let n = |p: &Path| p.display().to_string().trim_end_matches('\\').to_lowercase();
+    n(a) == n(b)
+}
+
+fn show_menu_on_top() {
+    if key_exists(MENU_PREFS) {
+        let _ = set_dword(&format!(r"{MENU_PREFS}\extensions\{MENU_PFN}"), "Enabled", 1);
+    }
+}
+
+fn key_exists(key: &str) -> bool {
+    let k = HSTRING::from(key);
+    let mut h = HKEY::default();
+    unsafe {
+        let ok = RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), None, KEY_READ, &mut h).is_ok();
+        if ok {
+            let _ = RegCloseKey(h);
+        }
+        ok
+    }
+}
+
+/// powershell.exe `script` as administrator (a UAC prompt), hidden; its exit code, or None if the
+/// prompt was refused or it did not finish within two minutes.
+fn run_elevated_powershell(script: &str) -> Option<i32> {
+    let params = HSTRING::from(format!("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"{}\"", script.replace('"', "\\\"")));
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
+        lpVerb: w!("runas"),
+        lpFile: w!("powershell.exe"),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        if let Err(e) = ShellExecuteExW(&mut sei) {
+            log(&format!("menu package: no administrator rights ({e})"));
+            return None;
+        }
+        if sei.hProcess.is_invalid() {
+            return None;
+        }
+        let w = WaitForSingleObject(sei.hProcess, 120_000);
+        let mut code = 1u32;
+        let _ = GetExitCodeProcess(sei.hProcess, &mut code);
+        let _ = CloseHandle(sei.hProcess);
+        (w == WAIT_OBJECT_0).then_some(code as i32)
+    }
+}
+
+/// Remove the menu package (one's own registration needs no admin to remove).
+pub fn unregister_menu_package() {
+    if menu_package_location().is_some() {
+        let r = powershell(&format!("Get-AppxPackage -Name {MENU_PACKAGE} | Remove-AppxPackage")).status();
+        log(&format!("menu package removed: {r:?}"));
+    }
+    delete_key(&format!(r"{MENU_PREFS}\extensions\{MENU_PFN}"));
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -414,9 +547,8 @@ fn shortcut_target(link: &Path) -> Option<PathBuf> {
 
 /// Is the Run value ours (points into `dir`, or at a watchdog that no longer exists)?
 fn run_value_ours(dir: &Path) -> bool {
-    let Some(v) = reg::get_string(reg::RUN, RUN_VALUE) else { return false };
-    let exe = v.trim_start_matches('"').split('"').next().unwrap_or("").to_string();
-    let p = PathBuf::from(&exe);
+    let Some(t) = autostart::target().or_else(|| reg::get_string(reg::RUN, RUN_VALUE)) else { return false };
+    let p = PathBuf::from(t.trim_start_matches('"').split('"').next().unwrap_or(""));
     p.starts_with(dir) || !p.exists()
 }
 
@@ -488,6 +620,9 @@ pub struct InstallOptions {
     /// An update started by Deskboxes itself: the copy it closed was exiting anyway, so start
     /// Deskboxes again only when `launch` says so.
     pub update: bool,
+    /// May ask for administrator rights (the desktop-menu package): the interactive installer
+    /// only, never an update or a quiet install.
+    pub ask_admin: bool,
     pub shortcut_desc: String,
 }
 
@@ -557,12 +692,13 @@ pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Resu
     report(Report::Step(Step::Registering));
     let wd = o.dir.join(WATCHDOG);
     if o.autostart {
-        reg::set_string(reg::RUN, RUN_VALUE, &format!("\"{}\" --launch", wd.display())).map_err(|e| Failure::Other(e.to_string()))?;
-        reg::delete_value(reg::RUN_APPROVED, RUN_VALUE);
+        let how = autostart::enable(&wd).map_err(|e| Failure::Other(e.to_string()))?;
+        log(&format!("autostart: {how}"));
     } else if run_value_ours(&o.dir) || old.as_ref().map(|i| run_value_ours(&i.dir)).unwrap_or(false) {
-        reg::delete_value(reg::RUN, RUN_VALUE);
-        reg::delete_value(reg::RUN_APPROVED, RUN_VALUE);
+        autostart::disable();
     }
+    let menu = register_menu_package(&o.dir, o.ask_admin);
+    log(&format!("desktop menu package registered: {menu}"));
     if o.start_menu {
         if let Some(link) = start_menu_link() {
             // `--enable`: opening Deskboxes from Start turns it back on after "Disable Deskboxes".
@@ -605,7 +741,12 @@ fn remove_files(dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         if std::fs::remove_file(&p).is_err() {
-            failed.push(p.clone());
+            // In use (Explorer keeps the desktop-menu DLL loaded for a while): a file in use can
+            // still be moved; out of the folder it goes, to the temp folder Windows cleans.
+            let aside = std::env::temp_dir().join(format!("deskboxes-removed-{}-{}", std::process::id(), f.replace(['\\', '/'], "_")));
+            if std::fs::rename(&p, &aside).is_err() {
+                failed.push(p.clone());
+            }
         }
         if let Some(parent) = p.parent() {
             remove_empty_dirs(parent, dir);
@@ -635,9 +776,10 @@ pub fn uninstall(o: &UninstallOptions, report: &dyn Fn(Report)) -> Result<(), Fa
 
     report(Report::Step(Step::Cleanup));
     if run_value_ours(&o.dir) {
-        reg::delete_value(reg::RUN, RUN_VALUE);
-        reg::delete_value(reg::RUN_APPROVED, RUN_VALUE);
+        autostart::disable();
     }
+    unregister_menu_package();
+    deskboxes_shell::turnon::remove_verb();
     remove_shortcut_if_ours(Some(&o.dir));
     delete_key(UNINSTALL_KEY);
     report(Report::Fraction(0.45));

@@ -46,7 +46,7 @@ impl App {
     /// Whether a box reads as light (dark text): a light tint color, or the light Windows theme
     /// for the automatic tint.
     fn box_is_light(&self, b: &BoxModel) -> bool {
-        match b.style.color {
+        match App::box_color(b) {
             Some(c) => {
                 let lum = (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0;
                 lum > 0.6 && b.style.opacity >= 0.35
@@ -71,29 +71,60 @@ impl App {
         if self.tab_anim.map(|(_, _, t0)| t0.elapsed().as_secs_f32() >= TAB_ANIM_S).unwrap_or(false) {
             self.tab_anim = None;
         }
-        let cells = self.visible_cells();
+        let cells = self.cells_in_view();
         for (k, cell, in_box) in &cells {
-            let full = self.is_full_label(k);
-            let _ = self.label_layout(k, cell.w - 4.0, full);
-            let _ = self.label_layout(k, cell.w - 4.0, false);
-            let light_box = in_box.and_then(|id| self.box_by_id(id)).map(|b| self.box_is_light(b)).unwrap_or(false);
-            if !light_box {
-                for f in [full, false] {
-                    let key = (k.clone(), f, (cell.w - 4.0) as i32);
-                    if !self.label_bmps.contains_key(&key) {
-                        if let Some(l) = self.labels.get(&key) {
-                            let h = r::text_height(l);
-                            match self.gpu.shadowed_label(l, cell.w - 4.0, h, self.scale, Self::desktop_theme().text) {
-                                Ok(b) => {
-                                    self.label_bmps.insert(key, b);
-                                }
-                                Err(e) => log::warn!("label bitmap: {e}"),
-                            }
+            self.prep_label(k, *cell, *in_box);
+        }
+        if self.prep_gen != self.items_gen {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 60, None);
+            }
+        }
+    }
+
+    /// A label's layout and its shadow bitmap, made once.
+    fn prep_label(&mut self, k: &ItemKey, cell: Rect, in_box: Option<u32>) {
+        let full = self.is_full_label(k);
+        let _ = self.label_layout(k, cell.w - 4.0, full);
+        let _ = self.label_layout(k, cell.w - 4.0, false);
+        let light_box = in_box.and_then(|id| self.box_by_id(id)).map(|b| self.box_is_light(b)).unwrap_or(false);
+        if light_box {
+            return;
+        }
+        for f in [full, false] {
+            let key = (k.clone(), f, (cell.w - 4.0) as i32);
+            if !self.label_bmps.contains_key(&key) {
+                if let Some(l) = self.labels.get(&key) {
+                    let h = r::text_height(l);
+                    match self.gpu.shadowed_label(l, cell.w - 4.0, h, self.scale, Self::desktop_theme().text) {
+                        Ok(b) => {
+                            self.label_bmps.insert(key, b);
                         }
+                        Err(e) => log::warn!("label bitmap: {e}"),
                     }
                 }
             }
         }
+    }
+
+    /// While idle: labels of icons out of view (scrolled away in a box), a few ms at a time, so
+    /// scrolling later finds them ready.
+    pub fn prep_more(&mut self) {
+        let t = Instant::now();
+        let gen = self.items_gen;
+        for (k, cell, in_box) in self.visible_cells() {
+            if self.labels.contains_key(&(k.clone(), false, (cell.w - 4.0) as i32)) {
+                continue;
+            }
+            self.prep_label(&k, cell, in_box);
+            if t.elapsed().as_secs_f32() > 0.004 {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 30, None);
+                }
+                return;
+            }
+        }
+        self.prep_gen = gen;
     }
 
     pub fn draw(&mut self) {
@@ -144,7 +175,8 @@ impl App {
     /// so they keep their offsets from the pointer.
     fn paint_ghost(&self, dc: &Dc, keys: &[ItemKey], dx: f32, dy: f32, alpha: f32) -> r::R<()> {
         let ghost_text = Color { a: (1.25 * alpha).min(1.0), ..Self::desktop_theme().text };
-        for (k, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| keys.contains(k)).take(64) {
+        let set: std::collections::HashSet<&ItemKey> = keys.iter().collect();
+        for (k, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
             let (icon, label) = self.item_parts(k, *cell, false);
             if self.privacy_on() {
                 let name = self.items.get(k).map(|i| i.display_name.as_str()).unwrap_or("");
@@ -173,7 +205,8 @@ impl App {
     pub fn ghost_pixels(&self, keys: &[ItemKey], at: Pt) -> Option<(u32, u32, Vec<u8>, (i32, i32))> {
         let m = r::LABEL_MARGIN + 2.0;
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for (_, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| keys.contains(k)).take(64) {
+        let set: std::collections::HashSet<&ItemKey> = keys.iter().collect();
+        for (_, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
             x0 = x0.min(cell.x - m);
             y0 = y0.min(cell.y - m);
             x1 = x1.max(cell.right() + m);
@@ -328,6 +361,10 @@ impl App {
             }
             _ => {}
         }
+        // An icon's name being edited: above everything else.
+        if self.box_edit.as_ref().map(|e| e.item.is_some()).unwrap_or(false) {
+            self.paint_title_field(dc, self.light)?;
+        }
         self.paint_search(dc)?;
         self.paint_tip(dc)?;
         if self.diag {
@@ -437,31 +474,53 @@ impl App {
         if self.privacy_on() {
             return self.paint_private(dc, &it.display_name, icon, label, cell, th, shadow, opacity * cut_ghost);
         }
+        let a = opacity * cut_ghost;
+        // Blending in: the wallpaper's color behind the icon.
+        let wall_c = (fx.blend > 0.0).then(|| self.wall_color_at(Pt { x: icon.x + icon.w / 2.0, y: icon.y + icon.h / 2.0 }));
         if let Some(b) = self.bitmaps.get(&it.icon) {
-            if fx.frost > 0.0 {
-                if let Some(bd) = self.backdrops.get(&fx.frost_blur) {
-                    let s = self.backdrop_down as f32 / self.scale;
-                    let light = if self.light { rgba(255, 255, 255, 0.32) } else { rgba(255, 255, 255, 0.20) };
-                    r::draw_frosted(dc, b, rf(fit_icon(b, icon)), bd, s, self.mon_offset(), light, fx.frost * opacity * cut_ghost)?;
+            let dst = rf(fit_icon(b, icon));
+            let own = 1.0 - fx.blend;
+            if own > 0.002 {
+                match fx.tint.and_then(|(c, s)| self.fx_bitmap(it.icon, b, c, 0).map(|t| (t, s))) {
+                    Some((t, s)) => {
+                        // The icon's own colors under its tinted copy (strength = how much shows).
+                        if s < 0.999 {
+                            r::draw_bitmap(dc, b, dst, a * own);
+                        }
+                        r::draw_bitmap(dc, &t, dst, a * own * if s < 0.999 { s } else { 1.0 });
+                    }
+                    None => r::draw_bitmap(dc, b, dst, a * own),
                 }
             }
-            match fx.tint {
-                Some((c, s)) => r::draw_bitmap_tinted(dc, b, rf(fit_icon(b, icon)), opacity * cut_ghost * fx.icon_a, c, s)?,
-                None => r::draw_bitmap(dc, b, rf(fit_icon(b, icon)), opacity * cut_ghost * fx.icon_a),
+            if let Some(c) = wall_c {
+                if let Some(g) = self.fx_bitmap(it.icon, b, c, 1) {
+                    r::draw_bitmap(dc, &g, dst, a * fx.blend * crate::iconfx::GHOST_A);
+                }
             }
         }
-        let opacity = opacity * fx.label_a;
+        // A blended name: the wallpaper's color, fainter, its shadow mostly gone.
+        let (text_c, shadow_a) = match wall_c {
+            Some(c) => (crate::iconfx::blend_text(th.text, c, fx.blend), 1.0 - 0.85 * fx.blend),
+            None => (th.text, 1.0),
+        };
+        let opacity = opacity * (1.0 - 0.3 * fx.blend);
+        // Its name is being edited: the field (drawn on top) shows it.
+        if self.box_edit.as_ref().and_then(|e| e.item.as_ref()) == Some(k) {
+            return Ok(());
+        }
         let lk = (k.clone(), full, (cell.w - 4.0) as i32);
         match (shadow, self.label_bmps.get(&lk), self.labels.get(&lk)) {
             (true, Some(b), Some(l)) => {
                 // The shadow (cached), then the text with ClearType, as Explorer draws it.
                 let sz = unsafe { b.GetPixelSize() };
                 let m = r::LABEL_MARGIN;
-                r::draw_bitmap(dc, b, r::rect(label.x - m, label.y - m, sz.width as f32 / self.scale, sz.height as f32 / self.scale), opacity);
-                r::draw_text_cleartype(dc, l, label.x, label.y, Color { a: th.text.a * opacity, ..th.text })?;
+                if shadow_a > 0.01 {
+                    r::draw_bitmap(dc, b, r::rect(label.x - m, label.y - m, sz.width as f32 / self.scale, sz.height as f32 / self.scale), opacity * shadow_a);
+                }
+                r::draw_text_cleartype(dc, l, label.x, label.y, Color { a: text_c.a * opacity, ..text_c })?;
             }
-            (true, None, Some(l)) => r::draw_text_shadowed(dc, l, label.x, label.y, Color { a: th.text.a * opacity, ..th.text })?,
-            (false, _, Some(l)) => r::draw_text(dc, l, label.x, label.y, Color { a: th.text.a * opacity, ..th.text })?,
+            (true, None, Some(l)) => r::draw_text_shadowed(dc, l, label.x, label.y, Color { a: text_c.a * opacity, ..text_c })?,
+            (false, _, Some(l)) => r::draw_text(dc, l, label.x, label.y, Color { a: text_c.a * opacity, ..text_c })?,
             _ => {}
         }
         Ok(())
@@ -590,7 +649,16 @@ impl App {
         let st = &b.style;
         let light = self.box_is_light(b);
         let auto_tint = if self.light { rgba(0xF3, 0xF3, 0xF3, 1.0) } else { rgba(0x20, 0x20, 0x20, 1.0) };
-        let tint = st.color.map(|c| rgba(c.r, c.g, c.b, 1.0)).unwrap_or(auto_tint);
+        let shown_c = App::box_color(b);
+        let mut tint = shown_c.map(|c| rgba(c.r, c.g, c.b, 1.0)).unwrap_or(auto_tint);
+        // Another tab just opened with its own color: the background crossfades.
+        if let Some((_, from, t0)) = self.tab_color_from.filter(|(id, _, _)| *id == b.id) {
+            let t = ease_out(t0.elapsed().as_secs_f32() / crate::app::TAB_COLOR_S);
+            if t < 1.0 {
+                let f = from.map(|c| rgba(c.r, c.g, c.b, 1.0)).unwrap_or(auto_tint);
+                tint = Color { r: f.r + (tint.r - f.r) * t, g: f.g + (tint.g - f.g) * t, b: f.b + (tint.b - f.b) * t, a: 1.0 };
+            }
+        }
         // Blending into the wallpaper (and the pointer not on it): the box fades too.
         let bk = 1.0 - 0.85 * self.box_blend(b);
         let op = st.opacity.clamp(0.0, 1.0) * bk;
@@ -626,7 +694,7 @@ impl App {
         let look = &self.settings.look;
         // Titles only when pointed at: the whole title bar fades in and out (always shown on a
         // box that is rolled up, being renamed or searched).
-        let shown_title = if look.titles_on_hover && open && self.box_edit.is_none() && self.rename.is_none() && self.search.scope != Some(b.id) {
+        let shown_title = if look.titles_on_hover && open && self.box_edit.is_none() && self.search.scope != Some(b.id) {
             self.pointer_on(b.id)
         } else {
             1.0
@@ -659,7 +727,7 @@ impl App {
                 let (ar, ag, ab) = accent();
                 Some(rgba(ar, ag, ab, 0.9 * bk))
             }
-            "box" => Some(st.color.map(|c| rgba(c.r, c.g, c.b, 0.95 * bk)).unwrap_or(faint)),
+            "box" => Some(shown_c.map(|c| rgba(c.r, c.g, c.b, 0.95 * bk)).unwrap_or(faint)),
             "white" => Some(rgba(255, 255, 255, 0.6 * bk)),
             "black" => Some(rgba(0, 0, 0, 0.5 * bk)),
             _ => Some(faint),
@@ -673,7 +741,7 @@ impl App {
         // their colors), and + (add a tab) while the pointer is on the title.
         let hl = self.header_layout(b);
         let n = b.tabs.len();
-        let editing = self.box_edit.as_ref().filter(|e| e.id == b.id).map(|e| e.tab);
+        let editing = self.box_edit.as_ref().filter(|e| e.id == b.id && e.item.is_none()).map(|e| e.tab);
         let hov = self.hover_hdr.filter(|h| h.0 == b.id && matches!(self.drag, Drag::None));
         let style = self.settings.tabs.style.as_str();
         // A search field over the title hides it.
@@ -890,7 +958,7 @@ impl App {
         let fade = if open { 1.0 } else { o };
         let tagged = self.az_tagged(b);
         r::push_clip(dc, rf(vis));
-        for (i, (k, cell)) in self.box_item_cells(b).into_iter().enumerate() {
+        for (i, k, cell) in self.box_cells_in(b, vis.y - dy, vis.bottom() - dy) {
             let cell = cell.offset(0.0, dy);
             if cell.bottom() < vis.y || cell.y > vis.bottom() {
                 continue;
@@ -966,33 +1034,42 @@ impl App {
         Ok(())
     }
 
-    /// The box title being edited in place: a darker field with the accent underline of a focused
-    /// Windows text box, selection, and a blinking caret.
+    /// A name being edited in place (box title or icon name): a Windows 11 text box, focused —
+    /// rounded, the theme's field color, a hairline border and the accent underline — with
+    /// selection and a blinking caret. It fades in.
     fn paint_title_field(&self, dc: &Dc, light: bool) -> r::R<()> {
         let (Some((field, l, x)), Some(be)) = (self.box_edit_layout(), self.box_edit.as_ref()) else {
             return Ok(());
         };
+        let fade = crate::app::ease_out(be.since.elapsed().as_secs_f32() / crate::app::EDIT_FADE_S);
         let (bg, fg, edge) = if light {
-            (rgba(255, 255, 255, 0.75), rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.12))
+            (rgba(255, 255, 255, 0.97), rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.10))
         } else {
-            (rgba(0, 0, 0, 0.38), rgba(255, 255, 255, 1.0), rgba(255, 255, 255, 0.14))
+            (rgba(30, 30, 30, 0.96), rgba(255, 255, 255, 1.0), rgba(255, 255, 255, 0.10))
         };
-        r::fill_round(dc, rf(field), 5.0, bg)?;
-        r::stroke_round(dc, rf(field.inflate(-0.5)), 5.0, edge, 1.0)?;
+        let a = |c: Color| Color { a: c.a * fade, ..c };
+        // A soft shadow under an icon's field (it floats over the desktop).
+        if be.item.is_some() {
+            r::fill_round(dc, rf(field.offset(0.0, 1.0).inflate(0.5)), 4.5, rgba(0, 0, 0, 0.22 * fade))?;
+        }
+        r::fill_round(dc, rf(field), 4.0, a(bg))?;
+        r::stroke_round(dc, rf(field.inflate(-0.5)), 4.0, a(edge), 1.0)?;
         let (ar, ag, ab) = accent();
-        r::fill_round(dc, rf(Rect::new(field.x + 2.0, field.bottom() - 2.0, field.w - 4.0, 2.0)), 1.0, rgba(ar, ag, ab, 1.0))?;
+        r::push_clip(dc, rf(Rect::new(field.x, field.bottom() - 2.0, field.w, 2.0)));
+        r::fill_round(dc, rf(field), 4.0, rgba(ar, ag, ab, fade))?;
+        r::pop_clip(dc);
         r::push_clip(dc, rf(Rect::new(field.x + 4.0, field.y, field.w - 8.0, field.h)));
         let h = r::text_height(&l);
-        let y = field.y + (field.h - h) / 2.0;
-        let (a, b) = be.ed.sel();
-        if a != b {
-            let (x0, x1) = (r::caret_x(&l, be.ed.utf16_pos(a)), r::caret_x(&l, be.ed.utf16_pos(b)));
-            r::fill_rect(dc, rf(Rect::new(x + x0, y, x1 - x0, h)), rgba(ar, ag, ab, if light { 0.45 } else { 0.7 }))?;
+        let y = (field.y + (field.h - 2.0 - h) / 2.0).round();
+        let (s0, s1) = be.ed.sel();
+        if s0 != s1 {
+            let (x0, x1) = (r::caret_x(&l, be.ed.utf16_pos(s0)), r::caret_x(&l, be.ed.utf16_pos(s1)));
+            r::fill_rect(dc, rf(Rect::new(x + x0, y, x1 - x0, h)), rgba(ar, ag, ab, if light { 0.45 } else { 0.7 } * fade))?;
         }
-        r::draw_text(dc, &l, x, y, fg)?;
+        r::draw_text(dc, &l, x, y, a(fg))?;
         if be.caret_on {
             let cx = x + r::caret_x(&l, be.ed.utf16_pos(be.ed.caret));
-            r::fill_rect(dc, rf(Rect::new((cx * self.scale).round() / self.scale, y, 1.0, h)), fg)?;
+            r::fill_rect(dc, rf(Rect::new((cx * self.scale).round() / self.scale, y, 1.0, h)), a(fg))?;
         }
         r::pop_clip(dc);
         Ok(())

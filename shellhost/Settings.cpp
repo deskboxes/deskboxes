@@ -29,6 +29,7 @@ namespace dbx
             std::set<long long> expanded;    // box groups open on the Boxes page
             long long focusBox = 0;          // box to bring into view on the next build
             bool lookOpen = false;           // the Look entry is open in the navigation
+            std::wstring lastSig;            // the data last built, without the download progress
         };
         State g;
 
@@ -214,49 +215,190 @@ namespace dbx
             x += Card(L"&#xF2B7;", Str(L"language"), Str(L"languageDesc"),
                       L"<ComboBox x:Name=\"Language\" MinWidth=\"220\">" + Opt(L"", Str(L"langAuto"), lang.empty()) + Opt(L"en", L"English", lang == L"en") + Opt(L"pl", L"Polski", lang == L"pl") + L"</ComboBox>");
             x += Card(L"&#xE823;", Str(L"autostart"), Str(L"autostartDesc"), Toggle(L"Autostart", app.GetNamedBoolean(L"autostart", false)));
-            // Updates: the switch, what the updater is doing, Check now / Install now.
-            {
-                auto up = g.data.GetNamedObject(L"update", JsonObject());
-                auto st = up.GetNamedObject(L"status", JsonObject());
-                std::wstring state = st.GetNamedString(L"state", L"").c_str(), latest = st.GetNamedString(L"latest", L"").c_str();
-                auto fill = [](std::wstring s, const wchar_t* k, const std::wstring& v) { auto i = s.find(k); if (i != std::wstring::npos) s.replace(i, wcslen(k), v); return s; };
-                std::wstring text = state == L"checking" ? Str(L"updChecking")
-                                  : state == L"downloading" ? fill(Str(L"updDownloading"), L"{v}", Esc(latest))
-                                  : state == L"ready" ? fill(Str(L"updReady"), L"{v}", Esc(latest))
-                                  : state == L"error" ? Str(L"updError")
-                                  : state == L"dev" ? Str(L"updDev")
-                                  : state == L"uptodate" ? fill(Str(L"updUpToDate"), L"{v}", Esc(std::wstring(up.GetNamedString(L"version", L"").c_str())))
-                                  : Str(L"updNever");
-                std::wstring when;
-                if (double t = st.GetNamedNumber(L"checked", 0); t > 0 && state != L"dev")
-                {
-                    time_t tt = (time_t)t;
-                    tm lt{};
-                    localtime_s(&lt, &tt);
-                    wchar_t b[64];
-                    wcsftime(b, 64, L"%Y-%m-%d %H:%M", &lt);
-                    when = fill(Str(L"updChecked"), L"{t}", b);
-                }
-                std::wstring more = state == L"ready" ? Str(L"updReadyDesc")
-                                  : state == L"error" ? [&] {
-                                        std::wstring k = st.GetNamedString(L"error", L"").c_str();
-                                        return Str(k == L"net" ? L"updErrNet" : k == L"none" ? L"updErrNone" : k == L"server" ? L"updErrServer" : k == L"file" ? L"updErrFile" : L"updErrOther");
-                                    }()
-                                  : state == L"dev" ? Str(L"updDevDesc")
-                                  : L"";
-                if (!more.empty() && !when.empty()) more += L" ";
-                when = more + when;
-                bool dev = state == L"dev", busy = state == L"checking" || state == L"downloading";
-                x += Section(Str(L"updates"));
-                x += Card(L"&#xE895;", Str(L"updAuto"), Str(L"updAutoDesc"), Toggle(L"UpdateAuto", up.GetNamedBoolean(L"auto", true)));
-                std::wstring btns = L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\">";
-                if (state == L"ready") btns += L"<Button x:Name=\"UpdateInstall\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(L"updInstall") + L"\" MinWidth=\"120\"/>";
-                btns += L"<Button x:Name=\"UpdateNow\" Content=\"" + Str(L"updNow") + L"\" MinWidth=\"120\"" + (dev || busy ? L" IsEnabled=\"False\"" : L"") + L"/></StackPanel>";
-                x += Card(state == L"error" ? L"&#xE783;" : state == L"ready" ? L"&#xE896;" : L"&#xE946;", text, when, btns);
-            }
             x += Section(Str(L"about"));
             x += Card(L"&#xE7E8;", Str(L"disable"), Str(L"disableDesc"), L"<Button x:Name=\"Disable\" Content=\"" + Str(L"disableButton") + L"\" MinWidth=\"120\"/>");
             x += L"<TextBlock Text=\"Deskboxes " + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" Margin=\"1,12,0,0\"/>";
+            return x;
+        }
+
+        std::wstring Fill(std::wstring s, const wchar_t* k, const std::wstring& v)
+        {
+            auto i = s.find(k);
+            if (i != std::wstring::npos) s.replace(i, wcslen(k), v);
+            return s;
+        }
+
+        // "today, 14:02", "yesterday, 9:15", or the date in the user's format and the time.
+        std::wstring WhenText(double unix)
+        {
+            ULONGLONG t = (ULONGLONG)unix * 10000000ULL + 116444736000000000ULL;
+            FILETIME ft{ (DWORD)t, (DWORD)(t >> 32) }, lft{};
+            SYSTEMTIME st{}, now{};
+            FileTimeToLocalFileTime(&ft, &lft);
+            FileTimeToSystemTime(&lft, &st);
+            GetLocalTime(&now);
+            wchar_t tm[64] = {}, dt[128] = {};
+            GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr, tm, 64);
+            // Days apart, by calendar date.
+            auto day = [](SYSTEMTIME s)
+            {
+                s.wHour = s.wMinute = s.wSecond = s.wMilliseconds = 0;
+                FILETIME f{};
+                SystemTimeToFileTime(&s, &f);
+                return (((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime) / 864000000000ULL;
+            };
+            ULONGLONG a = day(st), b = day(now);
+            if (a == b) return Str(L"updToday") + L", " + tm;
+            if (a + 1 == b) return Str(L"updYesterday") + L", " + tm;
+            GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, dt, 128, nullptr);
+            return std::wstring(dt) + L", " + tm;
+        }
+
+        // "2026-11-19" in the user's long date format.
+        std::wstring LongDate(const std::wstring& iso)
+        {
+            SYSTEMTIME st{};
+            if (iso.size() < 10 || swscanf_s(iso.c_str(), L"%hu-%hu-%hu", &st.wYear, &st.wMonth, &st.wDay) != 3) return L"";
+            wchar_t dt[128] = {};
+            if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &st, nullptr, dt, 128, nullptr)) return iso.substr(0, 10);
+            return dt;
+        }
+
+        // Release notes (Markdown as written on GitHub) as text blocks: headings, bullets and
+        // paragraphs; emphasis marks and link targets are left out.
+        std::wstring NotesXaml(const std::wstring& md)
+        {
+            auto inl = [](const std::wstring& t)
+            {
+                std::wstring o;
+                for (size_t i = 0; i < t.size(); i++)
+                {
+                    wchar_t c = t[i];
+                    if (c == L'*' || c == L'`') continue;
+                    if (c == L'_' && i + 1 < t.size() && t[i + 1] == L'_') { i++; continue; }
+                    if (c == L'[')
+                    {
+                        size_t close = t.find(L"](", i);
+                        size_t end = close == std::wstring::npos ? close : t.find(L')', close);
+                        if (end != std::wstring::npos) { o += t.substr(i + 1, close - i - 1); i = end; continue; }
+                    }
+                    o += c;
+                }
+                return Esc(o);
+            };
+            std::wstring x, para;
+            auto flush = [&]
+            {
+                if (!para.empty())
+                    x += L"<TextBlock Text=\"" + inl(para) + L"\" TextWrapping=\"Wrap\" IsTextSelectionEnabled=\"True\"/>";
+                para.clear();
+            };
+            size_t at = 0;
+            int lines = 0;
+            while (at <= md.size() && lines < 150)
+            {
+                size_t e = md.find(L'\n', at);
+                if (e == std::wstring::npos) e = md.size();
+                std::wstring ln = md.substr(at, e - at);
+                at = e + 1;
+                lines++;
+                while (!ln.empty() && (ln.back() == L'\r' || ln.back() == L' ')) ln.pop_back();
+                size_t lead = ln.find_first_not_of(L' ');
+                if (lead == std::wstring::npos) { flush(); continue; }
+                std::wstring t = ln.substr(lead);
+                if (t[0] == L'#')
+                {
+                    flush();
+                    size_t f = t.find_first_not_of(L"# ");
+                    if (f == std::wstring::npos) continue;
+                    x += L"<TextBlock Text=\"" + inl(t.substr(f)) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" TextWrapping=\"Wrap\" Margin=\"0,8,0,0\"/>";
+                }
+                else if (t.size() > 1 && (t[0] == L'-' || t[0] == L'*' || t[0] == L'+' || t[0] == 0x2022) && t[1] == L' ')
+                {
+                    flush();
+                    x += L"<Grid ColumnSpacing=\"10\" Margin=\"" + std::to_wstring(lead >= 2 ? 22 : 4) + L",0,0,0\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>"
+                         L"<TextBlock Text=\"&#x2022;\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/><TextBlock Grid.Column=\"1\" Text=\"" + inl(t.substr(2)) + L"\" TextWrapping=\"Wrap\" IsTextSelectionEnabled=\"True\"/></Grid>";
+                }
+                else
+                    para += (para.empty() ? L"" : L" ") + t;
+            }
+            flush();
+            return x;
+        }
+
+        // Updates, as Windows Update shows them: what the updater is doing (with its progress and
+        // "Restart now"), what changed in the newest version, and the options.
+        std::wstring PageUpdates()
+        {
+            auto up = g.data.GetNamedObject(L"update", JsonObject());
+            auto st = up.GetNamedObject(L"status", JsonObject());
+            std::wstring state = st.GetNamedString(L"state", L"").c_str();
+            std::wstring latest = Esc(std::wstring(st.GetNamedString(L"latest", L"").c_str()));
+            std::wstring version = Esc(std::wstring(up.GetNamedString(L"version", L"").c_str()));
+            bool dev = state == L"dev", busy = state == L"checking" || state == L"downloading", ready = state == L"ready";
+            std::wstring title = state == L"checking" ? Str(L"updChecking")
+                               : state == L"downloading" ? Fill(Str(L"updDownloading"), L"{v}", latest)
+                               : ready ? Fill(Str(L"updReady"), L"{v}", latest)
+                               : state == L"error" ? Str(L"updError")
+                               : dev ? Str(L"updDev")
+                               : state == L"uptodate" ? Str(L"updUpToDateTitle")
+                               : Str(L"updNever");
+            std::wstring more;
+            if (ready) more = Str(L"updReadyDesc");
+            else if (state == L"uptodate") more = Fill(Str(L"updUpToDate"), L"{v}", version);
+            else if (dev) more = Str(L"updDevDesc");
+            else if (state == L"error")
+            {
+                std::wstring k = st.GetNamedString(L"error", L"").c_str();
+                more = Str(k == L"net" ? L"updErrNet" : k == L"none" ? L"updErrNone" : k == L"server" ? L"updErrServer" : k == L"file" ? L"updErrFile" : L"updErrOther");
+            }
+            double checked = st.GetNamedNumber(L"checked", 0);
+            std::wstring when = checked > 0 && !dev ? Fill(Str(L"updChecked"), L"{t}", WhenText(checked)) : L"";
+            // The picture on the left: a turning ring while busy, otherwise what the state is.
+            std::wstring icon;
+            if (busy)
+                icon = L"<ProgressRing IsActive=\"True\" Width=\"36\" Height=\"36\"/>";
+            else
+            {
+                const wchar_t* glyph = ready ? L"&#xE896;" : state == L"uptodate" ? L"&#xE930;" : state == L"error" ? L"&#xE7BA;" : L"&#xE895;";
+                const wchar_t* brush = ready ? L"AccentTextFillColorPrimaryBrush" : state == L"uptodate" ? L"SystemFillColorSuccessBrush" : state == L"error" ? L"SystemFillColorCautionBrush" : L"TextFillColorSecondaryBrush";
+                icon = std::wstring(L"<FontIcon Glyph=\"") + glyph + L"\" FontSize=\"36\" Foreground=\"{ThemeResource " + brush + L"}\"/>";
+            }
+            std::wstring x = LR"(<Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="20,18">
+  <Grid ColumnSpacing="18"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>)";
+            x += L"<Grid Width=\"48\" Height=\"48\" VerticalAlignment=\"Center\">" + icon + L"</Grid>";
+            x += L"<StackPanel Grid.Column=\"1\" VerticalAlignment=\"Center\" Spacing=\"2\"><TextBlock Text=\"" + title + L"\" Style=\"{StaticResource SubtitleTextBlockStyle}\" TextWrapping=\"Wrap\"/>";
+            if (!more.empty()) x += L"<TextBlock Text=\"" + more + L"\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" TextWrapping=\"Wrap\"/>";
+            if (!when.empty()) x += L"<TextBlock Text=\"" + when + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/>";
+            if (state == L"downloading")
+            {
+                double pct = std::round(st.GetNamedNumber(L"progress", 0) * 100.0);
+                x += L"<Grid ColumnSpacing=\"12\" Margin=\"0,10,0,0\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
+                     L"<ProgressBar x:Name=\"UpdBar\" Maximum=\"100\" Value=\"" + Num(pct) + L"\" VerticalAlignment=\"Center\"" + (pct <= 0 ? L" IsIndeterminate=\"True\"" : L"") + L"/>"
+                     L"<TextBlock x:Name=\"UpdPct\" Grid.Column=\"1\" Text=\"" + Num(pct) + L"%\" Style=\"{StaticResource CaptionTextBlockStyle}\" MinWidth=\"32\" TextAlignment=\"Right\"/></Grid>";
+            }
+            x += L"</StackPanel><StackPanel Grid.Column=\"2\" Orientation=\"Horizontal\" Spacing=\"8\" VerticalAlignment=\"Center\">";
+            if (ready) x += L"<Button x:Name=\"UpdateInstall\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(L"updRestart") + L"\" MinWidth=\"120\"/>";
+            else x += L"<Button x:Name=\"UpdateNow\" Content=\"" + Str(L"updNow") + L"\" MinWidth=\"120\"" + (dev || busy ? L" IsEnabled=\"False\"" : L"") + L"/>";
+            x += L"</StackPanel></Grid></Border>";
+
+            // What's new.
+            std::wstring notes = st.GetNamedString(L"notes", L"").c_str();
+            std::wstring nv = Esc(std::wstring(st.GetNamedString(L"notes_version", L"").c_str()));
+            std::wstring date = LongDate(st.GetNamedString(L"notes_date", L"").c_str());
+            std::wstring head = Str(L"updWhatsNew");
+            x += Section(nv.empty() ? Str(L"updWhatsNewHead") : Fill(head, L"{v}", nv));
+            x += LR"(<Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="8" Padding="20,14,20,16"><StackPanel Spacing="6">)";
+            if (!date.empty()) x += L"<TextBlock Text=\"" + Esc(date) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/>";
+            std::wstring body = NotesXaml(notes);
+            x += body.empty() ? L"<TextBlock Text=\"" + Str(L"updNoNotes") + L"\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" TextWrapping=\"Wrap\"/>" : body;
+            x += L"</StackPanel></Border>";
+
+            // Options.
+            x += Section(Str(L"updOptions"));
+            x += Card(L"&#xE895;", Str(L"updAuto"), Str(L"updAutoDesc"), Toggle(L"UpdateAuto", up.GetNamedBoolean(L"auto", true)));
+            x += Card(L"&#xE946;", Str(L"updInstalled"), L"Deskboxes " + version,
+                      L"<HyperlinkButton Content=\"" + Str(L"updAllReleases") + L"\" NavigateUri=\"https://github.com/deskboxes/releases/releases\"/>");
             return x;
         }
 
@@ -486,7 +628,7 @@ namespace dbx
             auto ic = g.data.GetNamedObject(L"icons", JsonObject());
             std::wstring x = Card(L"&#xE790;", Str(L"tint"), Str(L"tintDesc"), TintBox(L"IconTint", ic.GetNamedString(L"tint", L"").c_str(), false));
             x += Card(L"&#xE706;", Str(L"tintStrength"), L"",
-                      L"<Slider x:Name=\"IconTintS\" Minimum=\"10\" Maximum=\"100\" StepFrequency=\"5\" SnapsTo=\"StepValues\" Width=\"220\" Value=\"" + Num(std::round(ic.GetNamedNumber(L"tintStrength", 0.7) * 100.0)) + L"\"/>");
+                      L"<Slider x:Name=\"IconTintS\" Minimum=\"10\" Maximum=\"100\" StepFrequency=\"5\" SnapsTo=\"StepValues\" Width=\"220\" Value=\"" + Num(std::round(ic.GetNamedNumber(L"tintStrength", 1.0) * 100.0)) + L"\"/>");
             x += Card(L"&#xE81E;", Str(L"blend"), Str(L"blendDesc"), Toggle(L"IconBlend", ic.GetNamedBoolean(L"blend", false)));
             x += Card(L"&#xE8B9;", Str(L"blendStrength"), L"",
                       L"<Slider x:Name=\"IconBlendS\" Minimum=\"10\" Maximum=\"100\" StepFrequency=\"5\" SnapsTo=\"StepValues\" Width=\"220\" Value=\"" + Num(std::round(ic.GetNamedNumber(L"blendStrength", 0.8) * 100.0)) + L"\"/>");
@@ -688,6 +830,14 @@ namespace dbx
                              L"<TextBlock Text=\"" + Str(L"homeTag") + L"\" Foreground=\"#E6FFFFFF\" TextWrapping=\"Wrap\"/>"
                              L"<TextBlock Text=\"" + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"  ·  " + Str(L"boxesN") + std::to_wstring(boxes) + L"\" Foreground=\"#B3FFFFFF\" Style=\"{StaticResource CaptionTextBlockStyle}\" Margin=\"0,4,0,0\"/>"
                              L"</StackPanel></Grid>";
+            // A downloaded update: say so here too, with its button.
+            {
+                auto st = g.data.GetNamedObject(L"update", JsonObject()).GetNamedObject(L"status", JsonObject());
+                if (st.GetNamedString(L"state", L"") == L"ready")
+                    x += L"<InfoBar IsOpen=\"True\" IsClosable=\"False\" Severity=\"Informational\" Margin=\"0,0,0,8\" Title=\"" +
+                         Fill(Str(L"updReady"), L"{v}", Esc(st.GetNamedString(L"latest", L"").c_str())) + L"\" Message=\"" + Str(L"updReadyDesc") +
+                         L"\"><InfoBar.ActionButton><Button x:Name=\"HomeUpdate\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(L"updRestart") + L"\"/></InfoBar.ActionButton></InfoBar>";
+            }
             // Quick actions.
             auto action = [](const wchar_t* name, const wchar_t* glyph, const wchar_t* text, bool accent)
             {
@@ -702,22 +852,25 @@ namespace dbx
             for (auto const& t : kTiles)
             {
                 std::wstring tag = t.page;
+                // The button is the tile's background and click target; the picture and the text lie
+                // over it and let clicks through. The switch (not in the button, so switching it doesn't
+                // open the page) has its own column in the title row, so it never covers the
+                // description however the text wraps (it was placed over the tile at a fixed spot and
+                // ran into the description with larger text, round 10).
                 x += L"<Grid Margin=\"0,0,8,8\">"
-                     L"<Button x:Name=\"Tile_" + tag + L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Stretch\""
-                     L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\">"
-                     L"<Grid><Grid.RowDefinitions><RowDefinition Height=\"124\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>" +
-                     Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0") +
-                     L"<StackPanel Grid.Row=\"1\" Padding=\"14,10,14,10\" Spacing=\"2\">"
-                     L"<TextBlock Text=\"" + Str(t.title) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" Margin=\"0,0,52,0\" TextTrimming=\"CharacterEllipsis\"/>"
-                     L"<TextBlock Text=\"" + Str(t.desc) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" TextWrapping=\"Wrap\" MaxLines=\"2\" TextTrimming=\"CharacterEllipsis\"/>"
-                     L"</StackPanel></Grid></Button>";
-                // The switch sits over the tile (not in the button, so switching it doesn't open the page).
+                     L"<Button x:Name=\"Tile_" + tag + L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\""
+                     L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\"/>"
+                     L"<Grid Margin=\"1\"><Grid.RowDefinitions><RowDefinition Height=\"123\"/><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
+                     L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0") + L"</Grid>"
+                     L"<Grid Grid.Row=\"1\" Margin=\"14,10,10,0\" ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
+                     L"<TextBlock Text=\"" + Str(t.title) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" VerticalAlignment=\"Center\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/>";
                 if (t.scope)
-                    x += L"<ToggleSwitch x:Name=\"HomeT_" + tag + L"\" OnContent=\"\" OffContent=\"\" MinWidth=\"0\" Width=\"40\" HorizontalAlignment=\"Right\" VerticalAlignment=\"Top\" Margin=\"0,130,10,0\"" +
+                    x += L"<ToggleSwitch x:Name=\"HomeT_" + tag + L"\" Grid.Column=\"1\" OnContent=\"\" OffContent=\"\" MinWidth=\"0\" Width=\"40\" VerticalAlignment=\"Center\" Margin=\"0,-12,0,-12\"" +
                          std::wstring(TileOn(t) ? L" IsOn=\"True\"" : L"") + L"/>";
                 else
-                    x += L"<FontIcon Glyph=\"&#xE76C;\" FontSize=\"12\" HorizontalAlignment=\"Right\" VerticalAlignment=\"Top\" Margin=\"0,142,16,0\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" IsHitTestVisible=\"False\"/>";
-                x += L"</Grid>";
+                    x += L"<FontIcon Grid.Column=\"1\" Glyph=\"&#xE76C;\" FontSize=\"12\" VerticalAlignment=\"Center\" Margin=\"0,0,6,0\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" IsHitTestVisible=\"False\"/>";
+                x += L"</Grid><TextBlock Grid.Row=\"2\" Margin=\"14,2,14,10\" Text=\"" + Str(t.desc) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\""
+                     L" TextWrapping=\"Wrap\" MaxLines=\"2\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/></Grid></Grid>";
             }
             x += L"</VariableSizedWrapGrid>";
             // Shortcuts.
@@ -767,6 +920,7 @@ namespace dbx
         const Page kPages[] = {
             { L"home", L"pageHome", L"&#xE80F;", PageHome, false, false, nullptr, nullptr },
             { L"general", L"pageGeneral", L"&#xE713;", PageGeneral, false, false, nullptr, nullptr },
+            { L"updates", L"updates", L"&#xE895;", PageUpdates, false, false, nullptr, nullptr },
             { L"look", L"pageStyles", L"&#xE737;", PageLook, true, false, L"heroLook", L"look" },
             { L"colors", L"pageColors", L"&#xE790;", PageColors, true, false, L"colorsDesc", L"colors" },
             { L"icons", L"pageIcons", L"&#xE8B9;", PageIcons, true, false, L"iconsDesc", L"icons" },
@@ -1044,6 +1198,7 @@ namespace dbx
             OnToggle(root, L"UpdateAuto", L"update", L"auto");
             OnClick(root, L"UpdateNow", L"update", 0, L"now");
             OnClick(root, L"UpdateInstall", L"update", 0, L"install");
+            OnClick(root, L"HomeUpdate", L"update", 0, L"install");
             OnToggle(root, L"LockAll", L"app", L"lockAll");
             OnToggle(root, L"Privacy", L"app", L"privacy");
             OnCombo(root, L"Language", [](std::wstring v) { Send(L"app", 0, L"language", JsonValue::CreateStringValue(v)); });
@@ -1419,6 +1574,35 @@ namespace dbx
         g.data = data;
         g.send = std::move(send);
         if (!g.window && !open) return;
+        // Only the download went on: move the progress bar instead of building the page again
+        // (a rebuild per percent would restart the ring and flicker).
+        {
+            auto copy = JsonObject::Parse(data.Stringify());
+            auto st = copy.GetNamedObject(L"update", JsonObject()).GetNamedObject(L"status", JsonObject());
+            double progress = st.GetNamedNumber(L"progress", 0);
+            if (st.HasKey(L"progress")) st.SetNamedValue(L"progress", JsonValue::CreateNumberValue(0));
+            std::wstring sig = copy.Stringify().c_str();
+            bool same = !open && g.window && sig == g.lastSig;
+            g.lastSig = sig;
+            if (same)
+            {
+                auto root = g.window.Content().try_as<mux::FrameworkElement>();
+                // A page put in by a page switch is a XAML document of its own (its own names).
+                if (auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr })
+                    if (auto pg = nav.Content().try_as<mux::FrameworkElement>(); pg && Find<muxc::ProgressBar>(pg, L"UpdBar")) root = pg;
+                if (root)
+                {
+                    double pct = std::round(progress * 100.0);
+                    if (auto bar = Find<muxc::ProgressBar>(root, L"UpdBar"))
+                    {
+                        bar.IsIndeterminate(pct <= 0);
+                        bar.Value(pct);
+                    }
+                    if (auto t = Find<muxc::TextBlock>(root, L"UpdPct")) t.Text(Num(pct) + L"%");
+                }
+                return;
+            }
+        }
         bool fresh = !g.window;
         if (fresh) MakeWindow();
         if (open)

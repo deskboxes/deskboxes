@@ -49,6 +49,8 @@ pub struct Search {
     pub matches: Vec<ItemKey>,
     pub set: HashSet<ItemKey>,
     pub cur: usize,
+    /// The searched box's icons (all tabs), cached per box and its item count.
+    pub scope_items: std::cell::RefCell<Option<(u32, usize, HashSet<ItemKey>)>>,
 }
 
 impl Default for Search {
@@ -58,6 +60,7 @@ impl Default for Search {
             ed: TextEdit::new(""),
             focused: false,
             scope: None,
+            scope_items: Default::default(),
             hover: false,
             hover_x: false,
             hover_t: past,
@@ -348,7 +351,17 @@ impl App {
         }
         if let Some(id) = self.search.scope {
             // Searching one box: the rest of the desktop is left alone.
-            let inside = self.box_by_id(id).map(|b| b.tabs.iter().any(|t| t.items.contains(k))).unwrap_or(false);
+            let inside = match self.box_by_id(id) {
+                Some(b) => {
+                    let n: usize = b.tabs.iter().map(|t| t.items.len()).sum();
+                    let mut c = self.search.scope_items.borrow_mut();
+                    if !matches!(&*c, Some((cid, cn, _)) if *cid == id && *cn == n) {
+                        *c = Some((id, n, b.tabs.iter().flat_map(|t| t.items.iter().cloned()).collect()));
+                    }
+                    c.as_ref().map(|(_, _, set)| set.contains(k)).unwrap_or(false)
+                }
+                None => false,
+            };
             if !inside {
                 return 1.0;
             }

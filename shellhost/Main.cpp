@@ -153,9 +153,21 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Windows' own dialogs that menu commands open in this process (delete and replace confirmations,
+// copy progress, Properties) follow the dark theme only when the process opts in, as Explorer
+// does: uxtheme's SetPreferredAppMode (ordinal 135; 1 = follow the system), FlushMenuThemes (136).
+static void AllowDarkDialogs()
+{
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    if (auto set = reinterpret_cast<int(WINAPI*)(int)>(GetProcAddress(ux, MAKEINTRESOURCEA(135)))) set(1);
+    if (auto flush = reinterpret_cast<void(WINAPI*)()>(GetProcAddress(ux, MAKEINTRESOURCEA(136)))) flush();
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    AllowDarkDialogs();
     SetUnhandledExceptionFilter(CrashFilter);
     dbx::LogInit();
     Args a = Parse();

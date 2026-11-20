@@ -54,6 +54,9 @@ pub struct Gpu {
     pub wic: IWICImagingFactory,
     /// Short round dashes (outlines drawn in privacy mode).
     pub dash: ID2D1StrokeStyle,
+    /// Text layouts made by `label`, reused: titles, tabs and letters are drawn every frame and
+    /// making a layout costs far more than drawing it.
+    labels: std::cell::RefCell<std::collections::HashMap<(usize, String, u32, u32, u32, bool), TextLayout>>,
 }
 
 impl Gpu {
@@ -93,6 +96,7 @@ impl Gpu {
                 dwrite,
                 wic,
                 dash,
+                labels: Default::default(),
             })
         }
     }
@@ -207,6 +211,52 @@ impl Gpu {
             read.Unmap()?;
             Ok(out)
         }
+    }
+
+    /// An icon recolored like iOS tinted icons: its lightness mapped onto a ramp of one color
+    /// (`ramp` = colors for lightness 0, 0.25, 0.5, 0.75, 1), shape and shading kept, alpha
+    /// kept. Rendered once at the icon's own pixel size (callers cache it).
+    pub fn recolor(&self, icon: &Bitmap, ramp: [Color; 5]) -> R<Bitmap> {
+        unsafe {
+            let sz = icon.GetPixelSize();
+            let gray = self.rdc.CreateEffect(&CLSID_D2D1ColorMatrix)?;
+            gray.SetInput(0, icon, true);
+            // Perceived lightness into all three channels; alpha as it is.
+            let l = [0.2126f32, 0.7152, 0.0722];
+            let mut m = [0f32; 20];
+            for i in 0..3 {
+                for j in 0..3 {
+                    m[i * 4 + j] = l[i];
+                }
+            }
+            m[15] = 1.0;
+            let mb: Vec<u8> = m.iter().flat_map(|f| f.to_le_bytes()).collect();
+            gray.SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32, D2D1_PROPERTY_TYPE_MATRIX_5X4, &mb)?;
+            gray.SetValue(D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT.0 as u32, D2D1_PROPERTY_TYPE_BOOL, &1u32.to_le_bytes())?;
+            let tt = self.rdc.CreateEffect(&CLSID_D2D1TableTransfer)?;
+            tt.SetInput(0, &gray.GetOutput()?, true);
+            let table = |f: fn(&Color) -> f32| -> Vec<u8> { ramp.iter().map(f).flat_map(|v| v.clamp(0.0, 1.0).to_le_bytes()).collect() };
+            tt.SetValue(D2D1_TABLETRANSFER_PROP_RED_TABLE.0 as u32, D2D1_PROPERTY_TYPE_BLOB, &table(|c| c.r))?;
+            tt.SetValue(D2D1_TABLETRANSFER_PROP_GREEN_TABLE.0 as u32, D2D1_PROPERTY_TYPE_BLOB, &table(|c| c.g))?;
+            tt.SetValue(D2D1_TABLETRANSFER_PROP_BLUE_TABLE.0 as u32, D2D1_PROPERTY_TYPE_BLOB, &table(|c| c.b))?;
+            tt.SetValue(D2D1_TABLETRANSFER_PROP_ALPHA_DISABLE.0 as u32, D2D1_PROPERTY_TYPE_BOOL, &1u32.to_le_bytes())?;
+            tt.SetValue(D2D1_TABLETRANSFER_PROP_CLAMP_OUTPUT.0 as u32, D2D1_PROPERTY_TYPE_BOOL, &1u32.to_le_bytes())?;
+            let out = tt.GetOutput()?;
+            self.offscreen(sz.width, sz.height, |dc| {
+                dc.DrawImage(&out, None, None, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_OVER);
+                Ok(())
+            })
+        }
+    }
+
+    /// Read a bitmap's pixels back (premultiplied BGRA rows), drawn at its own size.
+    pub fn pixels_of(&self, b: &Bitmap) -> R<(u32, u32, Vec<u8>)> {
+        let sz = unsafe { b.GetPixelSize() };
+        let px = self.render_pixels(sz.width, sz.height, 1.0, (0.0, 0.0), |dc| unsafe {
+            dc.DrawBitmap(b, None, 1.0, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, None, None);
+            Ok(())
+        })?;
+        Ok((sz.width, sz.height, px))
     }
 
     /// The wallpaper as Windows lays it out on a monitor of `mw`×`mh` px, downscaled by `down`, then
@@ -349,6 +399,25 @@ impl Gpu {
 
     /// A centered, wrapped label: at most `max_lines` lines with an ellipsis (0 = unlimited).
     pub fn label(&self, tf: &IDWriteTextFormat, text: &str, width: f32, line_h: f32, max_lines: u32, center: bool) -> R<TextLayout> {
+        let key = (tf.as_raw() as usize, text.to_string(), width.to_bits(), line_h.to_bits(), max_lines, center);
+        if let Some(l) = self.labels.borrow().get(&key) {
+            return Ok(l.clone());
+        }
+        let l = self.make_label(tf, text, width, line_h, max_lines, center)?;
+        let mut c = self.labels.borrow_mut();
+        if c.len() > 6000 {
+            c.clear();
+        }
+        c.insert(key, l.clone());
+        Ok(l)
+    }
+
+    /// Text formats are replaced (title font or size changed): their layouts go too.
+    pub fn forget_labels(&self) {
+        self.labels.borrow_mut().clear();
+    }
+
+    fn make_label(&self, tf: &IDWriteTextFormat, text: &str, width: f32, line_h: f32, max_lines: u32, center: bool) -> R<TextLayout> {
         unsafe {
             let s: Vec<u16> = text.encode_utf16().collect();
             let max_h = if max_lines == 0 { 10_000.0 } else { line_h * max_lines as f32 + 0.5 };

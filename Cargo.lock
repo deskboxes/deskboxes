@@ -41,6 +41,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "deskboxes-menuext"
+version = "0.1.1"
+dependencies = [
+ "deskboxes-i18n",
+ "serde_json",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "deskboxes-render"
 version = "0.1.1"
 dependencies = [

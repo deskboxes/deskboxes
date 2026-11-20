@@ -36,6 +36,8 @@ pub struct DropTarget {
     cur: RefCell<Option<Target>>,
     data: RefCell<Option<IDataObject>>,
     helper: Option<IDropTargetHelper>,
+    /// Our own icons are over us: the drag shows no caption (set once per visit).
+    own_caption_cleared: std::cell::Cell<bool>,
 }
 
 impl DropTarget {
@@ -46,6 +48,7 @@ impl DropTarget {
             cur: RefCell::new(None),
             data: RefCell::new(None),
             helper,
+            own_caption_cleared: std::cell::Cell::new(false),
         }
         .into()
     }
@@ -90,16 +93,58 @@ fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
     .flatten()
 }
 
+/// The drag image's caption ("Move to …"): another window's drop target sets it while the drag
+/// is over that window, and it stayed when our own icons came back over the desktop. Over us, a
+/// layout move shows none, as Explorer's desktop does.
+unsafe fn clear_caption(data: &IDataObject) {
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::Win32::System::Memory::*;
+    let cf = RegisterClipboardFormatW(windows::core::w!("DropDescription"));
+    if cf == 0 {
+        return;
+    }
+    let fmt = FORMATETC { cfFormat: cf as u16, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex: -1, tymed: TYMED_HGLOBAL.0 as u32 };
+    let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, std::mem::size_of::<DROPDESCRIPTION>()) else { return };
+    let p = GlobalLock(hg) as *mut DROPDESCRIPTION;
+    if p.is_null() {
+        let _ = GlobalFree(Some(hg));
+        return;
+    }
+    (*p).r#type = DROPIMAGE_NOIMAGE;
+    let _ = GlobalUnlock(hg);
+    let med = STGMEDIUM { tymed: TYMED_HGLOBAL.0 as u32, u: STGMEDIUM_0 { hGlobal: hg }, pUnkForRelease: std::mem::ManuallyDrop::new(None) };
+    // fRelease = true: the data object owns the memory now.
+    if data.SetData(&fmt, &med, true).is_err() {
+        let _ = GlobalFree(Some(hg));
+    }
+}
+
+impl DropTarget_Impl {
+    /// Over us with our own icons: no caption (once per visit).
+    fn own_over(&self) {
+        if !self.own_caption_cleared.get() {
+            if let Some(d) = self.data.borrow().as_ref() {
+                unsafe { clear_caption(d) };
+            }
+            self.own_caption_cleared.set(true);
+        }
+    }
+}
+
 impl IDropTarget_Impl for DropTarget_Impl {
     fn DragEnter(&self, pdataobj: Ref<IDataObject>, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, eff: *mut DROPEFFECT) -> windows::core::Result<()> {
         let data = pdataobj.ok()?.clone();
         *self.data.borrow_mut() = Some(data.clone());
         let allowed = unsafe { *eff };
         let t = target_at(self.hwnd, pt);
+        self.own_caption_cleared.set(false);
         unsafe {
             match &t {
                 Some(Target::Shell(_, t)) => t.DragEnter(&data, keys, *pt, eff)?,
-                Some(Target::Own) => *eff = allowed & DROPEFFECT_MOVE,
+                Some(Target::Own) => {
+                    *eff = allowed & DROPEFFECT_MOVE;
+                    self.own_over();
+                }
                 None => *eff = DROPEFFECT_NONE,
             }
             if let Some(h) = &self.helper {
@@ -125,13 +170,17 @@ impl IDropTarget_Impl for DropTarget_Impl {
                     let _ = t.DragEnter(d, keys, *pt, &mut e);
                 }
                 *self.cur.borrow_mut() = key_now;
+                self.own_caption_cleared.set(false);
             }
             match self.cur.borrow().as_ref() {
                 Some(Target::Shell(_, t)) => {
                     *eff = allowed;
                     t.DragOver(keys, *pt, eff)?;
                 }
-                Some(Target::Own) => *eff = allowed & DROPEFFECT_MOVE,
+                Some(Target::Own) => {
+                    *eff = allowed & DROPEFFECT_MOVE;
+                    self.own_over();
+                }
                 None => *eff = DROPEFFECT_NONE,
             }
             if let Some(h) = &self.helper {

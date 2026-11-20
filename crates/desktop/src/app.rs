@@ -1,6 +1,6 @@
 //! The core's UI thread: windows, state, input, menus, boxes, persistence (ARCHITECTURE §2–§10).
 
-use crate::events::{self, Ev, WM_APP_DRAW, WM_APP_EVENTS, WM_APP_RENAME_END};
+use crate::events::{self, Ev, WM_APP_DRAW, WM_APP_EVENTS, WM_APP_REFOCUS};
 use crate::textedit::TextEdit;
 use crate::worker::{self, Req};
 use crate::{Args, Paths};
@@ -11,7 +11,7 @@ use deskboxes_core::snapshot::{IconImage, Snapshot};
 use deskboxes_core::*;
 use deskboxes_i18n::{category_name, color_name, settings_strings, t, t as t_, Lang, BOX_COLORS, S};
 use deskboxes_render::{Bitmap, Gpu, Surface, TextLayout};
-use deskboxes_shell::{hide, items, reg, wallpaper};
+use deskboxes_shell::{autostart, hide, items, reg, turnon, wallpaper};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -21,7 +21,6 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -51,6 +50,14 @@ const T_TIP: usize = 14;
 const T_BTNTIP: usize = 15;
 /// Boxes above windows: the screen corner and whether another app came to the front.
 pub const T_ABOVE: usize = 16;
+/// Labels of icons out of view are made while idle.
+pub const T_PREP: usize = 40;
+/// Settings changed from the settings window are written a moment later (sliders send many).
+const T_SAVE_SETTINGS: usize = 41;
+/// The wallpaper changed: load it again once the changes settle.
+const T_WALLPAPER: usize = 42;
+/// The taskbar check again, a moment after the desktop got the front.
+const T_TASKBAR: usize = 43;
 /// Hover highlights fading in, s.
 pub const HOVER_FADE_S: f32 = 0.12;
 /// The search button opening into a field (and closing), s.
@@ -87,6 +94,10 @@ pub struct Vanish {
 }
 /// A tab opening: the highlight slides over and the icons fade in, s.
 pub const TAB_ANIM_S: f32 = 0.16;
+/// The box background crossfading to another tab's color, s.
+/// A name field fading in.
+pub const EDIT_FADE_S: f32 = 0.12;
+pub const TAB_COLOR_S: f32 = 0.22;
 /// Pointer rest before a hover prefetch, ms.
 const HOVER_PREFETCH_MS: u32 = 150;
 
@@ -229,11 +240,6 @@ pub struct MenuCtx {
     pub new_rect: Option<Rect>,
 }
 
-pub struct Rename {
-    pub edit: HWND,
-    pub target: RenameTarget,
-}
-
 /// Screen edges a box touches.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Dock {
@@ -243,10 +249,14 @@ pub struct Dock {
     pub right: bool,
 }
 
-/// A box (tab) title being edited in place, drawn in the header by us.
+/// A name being edited in place, drawn by us: a box (tab) title in its header, or an icon's
+/// name under it (`item`; `id` is then the box holding it, or 0).
 pub struct BoxEdit {
     pub id: u32,
     pub tab: usize,
+    pub item: Option<ItemKey>,
+    /// When the field appeared (it fades in).
+    pub since: Instant,
     pub ed: TextEdit,
     pub caret_on: bool,
     /// Mouse button held in the field: drag selects.
@@ -318,6 +328,14 @@ pub struct App {
     pub icon_dip: f32,
     pub icon_px: u32,
     pub items: HashMap<ItemKey, Item>,
+    /// Bumped whenever `items` changes (cached orders and layouts check it).
+    pub items_gen: u64,
+    /// `items_gen` all labels were made for (`prep_more`).
+    pub prep_gen: u64,
+    /// Settings changed and not yet written (`save_settings_soon`).
+    pub settings_dirty: bool,
+    /// Each tab's shown order (A–Z sorted), cached: see `az::Shown`.
+    pub shown_cache: RefCell<HashMap<u32, crate::az::Shown>>,
     pub bitmaps: HashMap<u32, Bitmap>,
     pub icon_imgs: HashMap<u32, IconImage>,
     pub layout: MonitorLayout,
@@ -342,13 +360,27 @@ pub struct App {
     pub wall: Option<Bitmap>,
     pub backdrops: HashMap<i32, Bitmap>,
     pub backdrop_down: u32,
+    /// The decoded wallpaper as laid out: (image and its original size, background color,
+    /// position, monitor w, h), kept for making blur levels.
+    pub wall_src: Option<(Option<(Bitmap, (u32, u32))>, deskboxes_render::Color, i32, u32, u32)>,
+    pub wall_sig: String,
+    /// A small blurred copy of the wallpaper as pixels: w, h, BGRA, monitor px per sample (the
+    /// color behind a blending icon).
+    pub wall_grid: Option<(u32, u32, Vec<u8>, f32)>,
+    /// Recolored icons (tint, blending), keyed by icon, color and kind: see `iconfx`.
+    pub fx_cache: RefCell<HashMap<(u32, u32, u8), Bitmap>>,
     pub light: bool,
     pub worker: worker::WorkerTx,
     pub host: Option<deskboxes_ipc::HostClient>,
     pub host_child: Option<std::process::Child>,
     pub host_starts: Vec<Instant>,
     pub menu: Option<(u32, MenuCtx)>,
-    pub rename: Option<Rename>,
+    /// An icon created from the "New" menu: sorted by the rules once its name is given.
+    pub sort_after_rename: Option<ItemKey>,
+    /// Edit this icon's name once the layout is redrawn (it was just created).
+    pub pending_rename: Option<ItemKey>,
+    /// "New" chosen in a menu: when, where (point, box), and the icons there were before.
+    pub pending_new: Option<(Instant, Pt, Option<u32>, BTreeSet<ItemKey>)>,
     pub box_edit: Option<BoxEdit>,
     /// What the settings window last got (boxes, styles, default style, language): resent when
     /// the layout changes it, so an open window stays current.
@@ -425,7 +457,10 @@ pub struct App {
     /// The search pill / box search field.
     pub search: crate::search::Search,
     /// The custom color window is open for: box, tab (None: the box), the color it started from.
-    pub color_pick: Option<(u32, Option<usize>, Option<Rgba>)>,
+    pub color_pick: Option<(u32, Option<(usize, bool)>, Option<Rgba>)>,
+    /// A tab just opened in a box whose tabs have their own colors: box, the color it had
+    /// (None = automatic), since (the background crossfades).
+    pub tab_color_from: Option<(u32, Option<Rgba>, Instant)>,
     /// The letter an A–Z box is at (the last one jumped or scrolled to): box, letter.
     pub az_at: Option<(u32, char)>,
     /// Blending icons: the box the pointer is on, the one it left, since.
@@ -671,10 +706,24 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     if crate::update::install_pending(&paths.update, settings.enabled && args.desktop_dir.is_none() && !args.window) {
         return 0;
     }
+    let real_desktop = args.desktop_dir.is_none() && !args.window;
     if !settings.enabled {
         log::info!("Deskboxes is disabled in settings: restoring native icons and exiting");
         hide::restore();
+        if real_desktop {
+            add_turn_on_verb(&settings);
+        }
         return 0;
+    }
+    if real_desktop {
+        turnon::remove_verb();
+        // Started at sign-in at above-normal priority (the logon task) so the desktop comes up
+        // fast; back to normal once it is up.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            use windows::Win32::System::Threading::*;
+            let _ = SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+        });
     }
     let desktop_mode = !args.window;
     let fixture = args.desktop_dir.clone();
@@ -683,6 +732,8 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let hinst = GetModuleHandleW(None).unwrap_or_default();
     let msg_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, w!("DeskboxesCore"), w!("Deskboxes core"), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst.into()), None).expect("message window");
     events::set_target(msg_hwnd);
+    events::watch_wallpaper(msg_hwnd);
+    events::watch_foreground(msg_hwnd);
     crate::anim::start(msg_hwnd);
 
     // 1. Snapshot: one read, no shell calls before the first frame.
@@ -804,6 +855,10 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         icon_dip,
         icon_px,
         items: HashMap::new(),
+        items_gen: 0,
+        prep_gen: u64::MAX,
+        settings_dirty: false,
+        shown_cache: RefCell::new(HashMap::new()),
         bitmaps: HashMap::new(),
         icon_imgs: HashMap::new(),
         layout: lay,
@@ -825,13 +880,19 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         wall: None,
         backdrops: HashMap::new(),
         backdrop_down: 4,
+        wall_src: None,
+        wall_sig: String::new(),
+        wall_grid: None,
+        fx_cache: RefCell::new(HashMap::new()),
         light,
         worker,
         host: None,
         host_child: None,
         host_starts: vec![],
         menu: None,
-        rename: None,
+        sort_after_rename: None,
+        pending_rename: None,
+        pending_new: None,
         box_edit: None,
         settings_sent: String::new(),
         revealed: Default::default(),
@@ -877,6 +938,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         glyph_tf,
         search: Default::default(),
         color_pick: None,
+        tab_color_from: None,
         az_at: None,
         blend_hover: (None, None, Instant::now()),
         desk_active: (false, Instant::now()),
@@ -910,6 +972,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         }
         for it in s.items {
             app.items.insert(it.key.clone(), it);
+            app.items_gen += 1;
         }
     }
     app.diag = app.args.diagnostics;
@@ -1012,14 +1075,38 @@ impl App {
             .map_err(|e| log::warn!("wallpaper surface: {e}"))
             .ok();
         self.backdrops.clear();
+        const GRID: u32 = 16;
+        self.wall_grid = self
+            .gpu
+            .blurred_wallpaper(img.as_ref().map(|(b, o)| (b, *o)), bg, pos, mw, mh, GRID, 40.0 * self.scale)
+            .and_then(|b| self.gpu.pixels_of(&b))
+            .map(|(w, h, px)| (w, h, px, GRID as f32))
+            .map_err(|e| log::warn!("wallpaper colors: {e}"))
+            .ok();
+        self.fx_cache.borrow_mut().clear();
+        self.wall_src = Some((img, bg, pos, mw, mh));
+        self.wall_sig = Self::wallpaper_sig();
+        self.ensure_backdrops();
+        log::info!("wallpaper '{path}' pos={pos} backdrops={}; MEM private/working set {:.1?} MB", self.backdrops.len(), mem_mb());
+    }
+
+    /// Blurred copies of the wallpaper for the blur levels in use, made from the decoded
+    /// wallpaper kept in memory (a blur slider used to read and decode the file per step).
+    /// Levels no box uses any more are dropped.
+    pub fn ensure_backdrops(&mut self) {
         let mut blurs: Vec<i32> = self.layout.boxes.iter().map(|b| b.style.blur as i32).collect();
         blurs.push(self.settings.default_style.blur as i32);
         blurs.sort();
         blurs.dedup();
+        self.backdrops.retain(|k, _| blurs.contains(k));
+        let Some((img, bg, pos, mw, mh)) = &self.wall_src else { return };
         for b in blurs {
+            if self.backdrops.contains_key(&b) {
+                continue;
+            }
             match self
                 .gpu
-                .blurred_wallpaper(img.as_ref().map(|(b, o)| (b, *o)), bg, pos, mw, mh, self.backdrop_down, b as f32 * self.scale)
+                .blurred_wallpaper(img.as_ref().map(|(b, o)| (b, *o)), *bg, *pos, *mw, *mh, self.backdrop_down, b as f32 * self.scale)
             {
                 Ok(bm) => {
                     self.backdrops.insert(b, bm);
@@ -1027,7 +1114,31 @@ impl App {
                 Err(e) => log::warn!("backdrop blur {b}: {e}"),
             }
         }
-        log::info!("wallpaper '{path}' pos={pos} backdrops={}; MEM private/working set {:.1?} MB", self.backdrops.len(), mem_mb());
+    }
+
+    /// What the wallpaper is now (file, its time and size, layout, color): a change means load
+    /// it again. Windows does not always tell top-level windows (Settings › Personalization).
+    pub fn wallpaper_sig() -> String {
+        let mons = wallpaper::monitors();
+        let mut s = String::new();
+        for m in &mons {
+            let meta = std::fs::metadata(&m.path).ok();
+            let t = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis()).unwrap_or(0);
+            let n = meta.map(|m| m.len()).unwrap_or(0);
+            s.push_str(&format!("{}|{t}|{n}|{}|{};", m.path, m.position, m.color));
+        }
+        s
+    }
+
+    /// The wallpaper may have changed: load it again if it did.
+    pub fn wallpaper_check(&mut self) {
+        let sig = Self::wallpaper_sig();
+        if sig != self.wall_sig {
+            log::info!("wallpaper changed");
+            self.load_wallpaper();
+            self.fx_cache.borrow_mut().clear();
+            self.invalidate();
+        }
     }
 
     pub fn invalidate(&mut self) {
@@ -1052,19 +1163,30 @@ impl App {
 
     /// Cell rects of the active tab's items of a box (scrolled; may extend past the content rect).
     pub fn box_item_cells(&self, b: &BoxModel) -> Vec<(ItemKey, Rect)> {
+        self.box_cells_in(b, f32::MIN, f32::MAX).into_iter().map(|(_, k, r)| (k, r)).collect()
+    }
+
+    /// Like `box_item_cells`, only the rows reaching into `y0..y1` (what can be seen or hit):
+    /// (index in the shown order, item, cell). A box of 800 icons shows about 50.
+    pub fn box_cells_in(&self, b: &BoxModel, y0: f32, y1: f32) -> Vec<(usize, ItemKey, Rect)> {
         let Some(tab) = b.active() else { return vec![] };
         let cols = self.box_cols(b);
         let c = Self::content_rect(b);
         let used = cols as f32 * self.grid.cell_w;
         let x0 = c.x + (c.w - used) / 2.0;
-        let y0 = c.y + 2.0 - self.shown_scroll(b.id);
-        self.shown_items(b, tab)
-            .into_iter()
-            .enumerate()
-            .map(|(i, k)| {
+        let top = c.y + 2.0 - self.shown_scroll(b.id);
+        let items = self.shown_items(b, tab);
+        let ch = self.grid.cell_h.max(1.0);
+        let first_row = if y0 == f32::MIN { 0 } else { ((y0 - top) / ch).floor().max(0.0) as usize };
+        let last_row = if y1 == f32::MAX { usize::MAX } else { ((y1 - top) / ch).floor().max(0.0) as usize };
+        let start = first_row.saturating_mul(cols).min(items.len());
+        let end = last_row.saturating_add(1).saturating_mul(cols).min(items.len());
+        (start..end)
+            .map(|i| {
                 (
-                    k.clone(),
-                    Rect::new(x0 + (i % cols) as f32 * self.grid.cell_w, y0 + (i / cols) as f32 * self.grid.cell_h, self.grid.cell_w, self.grid.cell_h),
+                    i,
+                    items[i].clone(),
+                    Rect::new(x0 + (i % cols) as f32 * self.grid.cell_w, top + (i / cols) as f32 * self.grid.cell_h, self.grid.cell_w, self.grid.cell_h),
                 )
             })
             .collect()
@@ -1100,7 +1222,7 @@ impl App {
         }
         let it = self.items.get(&key)?;
         let ext = std::path::Path::new(&it.parsing_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        let accepts = it.is_folder() || matches!(ext.as_str(), "exe" | "lnk" | "zip" | "bat" | "cmd");
+        let accepts = it.is_folder() || matches!(ext.as_str(), "exe" | "lnk" | "zip" | "bat" | "cmd") || is_recycle_bin(&it.parsing_name);
         let (_, cell, _) = self.visible_cells().into_iter().find(|(k, _, _)| *k == key)?;
         let (icon, _) = self.item_parts(&key, cell, false);
         (accepts && icon.inflate(6.0).contains(p)).then_some(key)
@@ -1157,6 +1279,26 @@ impl App {
                 continue;
             }
             v.extend(self.box_item_cells(b).into_iter().map(|(k, r)| (k, r, Some(b.id))));
+        }
+        v
+    }
+
+    /// The items that can be seen now (loose ones, and the rows of open boxes in view), for the
+    /// per-frame preparation: a box of 800 icons prepares the 50 it shows, not all of them.
+    pub fn cells_in_view(&self) -> Vec<(ItemKey, Rect, Option<u32>)> {
+        let mut v: Vec<(ItemKey, Rect, Option<u32>)> = self
+            .layout
+            .loose
+            .iter()
+            .filter(|(k, _)| self.items.contains_key(*k))
+            .map(|(k, c)| (k.clone(), self.grid.cell_rect(*c), None))
+            .collect();
+        for b in &self.layout.boxes {
+            if !self.fully_open(b) {
+                continue;
+            }
+            let c = Self::content_rect(b);
+            v.extend(self.box_cells_in(b, c.y, c.bottom()).into_iter().map(|(_, k, r)| (k, r, Some(b.id))));
         }
         v
     }
@@ -1349,6 +1491,7 @@ impl App {
         self.anim_roll
             || !self.glide.is_empty()
             || self.tab_anim.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_ANIM_S).unwrap_or(false)
+            || self.tab_color_from.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_COLOR_S).unwrap_or(false)
             || self.tip.as_ref().map(|t| t.4.elapsed().as_secs_f32() < TIP_FADE_S).unwrap_or(false)
             || self.search_animating()
             || self.az_animating()
@@ -1360,6 +1503,7 @@ impl App {
             || self.scroll_animating()
             || (matches!(self.drag, Drag::MoveBox { .. }) && self.move_t0.elapsed().as_secs_f32() < LIFT_S)
             || !self.vanishing.is_empty()
+            || self.box_edit.as_ref().map(|e| e.since.elapsed().as_secs_f32() < EDIT_FADE_S).unwrap_or(false)
     }
 
     /// The title size or corners changed: new title text formats and metrics, everything redrawn.
@@ -1371,6 +1515,8 @@ impl App {
         // Other tabs' titles: a step lighter than the open one.
         let lighter = if w >= 600 { 400 } else { (w - 100).max(300) };
         if let (Ok(a), Ok(b)) = (self.gpu.text_format_weight(&fam, sz, lighter), self.gpu.text_format_weight(&fam, sz, w)) {
+            // The old formats' pointers could be reused by new ones: no stale layouts.
+            self.gpu.forget_labels();
             self.title_tf = a;
             self.title_tf_bold = b;
         }
@@ -1452,18 +1598,21 @@ impl App {
         })
     }
 
-    /// The custom color window for a box (tab None) or one of its tabs.
-    fn open_color_picker(&mut self, id: u32, tab: Option<usize>) {
+    /// The custom color window for a box (tab None), one of its tabs (false), or the box's
+    /// background behind one of its tabs (true).
+    fn open_color_picker(&mut self, id: u32, tab: Option<(usize, bool)>) {
         let Some(h) = self.host.clone() else { return };
         let Some(b) = self.box_by_id(id) else { return };
         let cur = match tab {
-            Some(t) => b.tabs.get(t).and_then(|t| t.color),
+            Some((t, false)) => b.tabs.get(t).and_then(|t| t.color),
+            Some((t, true)) => b.tabs.get(t).and_then(|t| t.box_color.or(b.style.color)),
             None => b.style.color,
         };
         let hex = |c: Rgba| format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b);
         let (ar, ag, ab) = accent();
         let title = match tab {
-            Some(t) => format!("{} – {}", t_(self.lang, S::TabColor), b.tabs.get(t).map(|x| x.title.as_str()).unwrap_or("")),
+            Some((t, false)) => format!("{} – {}", t_(self.lang, S::TabColor), b.tabs.get(t).map(|x| x.title.as_str()).unwrap_or("")),
+            Some((t, true)) => format!("{} – {}", t_(self.lang, S::BoxColor), b.tabs.get(t).map(|x| x.title.as_str()).unwrap_or("")),
             None => format!("{} – {}", t_(self.lang, S::BoxColor), b.title()),
         };
         self.color_pick = Some((id, tab, cur));
@@ -1475,9 +1624,9 @@ impl App {
         let body = json!({
             "title": title,
             "current": cur.map(hex).unwrap_or_default(),
-            "auto": if tab.is_some() { format!("#{ar:02X}{ag:02X}{ab:02X}") } else if self.light { "#F3F3F3".to_string() } else { "#202020".to_string() },
+            "auto": if matches!(tab, Some((_, false))) { format!("#{ar:02X}{ag:02X}{ab:02X}") } else if self.light { "#F3F3F3".to_string() } else { "#202020".to_string() },
             "box": id,
-            "key": tab.map(|t| format!("tab:{t}")).unwrap_or_else(|| "box".into()),
+            "key": match tab { Some((t, false)) => format!("tab:{t}"), Some((t, true)) => format!("tabbox:{t}"), None => "box".into() },
             "ok": t_(self.lang, S::Ok),
             "cancel": t_(self.lang, S::Cancel),
         });
@@ -1500,9 +1649,14 @@ impl App {
         let set = |l: &mut MonitorLayout, c: Option<Rgba>| {
             if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id) {
                 match tab {
-                    Some(t) => {
+                    Some((t, false)) => {
                         if let Some(t) = b.tabs.get_mut(t) {
                             t.color = c;
+                        }
+                    }
+                    Some((t, true)) => {
+                        if let Some(t) = b.tabs.get_mut(t) {
+                            t.box_color = c;
                         }
                     }
                     None => b.style.color = c,
@@ -1550,7 +1704,7 @@ impl App {
     /// The pointer rested on an icon: ask the worker for Explorer's tooltip text.
     fn tip_due(&mut self) {
         // Privacy mode: no names in tooltips either.
-        if !matches!(self.drag, Drag::None) || self.menu.is_some() || self.rename.is_some() || self.privacy_on() {
+        if !matches!(self.drag, Drag::None) || self.menu.is_some() || self.box_edit.as_ref().map(|e| e.item.is_some()).unwrap_or(false) || self.privacy_on() {
             return;
         }
         let Some(k) = self.hover.clone() else { return };
@@ -1610,6 +1764,21 @@ impl App {
         }
     }
 
+    /// The window under the pointer is our surface (or the desktop it sits on).
+    pub fn pointer_over_us(&self) -> bool {
+        let mut c = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut c);
+            let w = WindowFromPoint(c);
+            w == self.hwnd || GetAncestor(w, GA_ROOT) == GetAncestor(self.hwnd, GA_ROOT)
+        }
+    }
+
+    /// A box's color as shown now: its open tab's own, else the box's (None = automatic).
+    pub fn box_color(b: &BoxModel) -> Option<Rgba> {
+        b.tabs.get(b.active_tab).and_then(|t| t.box_color).or(b.style.color)
+    }
+
     pub fn cursor_dip(&self) -> Pt {
         let mut c = POINT::default();
         unsafe {
@@ -1647,6 +1816,11 @@ impl App {
         if keep.len() != self.revealed.len() {
             self.revealed = keep.into_iter().collect();
             self.invalidate();
+        }
+        // The pointer is over another window now (maybe still above the box): the box is not
+        // pointed at any more, so it blends into the wallpaper again.
+        if !self.pointer_over_us() {
+            self.blend_pointer(Pt { x: -1.0e6, y: -1.0e6 });
         }
         if !self.revealed.is_empty() {
             unsafe {
@@ -1764,6 +1938,11 @@ impl App {
         let from = self.box_by_id(id).and_then(|b| self.header_layout(b).tabs.get(b.active_tab).copied());
         if let Some(b) = self.layout.boxes.iter_mut().find(|b| b.id == id) {
             if b.active_tab != t && t < b.tabs.len() {
+                let before = b.tabs.get(b.active_tab).and_then(|x| x.box_color).or(b.style.color);
+                let after = b.tabs.get(t).and_then(|x| x.box_color).or(b.style.color);
+                if before != after {
+                    self.tab_color_from = Some((id, before, Instant::now()));
+                }
                 b.active_tab = t;
                 if let Some(r) = from {
                     self.tab_anim = Some((id, r, Instant::now()));
@@ -1953,7 +2132,7 @@ impl App {
                 return Hit::BoxBody { id: b.id };
             }
             let c = Self::content_rect(b);
-            for (k, cell) in self.box_item_cells(b) {
+            for (_, k, cell) in self.box_cells_in(b, p.y - 3.0 * self.grid.cell_h, p.y + self.grid.cell_h) {
                 if cell.bottom() < c.y || cell.y > c.bottom() {
                     continue;
                 }
@@ -2058,11 +2237,7 @@ impl App {
         if self.host.is_some() && self.settings_sig() != self.settings_sent {
             self.send_settings(false, None);
         }
-        let mut blurs: Vec<i32> = self.layout.boxes.iter().map(|b| b.style.blur as i32).collect();
-        blurs.retain(|b| !self.backdrops.contains_key(b));
-        if !blurs.is_empty() {
-            self.load_wallpaper();
-        }
+        self.ensure_backdrops();
         unsafe {
             SetTimer(Some(self.msg_hwnd), T_SAVE, 1000, None);
         }
@@ -2204,6 +2379,8 @@ impl App {
             new_items.insert(it.key.clone(), it);
         }
         self.items = new_items;
+        self.items_gen += 1;
+        self.shown_cache.borrow_mut().clear();
         if renamed || first {
             self.labels.clear();
             self.label_bmps.clear();
@@ -2249,8 +2426,38 @@ impl App {
                 self.pending_drop = None;
             }
         }
+        let mut created: Option<ItemKey> = None;
+        if let Some((when, at, bx, before)) = self.pending_new.clone() {
+            if when.elapsed().as_secs() < 10 {
+                let fresh: Vec<ItemKey> = present.iter().filter(|k| !before.contains(*k) && !old.contains(*k)).cloned().collect();
+                if let Some(k) = fresh.first() {
+                    match bx.filter(|id| self.box_by_id(*id).map(|b| !b.is_folder()).unwrap_or(false)) {
+                        Some(id) => {
+                            layout::move_to_box(&mut self.layout, &fresh, id, None);
+                        }
+                        None => layout::move_to_grid(&mut self.layout, &fresh, self.grid.cell_at(at), &self.grid),
+                    }
+                    dropped.extend(fresh.iter().cloned());
+                    self.no_glide.extend(fresh.iter().cloned());
+                    created = Some(k.clone());
+                    self.pending_new = None;
+                }
+            } else {
+                self.pending_new = None;
+            }
+        }
+        // A new icon named after "New": the rules sort it now.
+        let renamed_new = self.sort_after_rename.clone().filter(|k| self.box_edit.as_ref().and_then(|e| e.item.as_ref()) != Some(k) && !old.is_empty());
         let changed = layout::reconcile(&mut self.layout, &present, &self.grid);
         let changed = self.sort_new_items(&old, &dropped) | changed;
+        let changed = match renamed_new {
+            Some(k) if self.items.contains_key(&k) => {
+                self.sort_after_rename = None;
+                let one: BTreeSet<ItemKey> = std::iter::once(k).collect();
+                self.apply_rules(Some(&one), true) | changed
+            }
+            _ => changed,
+        };
         self.fill_folder_boxes();
         self.sel.set.retain(|k| self.items.contains_key(k));
         self.scanned_once = true;
@@ -2270,6 +2477,12 @@ impl App {
                 }
             }
         }
+        if let Some(k) = created {
+            self.sel.set = std::iter::once(k.clone()).collect();
+            self.sel.focus = Some(k.clone());
+            self.sort_after_rename = Some(k.clone());
+            self.pending_rename = Some(k);
+        }
         if changed || first {
             unsafe {
                 SetTimer(Some(self.msg_hwnd), T_SAVE, 1000, None);
@@ -2283,6 +2496,9 @@ impl App {
             self.stats.hide_ms = th.elapsed().as_secs_f64() * 1000.0;
             log::info!("PHASE hide_icons (after first scan) ms={:.1} state={s:?}", self.stats.hide_ms);
             return;
+        }
+        if let Some(k) = self.pending_rename.take() {
+            self.begin_rename(RenameTarget::Item(k));
         }
         self.invalidate();
     }
@@ -2390,38 +2606,33 @@ impl App {
                             _ => None,
                         },
                     ),
-                    None => vec![json!({ "id": "dbx.newbox", "text": t(self.lang, S::NewBox), "glyph": "\u{E710}", "placement": "beforeNew" })],
+                    None => vec![],
                 };
-                let sub = vec![
-                    json!({ "id": "dbx.sortnow", "text": t(self.lang, S::SortNow), "glyph": "\u{E8CB}" }),
-                    json!({ "id": "dbx.rules", "text": t(self.lang, S::SortingRules), "glyph": "\u{E71C}" }),
-                    json!({ "id": "dbx.settings", "text": t(self.lang, S::Settings), "glyph": "\u{E713}" }),
-                    json!({ "separator": true }),
-                    json!({ "id": "dbx.lockall", "text": t(self.lang, S::LockEverything), "glyph": "\u{E72E}", "checkable": true, "checked": self.settings.lock_all }),
-                    json!({ "separator": true }),
-                    json!({ "id": "dbx.disable", "text": t(self.lang, S::Disable) }),
-                ];
-                let mut sub = sub;
-                // New folder box: one of the user's folders.
-                let kf: Vec<Value> = items::known_folders()
-                    .into_iter()
-                    .map(|(n, p)| {
-                        let s = match n {
-                            "documents" => S::KfDocuments,
-                            "downloads" => S::KfDownloads,
-                            "pictures" => S::KfPictures,
-                            "music" => S::KfMusic,
-                            _ => S::KfVideos,
-                        };
-                        json!({ "id": format!("dbx.fbknown:{}", p.display()), "text": t(self.lang, s), "glyph": "\u{E8B7}" })
-                    })
-                    .collect();
-                if !kf.is_empty() && bid.is_none() {
-                    sub.insert(0, json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
+                // Deskboxes' own things on the desktop all live in one submenu, in groups.
+                let mut sub = vec![];
+                if bid.is_none() {
+                    sub.push(json!({ "id": "dbx.newbox", "text": t(self.lang, S::NewBox), "glyph": "\u{E710}" }));
+                    let kf: Vec<Value> = items::known_folders()
+                        .into_iter()
+                        .map(|(n, p)| {
+                            let s = match n {
+                                "documents" => S::KfDocuments,
+                                "downloads" => S::KfDownloads,
+                                "pictures" => S::KfPictures,
+                                "music" => S::KfMusic,
+                                _ => S::KfVideos,
+                            };
+                            json!({ "id": format!("dbx.fbknown:{}", p.display()), "text": t(self.lang, s), "glyph": "\u{E8B7}" })
+                        })
+                        .collect();
+                    if !kf.is_empty() {
+                        sub.push(json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
+                    }
+                    sub.push(json!({ "separator": true }));
                 }
-                if self.settings.privacy.allowed {
-                    sub.insert(5, json!({ "id": "dbx.privacy", "text": t(self.lang, S::PrivacyMode), "glyph": "\u{ED1A}", "checkable": true, "checked": self.settings.privacy.on }));
-                }
+                sub.push(json!({ "id": "dbx.sortnow", "text": t(self.lang, S::SortNow), "glyph": "\u{E8CB}" }));
+                sub.push(json!({ "id": "dbx.rules", "text": t(self.lang, S::SortingRules), "glyph": "\u{E71C}" }));
+                sub.push(json!({ "separator": true }));
                 if self.settings.saved.in_menu {
                     // Saved layouts: save now, go back to one of the newest, or manage them.
                     let mut sv = vec![json!({ "id": "dbx.savenow", "text": t(self.lang, S::SaveLayoutNow), "glyph": "\u{E74E}" })];
@@ -2434,8 +2645,15 @@ impl App {
                     }
                     sv.push(json!({ "separator": true }));
                     sv.push(json!({ "id": "dbx.savedpage", "text": t(self.lang, S::ManageSaved), "glyph": "\u{E713}" }));
-                    sub.insert(2, json!({ "id": "dbx.savedmenu", "text": t(self.lang, S::SavedLayouts), "glyph": "\u{E81C}", "children": sv }));
+                    sub.push(json!({ "id": "dbx.savedmenu", "text": t(self.lang, S::SavedLayouts), "glyph": "\u{E81C}", "children": sv }));
                 }
+                if self.settings.privacy.allowed {
+                    sub.push(json!({ "id": "dbx.privacy", "text": t(self.lang, S::PrivacyMode), "glyph": "\u{ED1A}", "checkable": true, "checked": self.settings.privacy.on }));
+                }
+                sub.push(json!({ "id": "dbx.lockall", "text": t(self.lang, S::LockEverything), "glyph": "\u{E72E}", "checkable": true, "checked": self.settings.lock_all }));
+                sub.push(json!({ "separator": true }));
+                sub.push(json!({ "id": "dbx.settings", "text": t(self.lang, S::Settings), "glyph": "\u{E713}" }));
+                sub.push(json!({ "id": "dbx.disable", "text": t(self.lang, S::Disable), "glyph": "\u{E7E8}" }));
                 extra.push(json!({ "id": "dbx.menu", "text": t(self.lang, S::BoxesSubmenu), "placement": "beforeNew", "children": sub, "icon": format!("{},0", std::env::current_exe().unwrap_or_default().display()) }));
                 let _ = (at, new_rect);
                 // View and Sort by, as Explorer's desktop has them (Windows' own text, "@dll,-id").
@@ -2477,11 +2695,7 @@ impl App {
     }
 
     fn autostart_on() -> bool {
-        let run = reg::get_string(reg::RUN, crate::RUN_VALUE).is_some();
-        let approved = reg::get_binary(reg::RUN_APPROVED, crate::RUN_VALUE)
-            .map(|b| b.first().map(|x| x & 1 == 0).unwrap_or(true))
-            .unwrap_or(true);
-        run && approved
+        autostart::is_on()
     }
 
     /// Send the settings window its data; `open` shows it, otherwise an open one is refreshed.
@@ -2594,6 +2808,21 @@ impl App {
     }
 
     /// A change made in the settings window, applied live.
+    /// Write settings.json a moment from now: a slider in the settings window sends a value
+    /// per step, and writing each one made dragging it slow on slower PCs.
+    pub fn flush_settings(&mut self) {
+        if std::mem::take(&mut self.settings_dirty) {
+            let _ = persist::save_settings(&self.paths.settings, &self.settings);
+        }
+    }
+
+    pub fn save_settings_soon(&mut self) {
+        self.settings_dirty = true;
+        unsafe {
+            SetTimer(Some(self.msg_hwnd), T_SAVE_SETTINGS, 400, None);
+        }
+    }
+
     fn apply_setting(&mut self, v: &Value) {
         let (scope, key, val) = (v["scope"].as_str().unwrap_or(""), v["key"].as_str().unwrap_or(""), &v["value"]);
         let id = v["box"].as_f64().unwrap_or(0.0) as u32;
@@ -2618,21 +2847,17 @@ impl App {
         match (scope, key) {
             ("app", "autostart") => {
                 if val.as_bool().unwrap_or(false) {
-                    let exe = std::env::current_exe().unwrap_or_default();
-                    let wd = exe.with_file_name("deskboxes-watchdog.exe");
-                    let r = reg::set_string(reg::RUN, crate::RUN_VALUE, &format!("\"{}\" --launch", wd.display()));
-                    // Turned off in Task Manager's Startup apps: on again.
-                    reg::delete_value(reg::RUN_APPROVED, crate::RUN_VALUE);
-                    log::info!("autostart on: {r:?}");
+                    let wd = std::env::current_exe().unwrap_or_default().with_file_name("deskboxes-watchdog.exe");
+                    log::info!("autostart on: {:?}", autostart::enable(&wd));
                 } else {
-                    reg::delete_value(reg::RUN, crate::RUN_VALUE);
+                    autostart::disable();
                     log::info!("autostart off");
                 }
             }
             ("app", "language") => {
                 self.settings.language = val.as_str().unwrap_or("").to_string();
                 self.lang = Lang::pick(&self.settings.language, unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() });
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.send_settings(false, None);
             }
             ("app", "disable") => self.on_command("dbx.disable", None),
@@ -2641,12 +2866,12 @@ impl App {
                 if !self.settings.privacy.allowed {
                     self.set_privacy(false);
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
             }
             ("app", "lockAll") => {
                 self.settings.lock_all = val.as_bool().unwrap_or(false);
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2660,7 +2885,7 @@ impl App {
                     "ctrlWheel" => ex.ctrl_wheel_size = on,
                     _ => {}
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2671,7 +2896,7 @@ impl App {
                     _ => self.settings.az.letter_tags = on,
                 }
                 crate::az::set_bar(self.settings.az.letter_bar);
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2681,7 +2906,7 @@ impl App {
                     "field" => self.settings.search.field = on,
                     _ => self.settings.search.type_to_search = on,
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2689,7 +2914,7 @@ impl App {
                 let ic = &mut self.settings.icons;
                 match k {
                     "tint" => ic.tint = val.as_str().unwrap_or("").to_string(),
-                    "tintStrength" => ic.tint_strength = val.as_f64().unwrap_or(0.7).clamp(0.0, 1.0) as f32,
+                    "tintStrength" => ic.tint_strength = val.as_f64().unwrap_or(1.0).clamp(0.0, 1.0) as f32,
                     "blend" => ic.blend = val.as_bool().unwrap_or(false),
                     "blendStrength" => ic.blend_strength = val.as_f64().unwrap_or(0.8).clamp(0.0, 1.0) as f32,
                     "desktop" => ic.desktop = val.as_bool().unwrap_or(false),
@@ -2698,7 +2923,7 @@ impl App {
                     "fullActive" => ic.full_when_active = val.as_bool().unwrap_or(true),
                     _ => {}
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2723,7 +2948,7 @@ impl App {
                     "delete" => self.delete_saved_layout(sid),
                     _ => {
                         self.settings.saved.in_menu = val.as_bool().unwrap_or(true);
-                        let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                        self.save_settings_soon();
                         self.settings_sent = self.settings_sig();
                     }
                 }
@@ -2738,7 +2963,7 @@ impl App {
                 "auto" => {
                     self.settings.update.auto = val.as_bool().unwrap_or(true);
                     crate::update::set_auto(self.settings.update.auto);
-                    let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                    self.save_settings_soon();
                     self.settings_sent = self.settings_sig();
                 }
                 "now" => crate::update::check_now(),
@@ -2763,7 +2988,7 @@ impl App {
                 }
                 self.register_above_hotkey();
                 self.above_poll();
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.send_settings(false, None);
                 self.invalidate();
             }
@@ -2772,7 +2997,7 @@ impl App {
                 if !self.settings.hide.double_click {
                     self.set_tucked(false);
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
             }
@@ -2799,7 +3024,7 @@ impl App {
                     "combine" => self.settings.tabs.combine = val.as_bool().unwrap_or(true),
                     _ => self.settings.tabs.style = val.as_str().unwrap_or("pills").to_string(),
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.invalidate();
             }
             ("look", k) => {
@@ -2831,8 +3056,14 @@ impl App {
                     "titleButtons" => lk.title_buttons = val.as_bool().unwrap_or(false),
                     _ => {}
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
-                self.apply_look();
+                self.save_settings_soon();
+                // Only fonts and sizes need new text formats (a slider sends many values).
+                if refresh || matches!(k, "titleSize" | "titleFont" | "titleWeight" | "radius") {
+                    self.apply_look();
+                } else {
+                    set_look_metrics(&self.settings.look);
+                    self.invalidate();
+                }
                 if refresh {
                     self.send_settings(false, None);
                 } else {
@@ -2845,7 +3076,7 @@ impl App {
                     "doubleClick" => self.settings.rollup.double_click = val.as_bool().unwrap_or(true),
                     _ => self.settings.rollup.reveal = val.as_str().unwrap_or("hover").to_string(),
                 }
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.invalidate();
             }
             ("default", "applyAll") => {
@@ -2859,7 +3090,7 @@ impl App {
             }
             ("default", _) => {
                 set_style(&mut self.settings.default_style);
-                let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 // New blur values need their backdrop when a box gets created.
                 self.layout_changed();
@@ -2982,65 +3213,55 @@ impl App {
             .iter()
             .map(|(v, s)| json!({ "id": format!("dbx.blur:{v}"), "text": t(l, *s), "radio": true, "checked": st.blur.round() as i32 == *v }))
             .collect();
-        // Everything about the box sits in one submenu at the top of its menu: the tab (the one
-        // right-clicked, or the open one) first, then the box.
-        let mut sub = vec![];
-        if b.tabs.len() > 1 {
-            let ti = at_tab.unwrap_or(b.active_tab).min(b.tabs.len() - 1);
-            let tc = b.tabs[ti].color;
-            let mut tcolors = vec![json!({ "id": "dbx.tabcolor:auto", "text": t(l, S::ColorAuto), "radio": true, "checked": tc.is_none() })];
+        // Everything about the box sits in one submenu at the top of its menu, in short groups:
+        // the box and its tabs, then Look, Sorting and Lock, then delete and more settings.
+        let palette = |prefix: &str, cur: Option<Rgba>| -> Vec<Value> {
+            let mut v = vec![json!({ "id": format!("{prefix}auto"), "text": t(l, S::ColorAuto), "radio": true, "checked": cur.is_none() })];
             for (i, (_, _, (r, g, bl))) in BOX_COLORS.iter().enumerate() {
-                let on = tc.map(|c| (c.r, c.g, c.b) == (*r, *g, *bl)).unwrap_or(false);
-                tcolors.push(json!({ "id": format!("dbx.tabcolor:{i}"), "text": color_name(l, i), "radio": true, "checked": on, "color": format!("#{r:02X}{g:02X}{bl:02X}") }));
+                let on = cur.map(|c| (c.r, c.g, c.b) == (*r, *g, *bl)).unwrap_or(false);
+                v.push(json!({ "id": format!("{prefix}{i}"), "text": color_name(l, i), "radio": true, "checked": on, "color": format!("#{r:02X}{g:02X}{bl:02X}") }));
             }
-            let custom = tc.filter(|c| !BOX_COLORS.iter().any(|(_, _, (r, g, bl))| (c.r, c.g, c.b) == (*r, *g, *bl)));
-            tcolors.push(json!({ "separator": true }));
-            let mut cc = json!({ "id": "dbx.tabcolor:custom", "text": t(l, S::CustomColor), "radio": true, "checked": custom.is_some() });
+            let custom = cur.filter(|c| !BOX_COLORS.iter().any(|(_, _, (r, g, bl))| (c.r, c.g, c.b) == (*r, *g, *bl)));
+            v.push(json!({ "separator": true }));
+            let mut cc = json!({ "id": format!("{prefix}custom"), "text": t(l, S::CustomColor), "radio": true, "checked": custom.is_some() });
             if let Some(c) = custom {
                 cc["color"] = json!(format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b));
             }
-            tcolors.push(cc);
+            v.push(cc);
+            v
+        };
+        let multi = b.tabs.len() > 1;
+        let mut sub = vec![];
+        if !multi {
+            sub.push(json!({ "id": "dbx.renamebox", "text": t(l, S::RenameBox), "glyph": "\u{E8AC}" }));
+        }
+        sub.push(json!({ "id": "dbx.addtab", "text": t(l, S::AddTab), "glyph": "\u{E710}" }));
+        if multi {
+            let ti = at_tab.unwrap_or(b.active_tab).min(b.tabs.len() - 1);
+            let tab = &b.tabs[ti];
             // A right-clicked tab has Rename / Remove at the top of the menu: not again here.
             let tab_top = at_tab.is_some() && !self.locks(b).tabs;
+            let mut this = vec![];
             if !tab_top {
-                sub.push(json!({ "id": "dbx.renamebox", "text": t(l, S::RenameTab), "glyph": "\u{E8AC}" }));
+                this.push(json!({ "id": "dbx.renamebox", "text": t(l, S::RenameTab), "glyph": "\u{E8AC}" }));
             }
-            sub.push(json!({ "id": "dbx.tabcolormenu", "text": t(l, S::TabColor), "glyph": "\u{E790}", "children": tcolors }));
-            sub.push(json!({ "id": "dbx.addtab", "text": t(l, S::AddTab), "glyph": "\u{E710}" }));
-            sub.push(json!({ "id": "dbx.detachtab", "text": t(l, S::SplitTab), "glyph": "\u{E8A7}" }));
+            this.push(json!({ "id": "dbx.tabcolormenu", "text": t(l, S::TabColor), "glyph": "\u{E790}", "children": palette("dbx.tabcolor:", tab.color) }));
+            this.push(json!({ "id": "dbx.tabboxmenu", "text": t(l, S::TabBoxColor), "glyph": "\u{E771}", "children": palette("dbx.tabbox:", tab.box_color) }));
+            this.push(json!({ "separator": true }));
+            this.push(json!({ "id": "dbx.detachtab", "text": t(l, S::SplitTab), "glyph": "\u{E8A7}" }));
             if !tab_top {
-                sub.push(json!({ "id": "dbx.removetab", "text": t(l, S::RemoveTab), "glyph": "\u{E711}" }));
+                this.push(json!({ "id": "dbx.removetab", "text": t(l, S::RemoveTab), "glyph": "\u{E711}" }));
             }
-            sub.push(json!({ "separator": true }));
-            sub.push(json!({ "id": "dbx.colormenu", "text": t(l, S::BoxColor), "glyph": "\u{E771}", "children": colors }));
-        } else {
-            sub.push(json!({ "id": "dbx.renamebox", "text": t(l, S::RenameBox), "glyph": "\u{E8AC}" }));
-            sub.push(json!({ "id": "dbx.addtab", "text": t(l, S::AddTab), "glyph": "\u{E710}" }));
-            sub.push(json!({ "id": "dbx.colormenu", "text": t(l, S::ColorMenu), "glyph": "\u{E790}", "children": colors }));
-        }
-        sub.push(json!({ "id": "dbx.copystyle", "text": t(l, S::CopyStyle), "glyph": "\u{E8C8}" }));
-        sub.push(json!({ "id": "dbx.pastestyle", "text": t(l, S::PasteStyle), "glyph": "\u{E77F}", "enabled": self.style_clip.is_some() }));
-        // Sorting: icon types that go into this tab automatically.
-        let tab_id = b.tabs.get(at_tab.unwrap_or(b.active_tab).min(b.tabs.len().saturating_sub(1))).map(|t| t.id).unwrap_or(0);
-        let mut auto = vec![];
-        for (cat, _) in deskboxes_core::rules::CATEGORIES.iter() {
-            let on = self.layout.rules.iter().any(|r| r.enabled && r.kind == "type" && r.op == *cat && r.target == tab_id);
-            auto.push(json!({ "id": format!("dbx.rulecat:{cat}"), "text": category_name(l, cat), "checkable": true, "checked": on }));
-        }
-        auto.push(json!({ "separator": true }));
-        auto.push(json!({ "id": "dbx.newhere", "text": t(l, S::NewIconsHere), "checkable": true, "checked": self.layout.new_items_to == Some(tab_id) }));
-        auto.push(json!({ "separator": true }));
-        auto.push(json!({ "id": "dbx.sortnow", "text": t(l, S::SortNow), "glyph": "\u{E8CB}" }));
-        auto.push(json!({ "id": "dbx.rules", "text": t(l, S::SortingRules), "glyph": "\u{E71C}" }));
-        sub.push(json!({ "id": "dbx.automenu", "text": t(l, S::SortHere), "glyph": "\u{E8CB}", "children": auto }));
-        sub.push(json!({ "id": "dbx.az", "text": t(l, S::AzIndex), "checkable": true, "checked": b.az }));
-        if self.settings.hide.double_click {
-            sub.push(json!({ "id": "dbx.stayvisible", "text": t(l, S::StayVisible), "checkable": true, "checked": b.stay_visible }));
+            sub.push(json!({ "id": "dbx.thistab", "text": format!("{} ({})", t(l, S::ThisTab), tab.title), "glyph": "\u{E8A9}", "children": this }));
         }
         sub.push(json!({ "separator": true }));
-        sub.push(json!({ "id": "dbx.opacitymenu", "text": t(l, S::Transparency), "glyph": "\u{E81E}", "children": transp }));
-        sub.push(json!({ "id": "dbx.blurmenu", "text": t(l, S::Blur), "glyph": "\u{E8B9}", "children": blurs }));
-        // The icons: their tint and blending into the wallpaper (this box, or as all boxes).
+        // Look: colors, glass, icons, copying the look.
+        let mut look = vec![
+            json!({ "id": "dbx.colormenu", "text": t(l, if multi { S::ColorAllTabs } else { S::ColorMenu }), "glyph": "\u{E790}", "children": colors }),
+            json!({ "id": "dbx.opacitymenu", "text": t(l, S::Transparency), "glyph": "\u{E81E}", "children": transp }),
+            json!({ "id": "dbx.blurmenu", "text": t(l, S::Blur), "glyph": "\u{E8B9}", "children": blurs }),
+            json!({ "separator": true }),
+        ];
         let mut tints = vec![
             json!({ "id": "dbx.tint:", "text": t(l, S::AsAllBoxes), "radio": true, "checked": b.tint.is_empty() }),
             json!({ "id": "dbx.tint:off", "text": t(l, S::BlurNone), "radio": true, "checked": b.tint == "off" }),
@@ -3051,14 +3272,36 @@ impl App {
             let hx = format!("#{r:02X}{g:02X}{bl:02X}");
             tints.push(json!({ "id": format!("dbx.tint:{hx}"), "text": color_name(l, i), "radio": true, "checked": b.tint.eq_ignore_ascii_case(&hx), "color": hx }));
         }
-        sub.push(json!({ "id": "dbx.tintmenu", "text": t(l, S::IconTint), "glyph": "\u{E7E6}", "children": tints }));
+        look.push(json!({ "id": "dbx.tintmenu", "text": t(l, S::IconTint), "glyph": "\u{E7E6}", "children": tints }));
         let bl = b.blend.as_str();
-        sub.push(json!({ "id": "dbx.blendmenu", "text": t(l, S::BlendIn), "glyph": "\u{E91B}", "children": [
+        look.push(json!({ "id": "dbx.blendmenu", "text": t(l, S::BlendIn), "glyph": "\u{E91B}", "children": [
             { "id": "dbx.blend:", "text": t(l, S::AsAllBoxes), "radio": true, "checked": bl.is_empty() },
             { "id": "dbx.blend:on", "text": t(l, S::On), "radio": true, "checked": bl == "on" },
             { "id": "dbx.blend:off", "text": t(l, S::Off), "radio": true, "checked": bl == "off" },
         ] }));
-        sub.push(json!({ "separator": true }));
+        if self.settings.hide.double_click {
+            look.push(json!({ "id": "dbx.stayvisible", "text": t(l, S::StayVisible), "checkable": true, "checked": b.stay_visible }));
+        }
+        look.push(json!({ "separator": true }));
+        look.push(json!({ "id": "dbx.copystyle", "text": t(l, S::CopyStyle), "glyph": "\u{E8C8}" }));
+        look.push(json!({ "id": "dbx.pastestyle", "text": t(l, S::PasteStyle), "glyph": "\u{E77F}", "enabled": self.style_clip.is_some() }));
+        sub.push(json!({ "id": "dbx.lookmenu", "text": t(l, S::LookMenu), "glyph": "\u{E771}", "children": look }));
+        // Sorting: icon types that go into this tab automatically, A–Z.
+        let tab_id = b.tabs.get(at_tab.unwrap_or(b.active_tab).min(b.tabs.len().saturating_sub(1))).map(|t| t.id).unwrap_or(0);
+        let mut auto = vec![];
+        for (cat, _) in deskboxes_core::rules::CATEGORIES.iter() {
+            let on = self.layout.rules.iter().any(|r| r.enabled && r.kind == "type" && r.op == *cat && r.target == tab_id);
+            auto.push(json!({ "id": format!("dbx.rulecat:{cat}"), "text": category_name(l, cat), "checkable": true, "checked": on }));
+        }
+        let sorting = vec![
+            json!({ "id": "dbx.automenu", "text": t(l, S::SortHere), "glyph": "\u{E8CB}", "children": auto }),
+            json!({ "id": "dbx.newhere", "text": t(l, S::NewIconsHere), "checkable": true, "checked": self.layout.new_items_to == Some(tab_id) }),
+            json!({ "id": "dbx.az", "text": t(l, S::AzIndex), "checkable": true, "checked": b.az }),
+            json!({ "separator": true }),
+            json!({ "id": "dbx.sortnow", "text": t(l, S::SortNow), "glyph": "\u{E8CB}" }),
+            json!({ "id": "dbx.rules", "text": t(l, S::SortingRules), "glyph": "\u{E71C}" }),
+        ];
+        sub.push(json!({ "id": "dbx.sortmenu", "text": t(l, S::SortingMenu), "glyph": "\u{E8CB}", "children": sorting }));
         let lk = b.locks;
         sub.push(json!({ "id": "dbx.lockmenu", "text": t(l, S::LockMenu), "glyph": "\u{E72E}", "children": [
             { "id": "dbx.lock:position", "text": t(l, S::LockPosition), "checkable": true, "checked": lk.position },
@@ -3070,11 +3313,10 @@ impl App {
         ] }));
         sub.push(json!({ "separator": true }));
         sub.push(json!({ "id": "dbx.removebox", "text": t(l, S::DeleteBox), "glyph": "\u{E74D}" }));
-        sub.push(json!({ "separator": true }));
         sub.push(json!({ "id": "dbx.boxsettings", "text": t(l, S::MoreSettings), "glyph": "\u{E713}" }));
         if b.is_folder() {
             // No tabs and no sorting here: it shows its folder as it is.
-            sub.retain(|e| !matches!(e["id"].as_str(), Some("dbx.addtab" | "dbx.automenu")));
+            sub.retain(|e| !matches!(e["id"].as_str(), Some("dbx.addtab" | "dbx.sortmenu")));
         }
         let mut top = vec![json!({ "id": "dbx.boxmenu", "text": t(l, S::BoxSettings), "glyph": "\u{E8A9}", "children": sub, "placement": "top" })];
         if b.is_folder() {
@@ -3192,6 +3434,17 @@ impl App {
             }
             "closed" => {
                 log::info!("menu closed invoked={} {}", v["invoked"], v["error"]);
+                if v["invoked"].as_str().map(is_new_verb).unwrap_or(false) {
+                    // Windows' "New" made a file or folder: it goes where the menu was opened (or
+                    // into that box) and its name is edited at once, as on Explorer's desktop.
+                    if let Some((_, c)) = &self.menu {
+                        let bx = match &c.hit {
+                            Hit::Header { id, .. } | Hit::BoxBody { id } | Hit::Edge { id, .. } | Hit::Item { in_box: Some(id), .. } => Some(*id),
+                            _ => None,
+                        };
+                        self.pending_new = Some((Instant::now(), c.at, bx, self.items.keys().cloned().collect()));
+                    }
+                }
                 if v["invoked"].as_str().map(|s| !s.is_empty()).unwrap_or(false) {
                     let _ = self.worker.send(Req::Scan);
                 }
@@ -3428,10 +3681,31 @@ impl App {
                     });
                 }
             }
-            c @ ("dbx.tabcolor:custom" | "dbx.color:custom") => {
+            c @ ("dbx.tabcolor:custom" | "dbx.color:custom" | "dbx.tabbox:custom") => {
                 if let Some(id) = box_id {
-                    let tab = if c == "dbx.tabcolor:custom" { Some(tab_of(&ctx).or(self.box_by_id(id).map(|b| b.active_tab)).unwrap_or(0)) } else { None };
+                    let t = tab_of(&ctx).or(self.box_by_id(id).map(|b| b.active_tab)).unwrap_or(0);
+                    let tab = match c {
+                        "dbx.tabcolor:custom" => Some((t, false)),
+                        "dbx.tabbox:custom" => Some((t, true)),
+                        _ => None,
+                    };
                     self.open_color_picker(id, tab);
+                }
+            }
+            c if c.starts_with("dbx.tabbox:") => {
+                // The box's background behind this tab ("auto": the box's own color).
+                if let Some(id) = box_id {
+                    let tab = tab_of(&ctx).or(self.box_by_id(id).map(|b| b.active_tab)).unwrap_or(0);
+                    let color = c["dbx.tabbox:".len()..]
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| BOX_COLORS.get(i))
+                        .map(|(_, _, (r, g, bl))| Rgba { r: *r, g: *g, b: *bl, a: 255 });
+                    self.change_layout(|l, _| {
+                        if let Some(t) = l.boxes.iter_mut().find(|b| b.id == id).and_then(|b| b.tabs.get_mut(tab)) {
+                            t.box_color = color;
+                        }
+                    });
                 }
             }
             c if c.starts_with("dbx.tabcolor:") => {
@@ -3516,7 +3790,13 @@ impl App {
                     self.change_layout(|l, _| {
                         let Some(b) = l.boxes.iter_mut().find(|b| b.id == id) else { return };
                         match k.as_str() {
-                            "color" => b.style.color = v.parse::<usize>().ok().and_then(|i| BOX_COLORS.get(i)).map(|(_, _, (r, g, bl))| Rgba { r: *r, g: *g, b: *bl, a: 255 }),
+                            "color" => {
+                                // The whole box (every tab) takes it.
+                                b.style.color = v.parse::<usize>().ok().and_then(|i| BOX_COLORS.get(i)).map(|(_, _, (r, g, bl))| Rgba { r: *r, g: *g, b: *bl, a: 255 });
+                                for t in b.tabs.iter_mut() {
+                                    t.box_color = None;
+                                }
+                            }
                             "opacity" => b.style.opacity = 1.0 - v.parse::<f32>().unwrap_or(40.0).clamp(0.0, 100.0) / 100.0,
                             _ => b.style.blur = v.parse::<f32>().unwrap_or(60.0).max(0.0),
                         }
@@ -3526,6 +3806,9 @@ impl App {
             "dbx.disable" => {
                 self.settings.enabled = false;
                 let _ = persist::save_settings(&self.paths.settings, &self.settings);
+                if self.desktop_mode && self.args.desktop_dir.is_none() {
+                    add_turn_on_verb(&self.settings);
+                }
                 log::info!("disabled by the user: restoring icons and exiting");
                 unsafe {
                     let _ = PostMessageW(Some(self.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -3597,6 +3880,8 @@ impl App {
             self.box_edit = Some(BoxEdit {
                 id,
                 tab,
+                item: None,
+                since: Instant::now(),
                 ed: TextEdit::new(&title),
                 caret_on: true,
                 selecting: false,
@@ -3611,58 +3896,27 @@ impl App {
             self.invalidate();
             return;
         }
-        let (r, text) = match &target {
-            RenameTarget::Item(k) => {
-                let Some((_, cell, _)) = self.visible_cells().into_iter().find(|(x, _, _)| x == k) else { return };
-                let (_, l) = self.item_parts(k, cell, true);
-                (Rect::new(cell.x - 8.0, l.y - 2.0, cell.w + 16.0, self.line_h * 3.0 + 6.0), self.items[k].display_name.clone())
-            }
-            RenameTarget::Box { id, tab } => {
-                let Some(b) = self.box_by_id(*id) else { return };
-                let tw = b.rect.w / b.tabs.len().max(1) as f32;
-                (
-                    Rect::new(b.rect.x + tw * *tab as f32 + 8.0, b.rect.y + 4.0, tw - 16.0, header_h() - 8.0),
-                    b.tabs.get(*tab).map(|t| t.title.clone()).unwrap_or_default(),
-                )
-            }
-        };
-        let (x, y) = self.to_screen(Pt { x: r.x, y: r.y });
-        let (w, h) = ((r.w * self.scale) as i32, (r.h * self.scale) as i32);
-        unsafe {
-            let wt: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-            let multi = matches!(target, RenameTarget::Item(_));
-            let style = WS_POPUP | WS_BORDER | WS_VISIBLE | WINDOW_STYLE((ES_AUTOHSCROLL | if multi { ES_CENTER | ES_MULTILINE | ES_AUTOVSCROLL } else { 0 }) as u32);
-            let Ok(edit) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("EDIT"), PCWSTR(wt.as_ptr()), style, x, y, w, h, Some(self.hwnd), None, None, None) else {
-                return;
-            };
-            let font = CreateFontW(
-                -((self.font.1 * self.scale) as i32),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_DEFAULT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                0,
-                &windows::core::HSTRING::from(self.font.0.as_str()),
-            );
-            SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-            // Explorer selects the name without the extension.
-            let sel_end = match (&target, text.rfind('.')) {
-                (RenameTarget::Item(k), Some(dot)) if !self.items[k].is_folder() && dot > 0 => text[..dot].encode_utf16().count(),
-                _ => text.encode_utf16().count(),
-            };
-            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(sel_end as isize)));
-            OLD_EDIT_PROC.with(|o| o.set(SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize)));
-            let _ = SetForegroundWindow(edit);
-            let _ = SetFocus(Some(edit));
-            self.rename = Some(Rename { edit, target });
+        let RenameTarget::Item(k) = target else { return };
+        let Some(it) = self.items.get(&k) else { return };
+        if self.visible_cells().iter().all(|(x, _, _)| *x != k) {
+            return;
         }
+        let text = it.display_name.clone();
+        let mut ed = TextEdit::new(&text);
+        // Explorer selects the name without the extension.
+        if let Some(dot) = text.rfind('.').filter(|d| *d > 0 && !it.is_folder()) {
+            ed.move_to(0, false);
+            ed.move_to(text[..dot].chars().count(), true);
+        }
+        let id = self.layout.boxes.iter().find(|b| b.tabs.iter().any(|t| t.items.contains(&k))).map(|b| b.id).unwrap_or(0);
+        self.box_edit = Some(BoxEdit { id, tab: 0, item: Some(k), since: Instant::now(), ed, caret_on: true, selecting: false, hi: None });
+        unsafe {
+            let root = GetAncestor(self.hwnd, GA_ROOT);
+            let _ = SetForegroundWindow(root);
+            let _ = SetFocus(Some(self.hwnd));
+        }
+        self.restart_caret();
+        self.invalidate();
     }
 
     fn restart_caret(&mut self) {
@@ -3691,6 +3945,25 @@ impl App {
     /// while it fits, else scrolled so the caret stays visible).
     pub fn box_edit_layout(&self) -> Option<(Rect, TextLayout, f32)> {
         let be = self.box_edit.as_ref()?;
+        if let Some(k) = &be.item {
+            // An icon's name: a field under the icon as wide as the name (at least the cell, at
+            // most two and a half cells), centred on the cell and kept on the screen.
+            let (_, cell, _) = self.visible_cells().into_iter().find(|(x, _, _)| x == k)?;
+            let (_, label) = self.item_parts(k, cell, true);
+            let l = self.gpu.label(&self.label_tf, &be.ed.string(), 10_000.0, self.line_h, 0, false).ok()?;
+            let w = deskboxes_render::text_width(&l);
+            let fw = (w + 20.0).clamp(cell.w + 8.0, cell.w * 2.5).round();
+            let fx = (cell.x + (cell.w - fw) / 2.0).clamp(2.0, (self.size_dip.0 - fw - 2.0).max(2.0)).round();
+            let field = Rect::new(fx, (label.y - 4.0).round(), fw, (self.line_h + 9.0).round());
+            let inner = field.w - 16.0;
+            let x = if w <= inner {
+                field.x + (field.w - w) / 2.0
+            } else {
+                let cx = deskboxes_render::caret_x(&l, be.ed.utf16_pos(be.ed.caret));
+                field.x + 8.0 - (cx - inner + 2.0).max(0.0)
+            };
+            return Some((field, l, x));
+        }
         let b = self.box_by_id(be.id)?;
         let field = self.title_field(b, be.tab);
         let l = self.gpu.label(&self.title_tf_bold, &be.ed.string(), 10_000.0, self.title_line_h, 0, false).ok()?;
@@ -3778,6 +4051,17 @@ impl App {
                 let _ = KillTimer(Some(self.msg_hwnd), T_CARET);
             }
             let text = be.ed.string().trim().to_string();
+            if let Some(k) = be.item {
+                if let Some(it) = self.items.get(&k).filter(|it| commit && !text.is_empty() && it.display_name != text && it.kind != ItemKind::Virtual) {
+                    let _ = self.worker.send(Req::Rename { path: it.parsing_name.clone(), new_name: text });
+                } else if self.sort_after_rename.as_ref() == Some(&k) {
+                    // Not renamed (Esc, or the name kept): the rules can sort it now.
+                    self.sort_after_rename = None;
+                    self.sort_created(&k);
+                }
+                self.invalidate();
+                return;
+            }
             let (id, tab) = (be.id, be.tab);
             let old = self.box_by_id(id).and_then(|b| b.tabs.get(tab)).map(|t| t.title.clone());
             if commit && !text.is_empty() && old.as_deref() != Some(text.as_str()) {
@@ -3787,31 +4071,17 @@ impl App {
             }
             self.invalidate();
         }
-        let Some(r) = self.rename.take() else { return };
-        unsafe {
-            let n = GetWindowTextLengthW(r.edit);
-            let mut buf = vec![0u16; n as usize + 1];
-            let got = GetWindowTextW(r.edit, &mut buf);
-            let text = String::from_utf16_lossy(&buf[..got as usize]).trim().to_string();
-            let _ = DestroyWindow(r.edit);
-            if !commit || text.is_empty() {
-                return;
-            }
-            match r.target {
-                RenameTarget::Item(k) => {
-                    if let Some(it) = self.items.get(&k) {
-                        if it.display_name != text && it.kind != ItemKind::Virtual {
-                            let _ = self.worker.send(Req::Rename {
-                                path: it.parsing_name.clone(),
-                                new_name: text,
-                            });
-                        }
-                    }
-                }
-                RenameTarget::Box { id, tab } => self.change_layout(|l, _| {
-                    layout::rename_tab(l, id, tab, &text);
-                }),
-            }
+    }
+
+    /// An icon made with "New", named now: where the sorting rules put new icons (gliding there).
+    fn sort_created(&mut self, k: &ItemKey) {
+        let one: BTreeSet<ItemKey> = std::iter::once(k.clone()).collect();
+        let before = self.layout.clone();
+        if self.apply_rules(Some(&one), true) {
+            layout::evict_from_boxes(&mut self.layout, &self.grid);
+            self.hist.record(&before);
+            self.layout_changed();
+            log::info!("rules: sorted the new icon after its rename");
         }
     }
 
@@ -4033,7 +4303,7 @@ impl App {
             Drag::Rubber { start, base, ctrl, scope, .. } => {
                 let band = Rect::from_points(start, p);
                 let hit: BTreeSet<ItemKey> = self
-                    .visible_cells()
+                    .cells_in_view()
                     .into_iter()
                     .filter(|(k, cell, b)| {
                         if *b != scope {
@@ -4364,6 +4634,15 @@ impl App {
             {
                 // Onto a folder or program: Windows' own drop (moves or opens with).
                 if let Some(t) = self.items.get(&key).map(|i| i.parsing_name.clone()) {
+                    let paths: Vec<String> = keys.iter().filter_map(|k| self.items.get(k)).filter(|i| i.kind != ItemKind::Virtual).map(|i| i.parsing_name.clone()).collect();
+                    if is_recycle_bin(&t) {
+                        // Onto the Recycle Bin: deleted as Explorer does (Shift: permanently,
+                        // with Windows' confirmation).
+                        if !paths.is_empty() {
+                            let _ = self.worker.send(Req::Delete { paths, recycle: !key_down(VK_SHIFT) });
+                        }
+                        return;
+                    }
                     let paths: Vec<String> = keys.iter().filter_map(|k| self.items.get(k)).map(|i| i.parsing_name.clone()).collect();
                     let _ = self.worker.send(Req::DropOnItem {
                         target: t,
@@ -4672,22 +4951,55 @@ impl App {
         }
     }
 
+    /// Another window came to the front.
+    /// - The desktop itself: after "Show desktop", Windows can put the desktop window above the
+    ///   taskbar when it gets the front back from a window that closed (our menu), and the
+    ///   taskbar stays hidden until Start is opened (seen 2026-11-20). Put the taskbar back on top.
+    /// - Another app: the desktop's selection goes, as the user asked.
+    pub fn on_foreground(&mut self, fg: HWND) {
+        if fg.0.is_null() {
+            return;
+        }
+        let class = unsafe {
+            let mut b = [0u16; 64];
+            let n = GetClassNameW(fg, &mut b) as usize;
+            String::from_utf16_lossy(&b[..n])
+        };
+        let desktop = matches!(class.as_str(), "Progman" | "WorkerW");
+        if desktop {
+            if self.desktop_mode {
+                keep_taskbar_on_top();
+                unsafe {
+                    SetTimer(Some(self.msg_hwnd), T_TASKBAR, 300, None);
+                }
+            }
+            return;
+        }
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+        }
+        let ours = pid == std::process::id() || self.host_child.as_ref().map(|c| c.id() == pid).unwrap_or(false);
+        // The taskbar, Start, search, the tray, task switching: not "another app".
+        let shell = matches!(
+            class.as_str(),
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "NotifyIconOverflowWindow" | "TopLevelWindowForOverflowXamlIsland" | "XamlExplorerHostIslandWindow" | "Windows.UI.Core.CoreWindow" | "ForegroundStaging" | "MultitaskingViewFrame" | "TaskSwitcherWnd" | "XamlExplorerHostIslandWindow_WASDK"
+        );
+        if ours || shell || !matches!(self.drag, Drag::None) || self.sel.set.is_empty() {
+            return;
+        }
+        self.sel.set.clear();
+        self.invalidate();
+    }
+
     /// At session end: if the autostart would not bring Deskboxes back, show the native icons
     /// now so the next logon is never an empty desktop (ARCHITECTURE §5).
     fn on_query_end_session(&mut self) {
         if !self.desktop_mode || self.args.no_hide {
             return;
         }
-        let run = reg::get_string(reg::RUN, crate::RUN_VALUE);
-        let exe_ok = run
-            .as_deref()
-            .map(|r| std::path::Path::new(r.trim_start_matches('"').split('"').next().unwrap_or("")).exists())
-            .unwrap_or(false);
-        let approved = reg::get_binary(reg::RUN_APPROVED, crate::RUN_VALUE)
-            .map(|b| b.first().map(|x| x & 1 == 0).unwrap_or(true))
-            .unwrap_or(true);
-        let intact = exe_ok && approved;
-        log::info!("session end: autostart intact={intact} (run={run:?} approved={approved})");
+        let intact = autostart::intact();
+        log::info!("session end: autostart intact={intact} ({:?})", autostart::target());
         if !intact {
             hide::restore();
         }
@@ -4700,6 +5012,7 @@ impl App {
         self.set_above(false);
         self.quitting = true;
         self.end_rename(false);
+        self.flush_settings();
         self.save();
         if let Some(h) = &self.host {
             let _ = h.send("quit", json!({}));
@@ -4752,50 +5065,6 @@ impl WaitTimeout for std::process::Child {
         }
         let _ = self.kill();
         false
-    }
-}
-
-thread_local! {
-    static OLD_EDIT_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-}
-
-extern "system" fn edit_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    unsafe {
-        let parent = GetWindow(h, GW_OWNER).unwrap_or_default();
-        match m {
-            WM_KEYDOWN if w.0 == VK_RETURN.0 as usize => {
-                let _ = PostMessageW(Some(parent), WM_APP_RENAME_END, WPARAM(1), LPARAM(0));
-                return LRESULT(0);
-            }
-            WM_KEYDOWN if w.0 == VK_ESCAPE.0 as usize => {
-                let _ = PostMessageW(Some(parent), WM_APP_RENAME_END, WPARAM(0), LPARAM(0));
-                return LRESULT(0);
-            }
-            // Ctrl+Backspace: delete the previous word (the plain EDIT control types a box char).
-            WM_CHAR if w.0 == 13 || w.0 == 27 || w.0 == 0x7F => return LRESULT(0),
-            WM_KEYDOWN if w.0 == VK_BACK.0 as usize && key_down(VK_CONTROL) => {
-                let n = GetWindowTextLengthW(h);
-                let mut buf = vec![0u16; n as usize + 1];
-                let got = GetWindowTextW(h, &mut buf) as usize;
-                let (mut a, mut b) = (0u32, 0u32);
-                SendMessageW(h, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
-                if a == b {
-                    let ed = TextEdit::new(&String::from_utf16_lossy(&buf[..got]));
-                    let from = ed.utf16_pos(ed.prev_word(ed.char_pos(b)));
-                    SendMessageW(h, EM_SETSEL, Some(WPARAM(from as usize)), Some(LPARAM(b as isize)));
-                }
-                let empty = [0u16];
-                SendMessageW(h, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(empty.as_ptr() as isize)));
-                return LRESULT(0);
-            }
-            WM_KILLFOCUS => {
-                let _ = PostMessageW(Some(parent), WM_APP_RENAME_END, WPARAM(1), LPARAM(0));
-            }
-            _ => {}
-        }
-        let old = OLD_EDIT_PROC.with(|o| o.get());
-        let f: WNDPROC = std::mem::transmute(old);
-        CallWindowProcW(f, h, m, w, l)
     }
 }
 
@@ -4882,10 +5151,24 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 Some(LRESULT(0))
             }
             WM_KILLFOCUS if is_surface && app.box_edit.is_some() => {
-                app.end_rename(true);
+                // An icon's name field that just opened (after "New", Windows' own handler may
+                // take the focus for a moment): it keeps the focus instead of closing.
+                let fresh = app.box_edit.as_ref().map(|e| e.item.is_some() && e.since.elapsed().as_millis() < 500).unwrap_or(false);
+                if fresh {
+                    let _ = PostMessageW(Some(h), WM_APP_REFOCUS, WPARAM(0), LPARAM(0));
+                } else {
+                    app.end_rename(true);
+                }
                 Some(LRESULT(0))
             }
-            WM_CHAR if is_surface && app.rename.is_none() => {
+            WM_APP_REFOCUS => {
+                if app.box_edit.is_some() {
+                    let _ = SetForegroundWindow(GetAncestor(h, GA_ROOT));
+                    let _ = SetFocus(Some(h));
+                }
+                Some(LRESULT(0))
+            }
+            WM_CHAR if is_surface => {
                 if app.type_to_search(w.0 as u32) {
                     Some(LRESULT(0))
                 } else {
@@ -4932,6 +5215,8 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 app.update_hdr_btn(Pt { x: -1.0e6, y: -1.0e6 }, None);
                 app.hide_tip();
                 app.search_hover(Pt { x: -1.0e6, y: -1.0e6 });
+                // Into another window: boxes the pointer was on blend into the wallpaper again.
+                app.blend_pointer(Pt { x: -1.0e6, y: -1.0e6 });
                 if app.hover.take().is_some() || app.hover_hdr.take().is_some() {
                     app.invalidate();
                 }
@@ -4990,9 +5275,12 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 app.draw();
                 Some(LRESULT(0))
             }
-            WM_APP_RENAME_END => {
-                app.end_rename(w.0 == 1);
-                app.invalidate();
+            crate::events::WM_APP_FOREGROUND => {
+                app.on_foreground(HWND(l.0 as _));
+                Some(LRESULT(0))
+            }
+            crate::events::WM_APP_WALLPAPER => {
+                SetTimer(Some(app.msg_hwnd), T_WALLPAPER, 400, None);
                 Some(LRESULT(0))
             }
             WM_TIMER => {
@@ -5023,6 +5311,16 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         }
                     }
                     T_SAVE => app.save(),
+                    T_PREP => {
+                        let _ = KillTimer(Some(h), T_PREP);
+                        app.prep_more();
+                    }
+                    T_SAVE_SETTINGS => app.flush_settings(),
+                    T_TASKBAR => keep_taskbar_on_top(),
+                    T_WALLPAPER => {
+                        let _ = KillTimer(Some(h), T_WALLPAPER);
+                        app.wallpaper_check();
+                    }
                     T_FS => {
                         let _ = app.worker.send(Req::Scan);
                     }
@@ -5042,10 +5340,13 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 reset_accent();
                 app.invalidate();
                 let light = reg::apps_use_light_theme();
-                if light != app.light || w.0 as u32 == SPI_SETDESKWALLPAPER.0 {
+                if light != app.light {
                     app.light = light;
                     app.load_wallpaper();
+                    app.fx_cache.borrow_mut().clear();
                     app.invalidate();
+                } else if w.0 as u32 == SPI_SETDESKWALLPAPER.0 || w.0 == 0 {
+                    SetTimer(Some(app.msg_hwnd), T_WALLPAPER, 250, None);
                 }
                 None
             }
@@ -5135,6 +5436,59 @@ unsafe fn ole_drag(h: HWND, paths: Vec<String>, ghost: Option<(u32, u32, Vec<u8>
         Err(e) => {
             log::warn!("drag data object: {e}");
             with(|app| app.own_drag = None);
+        }
+    }
+}
+
+/// The Recycle Bin's parsing name (`::{645FF040-5081-101B-9F08-00AA002F954E}`).
+pub fn is_recycle_bin(parsing: &str) -> bool {
+    parsing.to_ascii_uppercase().contains("645FF040-5081-101B-9F08-00AA002F954E")
+}
+
+/// "Turn on Deskboxes" in Windows' classic desktop menu while Deskboxes is off (Windows 11's main
+/// menu gets it from the installer's menu package).
+fn add_turn_on_verb(settings: &deskboxes_core::Settings) {
+    let lang = Lang::pick(&settings.language, unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() });
+    let exe = std::env::current_exe().unwrap_or_default();
+    turnon::add_verb(t(lang, S::TurnOn), &exe.with_file_name("deskboxes-watchdog.exe"), &exe);
+}
+
+/// A verb of Windows' "New" submenu: a file type (".txt", ".docx"), a folder or a shortcut.
+fn is_new_verb(v: &str) -> bool {
+    v == "new" || (v.starts_with('.') && v.len() > 1) || v.eq_ignore_ascii_case("NewFolder") || v.eq_ignore_ascii_case("NewLink") || v.eq_ignore_ascii_case("NewShortcut")
+}
+
+/// The taskbar(s) back above the desktop window if the desktop got above them (see
+/// `App::on_foreground`). No activation, no move: only the z-order, and only when it is wrong.
+fn keep_taskbar_on_top() {
+    unsafe {
+        let Ok(progman) = FindWindowW(w!("Progman"), None) else { return };
+        let mut trays = vec![];
+        if let Ok(t) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            trays.push(t);
+        }
+        let mut prev: Option<HWND> = None;
+        while let Ok(t) = FindWindowExW(None, prev, w!("Shell_SecondaryTrayWnd"), None) {
+            trays.push(t);
+            prev = Some(t);
+        }
+        for t in trays {
+            // Is the desktop window above this taskbar?
+            let mut h = GetWindow(t, GW_HWNDPREV).unwrap_or_default();
+            let mut n = 0;
+            let mut above = false;
+            while !h.0.is_null() && n < 400 {
+                if h == progman {
+                    above = true;
+                    break;
+                }
+                h = GetWindow(h, GW_HWNDPREV).unwrap_or_default();
+                n += 1;
+            }
+            if above {
+                let _ = SetWindowPos(t, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                log::info!("the desktop window was above the taskbar: taskbar put back on top");
+            }
         }
     }
 }

@@ -646,6 +646,27 @@ namespace dbx
         Log(L"menu list cap: overflow presenter not found");
     }
 
+    // Where the menu opens, as Explorer's does: its top-left corner at the pointer; above the
+    // pointer (bottom-left corner there) when there is no room below, and to the left of it
+    // when there is no room on the right. The menu's size is estimated from its entries (the
+    // same metrics WinUI uses: 56 px command row, 32 px items, 9 px separators, 8 px padding).
+    static mux::Controls::Primitives::FlyoutPlacementMode MenuPlacement(View& v)
+    {
+        using P = mux::Controls::Primitives::FlyoutPlacementMode;
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfoW(MonitorFromPoint(v.m->req.pt, MONITOR_DEFAULTTONEAREST), &mi);
+        UINT dpi = GetDpiForWindow(v.hwnd);
+        double k = (dpi ? dpi : 96) / 96.0;
+        double h = 8.0 + (v.m->row.empty() ? 0.0 : 56.0);
+        for (auto& e : v.m->list) h += e.separator ? 9.0 : 32.0;
+        double w = v.m->row.empty() ? 260.0 : (std::max)(260.0, 65.0 * v.m->row.size());
+        POINT pt = v.m->req.pt;
+        bool below = (mi.rcWork.bottom - pt.y) >= h * k || (pt.y - mi.rcWork.top) < h * k && (mi.rcWork.bottom - pt.y) >= (pt.y - mi.rcWork.top);
+        bool right = (mi.rcWork.right - pt.x) >= w * k;
+        if (below) return right ? P::BottomEdgeAlignedLeft : P::BottomEdgeAlignedRight;
+        return right ? P::TopEdgeAlignedLeft : P::TopEdgeAlignedRight;
+    }
+
     void ShowMenuView(std::shared_ptr<BuiltMenu> menu, MenuViewEvents events)
     {
         auto v = std::make_shared<View>();
@@ -657,6 +678,14 @@ namespace dbx
         // Host window: a 1x1 context-menu window at the anchor point, fully transparent.
         v->window = mux::Window();
         muxc::Grid root;
+        // The flyout's target: a 1x1 element at the window's top-left (the window itself is
+        // clamped larger than 1x1, and a placement below it opened the menu far under the pointer).
+        muxc::Border anchor;
+        anchor.Width(1);
+        anchor.Height(1);
+        anchor.HorizontalAlignment(mux::HorizontalAlignment::Left);
+        anchor.VerticalAlignment(mux::VerticalAlignment::Top);
+        root.Children().Append(anchor);
         v->window.Content(root);
         auto aw = v->window.AppWindow();
         aw.SetPresenter(winrt::Microsoft::UI::Windowing::OverlappedPresenter::CreateForContextMenu());
@@ -665,8 +694,15 @@ namespace dbx
         SetWindowLongPtrW(v->hwnd, GWL_EXSTYLE, GetWindowLongPtrW(v->hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOOLWINDOW);
         SetLayeredWindowAttributes(v->hwnd, 0, 0, LWA_ALPHA);
         POINT pt = menu->req.pt;
-        aw.MoveAndResize({ pt.x, pt.y, 1, 1 });
+        auto place = MenuPlacement(*v);
         UINT dpi = GetDpiForWindow(v->hwnd);
+        // Opening upward, the flyout keeps its (empty) icon-row space under the list: 52 px at
+        // 100 % between the menu's visible bottom and the pointer. Shift the anchor down by that
+        // so the bottom-left corner sits at the pointer, as Explorer's does.
+        using PM = mux::Controls::Primitives::FlyoutPlacementMode;
+        bool up = place == PM::TopEdgeAlignedLeft || place == PM::TopEdgeAlignedRight;
+        int dy = up && menu->row.empty() ? MulDiv(52, dpi ? dpi : 96, 96) : 0;
+        aw.MoveAndResize({ pt.x, pt.y + dy, 1, 1 });
         v->iconPx = MulDiv(16, dpi ? dpi : 96, 96);
 
         // The flyout.
@@ -754,16 +790,15 @@ namespace dbx
         // Show once the root is in the live tree (it has a XamlRoot then); Window.Activated can
         // arrive earlier and ShowAt fails with "This element does not have a XamlRoot".
         bool shown = false;
-        root.Loaded([wv, shown](auto&& sender, auto&&) mutable
+        root.Loaded([wv, shown, anchor, place](auto&&, auto&&) mutable
         {
             auto v = wv.lock();
             if (shown || !v) return;
             shown = true;
-            auto root = sender.template as<muxc::Grid>();
             mux::Controls::Primitives::FlyoutShowOptions o;
-            o.Position(winrt::Windows::Foundation::Point{ 0, 0 });
+            o.Placement(place);
             o.ShowMode(mux::Controls::Primitives::FlyoutShowMode::Standard);
-            v->flyout.ShowAt(root, o);
+            v->flyout.ShowAt(anchor, o);
         });
         v->window.Activate();
         SetForegroundWindow(v->hwnd);

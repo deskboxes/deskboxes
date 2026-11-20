@@ -56,34 +56,62 @@ pub fn initial(name: &str) -> char {
     f.chars().next().map(|c| c.to_uppercase().next().unwrap_or(c)).filter(|c| c.is_alphabetic()).unwrap_or('#')
 }
 
-fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let wa: Vec<u16> = a.encode_utf16().chain(std::iter::once(0)).collect();
-    let wb: Vec<u16> = b.encode_utf16().chain(std::iter::once(0)).collect();
-    let r = unsafe { windows::Win32::UI::Shell::StrCmpLogicalW(windows::core::PCWSTR(wa.as_ptr()), windows::core::PCWSTR(wb.as_ptr())) };
-    r.cmp(&0)
+/// A tab's shown order, cached until its items or any item's name change: an A–Z box sorts
+/// hundreds of names, and that order is needed several times per frame and per pointer move.
+pub struct Shown {
+    pub fp: u64,
+    pub keys: std::rc::Rc<Vec<ItemKey>>,
+    /// Each letter and the index of its first icon (A–Z boxes).
+    pub firsts: std::rc::Rc<Vec<(char, usize)>>,
 }
 
 impl App {
-    /// A tab's icons as shown: present on disk, by name in an A–Z box.
-    pub fn shown_items(&self, b: &BoxModel, tab: &Tab) -> Vec<ItemKey> {
-        let mut v: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k)).cloned().collect();
-        if b.az {
-            v.sort_by(|x, y| natural_cmp(&self.items[x].display_name, &self.items[y].display_name));
+    fn shown(&self, b: &BoxModel, tab: &Tab) -> (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.items_gen, b.az, tab.items.len()).hash(&mut h);
+        tab.items.hash(&mut h);
+        let fp = h.finish();
+        if let Some(s) = self.shown_cache.borrow().get(&tab.id) {
+            if s.fp == fp {
+                return (s.keys.clone(), s.firsts.clone());
+            }
         }
-        v
+        let mut v: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k)).cloned().collect();
+        let mut firsts = vec![];
+        if b.az {
+            // StrCmpLogicalW (Explorer's order) on names converted once, not per comparison.
+            let mut w: Vec<(Vec<u16>, ItemKey)> = v
+                .into_iter()
+                .map(|k| (self.items[&k].display_name.encode_utf16().chain(std::iter::once(0)).collect(), k))
+                .collect();
+            w.sort_by(|x, y| unsafe { windows::Win32::UI::Shell::StrCmpLogicalW(windows::core::PCWSTR(x.0.as_ptr()), windows::core::PCWSTR(y.0.as_ptr())) }.cmp(&0));
+            v = w.into_iter().map(|(_, k)| k).collect();
+            for (i, k) in v.iter().enumerate() {
+                let c = initial(&self.items[k].display_name);
+                if !firsts.iter().any(|l: &(char, usize)| l.0 == c) {
+                    firsts.push((c, i));
+                }
+            }
+        }
+        let s = Shown { fp, keys: std::rc::Rc::new(v), firsts: std::rc::Rc::new(firsts) };
+        let out = (s.keys.clone(), s.firsts.clone());
+        self.shown_cache.borrow_mut().insert(tab.id, s);
+        out
+    }
+
+    /// A tab's icons as shown: present on disk, by name in an A–Z box.
+    pub fn shown_items(&self, b: &BoxModel, tab: &Tab) -> std::rc::Rc<Vec<ItemKey>> {
+        self.shown(b, tab).0
     }
 
     /// Each letter of the active tab and the index of its first icon.
     fn az_firsts(&self, b: &BoxModel) -> Vec<(char, usize)> {
         let Some(tab) = b.active() else { return vec![] };
-        let mut letters: Vec<(char, usize)> = vec![];
-        for (i, k) in self.shown_items(b, tab).iter().enumerate() {
-            let c = initial(&self.items[k].display_name);
-            if !letters.iter().any(|l| l.0 == c) {
-                letters.push((c, i));
-            }
+        if !b.az {
+            return vec![];
         }
-        letters
+        (*self.shown(b, tab).1).clone()
     }
 
     /// Indexes of the icons that carry a letter tag (the first of each letter).

@@ -120,6 +120,9 @@ pub struct Tab {
     /// Tab color (its pill / underline); `None` = neutral.
     #[serde(default)]
     pub color: Option<Rgba>,
+    /// The box's background while this tab is open; `None` = the box's own color.
+    #[serde(default)]
+    pub box_color: Option<Rgba>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -433,19 +436,24 @@ pub struct IconSettings {
     /// Everything comes back in full color while the desktop is in use (it has the keyboard
     /// focus: after a click on it, until another window is used).
     pub full_when_active: bool,
+    /// Version of the icon look: 2 = phone-style tint (an older file's strength is raised to
+    /// full on load, the old 70% left the icons' own colors showing).
+    #[serde(default)]
+    pub fx_v: u32,
 }
 
 impl Default for IconSettings {
     fn default() -> Self {
         IconSettings {
             tint: String::new(),
-            tint_strength: 0.7,
+            tint_strength: 1.0,
             blend: false,
             blend_strength: 0.8,
             desktop: false,
             blend_boxes: true,
             full_on_hover: true,
             full_when_active: true,
+            fx_v: 2,
         }
     }
 }

@@ -3,11 +3,13 @@
 //! opened with `FILE_READ_ATTRIBUTES` only (no OneDrive hydration), and file changes go through
 //! `IFileOperation`.
 
+pub mod autostart;
 pub mod fileops;
 pub mod hide;
 pub mod icons;
 pub mod items;
 pub mod reg;
+pub mod turnon;
 pub mod view;
 pub mod wallpaper;
 pub mod watch;

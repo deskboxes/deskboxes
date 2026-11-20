@@ -44,7 +44,7 @@ mod textedit;
 mod tuck;
 mod worker;
 
-use deskboxes_shell::{hide, reg};
+use deskboxes_shell::hide;
 use std::path::PathBuf;
 use std::time::Instant;
 use windows::core::w;
@@ -214,15 +214,15 @@ fn main() {
     }
     if args.uninstall {
         let code = restore_icons_cmd();
-        reg::delete_value(reg::RUN, RUN_VALUE);
-        reg::delete_value(reg::RUN_APPROVED, RUN_VALUE);
+        deskboxes_shell::autostart::disable();
+        deskboxes_shell::turnon::remove_verb();
         log::info!("--uninstall: autostart removed");
         std::process::exit(code);
     }
     if args.install_autostart {
         let exe = std::env::current_exe().unwrap_or_default();
         let wd = exe.with_file_name("deskboxes-watchdog.exe");
-        let r = reg::set_string(reg::RUN, RUN_VALUE, &format!("\"{}\" --launch", wd.display()));
+        let r = deskboxes_shell::autostart::enable(&wd);
         log::info!("--install-autostart: {r:?}");
         std::process::exit(if r.is_ok() { 0 } else { 1 });
     }
@@ -230,7 +230,28 @@ fn main() {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
+    allow_dark_dialogs();
     let code = app::run(args, paths, t0);
     log::logger().flush();
     std::process::exit(code);
+}
+
+/// Windows' own dialogs shown from this process (copy progress, delete and replace confirmations,
+/// properties) follow the system's dark mode only when the process opts in, as Explorer does:
+/// uxtheme's SetPreferredAppMode (ordinal 135; 1 = follow the system theme), then FlushMenuThemes
+/// (ordinal 136). Without it they were light on a dark desktop (2026-11-20).
+fn allow_dark_dialogs() {
+    use windows::core::{w, PCSTR};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    unsafe {
+        let Ok(ux) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return };
+        if let Some(f) = GetProcAddress(ux, PCSTR(135 as *const u8)) {
+            let set: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+            set(1);
+        }
+        if let Some(f) = GetProcAddress(ux, PCSTR(136 as *const u8)) {
+            let flush: extern "system" fn() = std::mem::transmute(f);
+            flush();
+        }
+    }
 }

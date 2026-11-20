@@ -47,6 +47,12 @@ pub fn set_string(key: &str, value: &str, data: &str) -> windows::core::Result<(
     unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, pcw(&k), pcw(&v), REG_SZ.0, Some(d.as_ptr() as _), (d.len() * 2) as u32).ok() }
 }
 
+/// Remove a key and everything under it.
+pub fn delete_tree(key: &str) -> bool {
+    let k = wide(key);
+    unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, pcw(&k)).is_ok() && RegDeleteKeyW(HKEY_CURRENT_USER, pcw(&k)).is_ok() }
+}
+
 pub fn delete_value(key: &str, value: &str) -> bool {
     let (k, v) = (wide(key), wide(value));
     unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, pcw(&k), pcw(&v)).is_ok() }

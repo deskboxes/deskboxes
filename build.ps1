@@ -49,6 +49,24 @@ if ($Only -in 'all', 'shellhost') {
         & $msbuild (Join-Path $sh 'DeskboxesShellHost.vcxproj') /p:Configuration=$config /p:Platform=x64 /m /nologo /v:m
     }
 }
+if ($Only -in 'all', 'rust') {
+    # The sparse package for "Turn on Deskboxes" in Windows' desktop menu (crates/menuext): its
+    # manifest and logo, packed unsigned (registered per user by the installer, files from the
+    # install folder).
+    Step "pack menu package ($config)" {
+        $tdir = Join-Path $root "target\$($config.ToLower())"
+        $pk = Join-Path $root "out\$config\menu-package"
+        if (Test-Path $pk) { Remove-Item $pk -Recurse -Force }
+        New-Item -ItemType Directory -Force $pk | Out-Null
+        Copy-Item (Join-Path $root 'crates\menuext\package\AppxManifest.xml') $pk
+        Copy-Item (Join-Path $root 'res\deskboxes-256.png') (Join-Path $pk 'menu-logo.png')
+        Copy-Item (Join-Path $root 'res\deskboxes-256.png') (Join-Path $tdir 'menu-logo.png')
+        $makeappx = Get-ChildItem (Join-Path $root 'shellhost\packages\Microsoft.Windows.SDK.BuildTools.*\bin\*\x64\makeappx.exe') | Sort-Object FullName | Select-Object -Last 1
+        if (-not $makeappx) { throw 'makeappx.exe not found (run the shellhost NuGet restore first)' }
+        & $makeappx.FullName pack /o /nv /d $pk /p (Join-Path $tdir 'deskboxes-menu.msix') | Out-Null
+    }
+}
+
 if ($Installer) {
     # Stage what gets installed (one flat folder: the core and the watchdog find the shell host
     # next to themselves), then pack it into the setup program.
@@ -65,7 +83,7 @@ if ($Installer) {
             New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
             Copy-Item $_.FullName $dst
         }
-        foreach ($exe in 'deskboxes.exe', 'deskboxes-watchdog.exe') { Copy-Item (Join-Path $root "target\release\$exe") $stage }
+        foreach ($exe in 'deskboxes.exe', 'deskboxes-watchdog.exe', 'deskboxes_menu.dll', 'deskboxes-menu.msix', 'menu-logo.png') { Copy-Item (Join-Path $root "target\release\$exe") $stage }
         # The Visual C++ runtime next to the programs (app-local, as Microsoft's redist.txt allows),
         # so the end user's PC needs no Visual C++ Redistributable.
         $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"

@@ -6,12 +6,14 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Shell::*;
 
-fn op(owner: isize, no_ui: bool, recycle: bool) -> windows::core::Result<IFileOperation> {
+/// `undo`: the operation can be undone (Ctrl+Z); for a delete it also means "to the Recycle
+/// Bin", so a permanent delete (Shift+Delete) passes false and gets Windows' own confirmation.
+fn op(owner: isize, no_ui: bool, undo: bool) -> windows::core::Result<IFileOperation> {
     unsafe {
         let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-        let mut flags = FOF_ALLOWUNDO.0;
-        if recycle {
-            flags |= FOFX_RECYCLEONDELETE.0;
+        let mut flags = 0;
+        if undo {
+            flags |= FOF_ALLOWUNDO.0;
         }
         if no_ui {
             flags |= FOF_NO_UI.0;
@@ -32,7 +34,7 @@ fn item(parsing: &str) -> windows::core::Result<IShellItem> {
 /// Rename through the shell. Returns false if the user or a conflict aborted it.
 pub fn rename(parsing: &str, new_name: &str, owner: isize, no_ui: bool) -> windows::core::Result<bool> {
     unsafe {
-        let fo = op(owner, no_ui, false)?;
+        let fo = op(owner, no_ui, true)?;
         let n = wide(new_name);
         fo.RenameItem(&item(parsing)?, pcw(&n), None)?;
         fo.PerformOperations()?;
@@ -44,6 +46,9 @@ pub fn rename(parsing: &str, new_name: &str, owner: isize, no_ui: bool) -> windo
 pub fn delete(parsing: &[String], recycle: bool, owner: isize, no_ui: bool) -> windows::core::Result<bool> {
     unsafe {
         let fo = op(owner, no_ui, recycle)?;
+        if recycle {
+            fo.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_RECYCLEONDELETE.0 | if no_ui { FOF_NO_UI.0 } else { 0 }))?;
+        }
         for p in parsing {
             fo.DeleteItem(&item(p)?, None)?;
         }
@@ -78,7 +83,7 @@ pub fn data_object(parsing: &[String]) -> windows::core::Result<IDataObject> {
 /// Move (or copy) items into a folder: what dropping them on a folder's icon does.
 pub fn transfer(parsing: &[String], dest_folder: &str, copy: bool, owner: isize, no_ui: bool) -> windows::core::Result<bool> {
     unsafe {
-        let fo = op(owner, no_ui, false)?;
+        let fo = op(owner, no_ui, true)?;
         let dest = item(dest_folder)?;
         for p in parsing {
             if copy {

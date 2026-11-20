@@ -13,6 +13,10 @@
 //! tried twice at most. Copies that are not installed (a build folder) never update themselves.
 //! Only HTTPS to github.com (redirects to GitHub's download hosts are followed by WinHTTP);
 //! `DBX_UPDATE_FEED` points tests at a local feed (plain http only on 127.0.0.1).
+//!
+//! Settings › Updates also shows what changed: the newest release's notes, read from GitHub's
+//! API with each check (best effort, kept in `state.json` for offline use; `DBX_UPDATE_NOTES`
+//! points tests at a local copy).
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -22,6 +26,8 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const FEED: &str = "https://github.com/deskboxes/releases/releases/latest/download/latest.json";
+/// The newest release (its notes): GitHub's REST API.
+const NOTES: &str = "https://api.github.com/repos/deskboxes/releases/releases/latest";
 const DAY: u64 = 24 * 3600;
 const MAX_SETUP: u64 = 200 * 1024 * 1024;
 
@@ -42,6 +48,26 @@ struct State {
     pending: Option<Pending>,
     /// Install attempts of the pending version (2 at most).
     attempts: u32,
+    /// The newest release's notes, from the last check that could read them.
+    notes: Option<Notes>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Notes {
+    version: String,
+    body: String,
+    /// "2026-11-19" (from GitHub's published_at).
+    date: String,
+}
+
+/// GitHub's release object: only what is shown.
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    published_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -59,6 +85,12 @@ pub struct Status {
     pub latest: String,
     pub checked: u64,
     pub error: String,
+    /// While downloading: 0..1.
+    pub progress: f64,
+    /// What changed in the newest release (Markdown as written on GitHub), its version and date.
+    pub notes: String,
+    pub notes_version: String,
+    pub notes_date: String,
 }
 
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
@@ -138,6 +170,11 @@ pub fn start(dir: PathBuf, auto: bool) {
     let st = load_state(&dir);
     set_status(|s| {
         s.checked = st.last_check;
+        if let Some(n) = &st.notes {
+            s.notes = n.body.clone();
+            s.notes_version = n.version.clone();
+            s.notes_date = n.date.clone();
+        }
         if let Some(p) = st.pending.as_ref().filter(|p| newer(&p.version, current())) {
             s.state = "ready".into();
             s.latest = p.version.clone();
@@ -187,6 +224,7 @@ fn check(dir: &Path) {
     set_status(|s| {
         s.state = "checking".into();
         s.error.clear();
+        s.progress = 0.0;
     });
     match check_inner(dir) {
         Ok(()) => {}
@@ -236,6 +274,7 @@ fn check_inner(dir: &Path) -> Result<(), String> {
     let mut st = load_state(dir);
     st.last_check = now();
     log::info!("update feed: newest {} (this is {})", f.version, current());
+    read_notes(&mut st);
     if !newer(&f.version, current()) {
         clear_pending(dir, &mut st);
         save_state(dir, &st);
@@ -265,8 +304,15 @@ fn check_inner(dir: &Path) -> Result<(), String> {
         let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
         let mut h = sha256::Sha256::new();
         let mut n = 0u64;
+        let mut shown = 0u64;
         let r = http::get(&f.url, f.size + 1, &mut |b| {
             n += b.len() as u64;
+            // Settings' progress bar: whole percents.
+            let pct = (n * 100 / f.size).min(100);
+            if pct != shown {
+                shown = pct;
+                set_status(|s| s.progress = pct as f64 / 100.0);
+            }
             h.update(b);
             out.write_all(b).map_err(|e| e.to_string())
         });
@@ -288,6 +334,37 @@ fn check_inner(dir: &Path) -> Result<(), String> {
         s.checked = st.last_check;
     });
     Ok(())
+}
+
+/// The newest release's notes into `st` and Settings (best effort: a check does not fail for them).
+fn read_notes(st: &mut State) {
+    let url = match (std::env::var("DBX_UPDATE_NOTES"), std::env::var_os("DBX_UPDATE_FEED")) {
+        (Ok(u), _) => u,
+        (Err(_), Some(_)) => return, // a test feed and no test notes
+        (Err(_), None) => NOTES.to_string(),
+    };
+    let mut body = Vec::new();
+    let r = http::get(&url, 1 << 20, &mut |b| {
+        body.extend_from_slice(b);
+        Ok(())
+    })
+    .and_then(|_| serde_json::from_slice::<Release>(&body).map_err(|e| format!("release: {e}")));
+    match r {
+        Ok(rel) => {
+            let n = Notes {
+                version: rel.tag_name.trim_start_matches('v').to_string(),
+                body: rel.body.unwrap_or_default().chars().take(20_000).collect(),
+                date: rel.published_at.unwrap_or_default().chars().take(10).collect(),
+            };
+            set_status(|s| {
+                s.notes = n.body.clone();
+                s.notes_version = n.version.clone();
+                s.notes_date = n.date.clone();
+            });
+            st.notes = Some(n);
+        }
+        Err(e) => log::info!("release notes not read: {e}"),
+    }
 }
 
 fn clear_pending(dir: &Path, st: &mut State) {
@@ -393,7 +470,7 @@ mod http {
         if !secure && !local {
             return Err("updates are only downloaded over HTTPS".into());
         }
-        if !local && !(host.eq_ignore_ascii_case("github.com") || host.to_ascii_lowercase().ends_with(".githubusercontent.com")) {
+        if !local && !(host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("api.github.com") || host.to_ascii_lowercase().ends_with(".githubusercontent.com")) {
             return Err(format!("not a GitHub address: {host}"));
         }
         unsafe {

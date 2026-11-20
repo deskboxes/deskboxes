@@ -809,7 +809,7 @@ impl App {
                     self.set_page(Page::Error);
                     return;
                 };
-                let o = InstallOptions { dir: self.dir.clone(), autostart: self.autostart, start_menu: self.start_menu, launch: false, update: false, shortcut_desc: self.s(T::ShortcutDesc).into() };
+                let o = InstallOptions { dir: self.dir.clone(), autostart: self.autostart, start_menu: self.start_menu, launch: false, update: false, ask_admin: true, shortcut_desc: self.s(T::ShortcutDesc).into() };
                 std::thread::spawn(move || {
                     deskboxes_shell::com_sta();
                     let rep = |r: Report| send(&tx, r);

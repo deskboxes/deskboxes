@@ -14,6 +14,7 @@ members = [
     "crates/desktop",
     "crates/watchdog",
     "crates/setup",
+    "crates/menuext",
 ]
 
 [workspace.package]

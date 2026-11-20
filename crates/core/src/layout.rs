@@ -336,6 +336,7 @@ pub fn create_box(l: &mut MonitorLayout, rect: Rect, title: &str, style: BoxStyl
             title: title.to_string(),
             items: vec![],
             color: None,
+            box_color: None,
         }],
         active_tab: 0,
         rolled_up: false,
@@ -407,6 +408,7 @@ pub fn add_tab(l: &mut MonitorLayout, box_id: u32, title: &str) -> Option<usize>
         title: title.to_string(),
         items: vec![],
         color: None,
+        box_color: None,
     });
     b.active_tab = b.tabs.len() - 1;
     Some(b.active_tab)
