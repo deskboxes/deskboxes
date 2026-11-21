@@ -2902,9 +2902,10 @@ impl App {
                     ],
                 };
                 // A folder box's menu is its folder's (Windows' own, without our View): its view
-                // goes at the top with the box's entries.
+                // goes at the top with the box's entries, right under Box settings.
                 if bid.and_then(|id| self.box_by_id(id)).map(|b| b.is_folder()).unwrap_or(false) {
-                    extra.insert(0, json!({ "id": "dbx.viewmenu", "text": t(self.lang, S::ViewMenu), "glyph": "\u{E8A9}", "children": view.clone(), "placement": "top" }));
+                    let at = extra.iter().position(|e| e["id"] == "dbx.boxmenu").map(|i| i + 1).unwrap_or(0);
+                    extra.insert(at, json!({ "id": "dbx.viewmenu", "text": t(self.lang, S::ViewMenu), "glyph": "\u{E8A9}", "children": view.clone(), "placement": "top" }));
                 }
                 let sort = vec![
                     json!({ "id": "sort.name", "text": "@propsys.dll,-38671" }),

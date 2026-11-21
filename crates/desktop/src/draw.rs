@@ -1063,7 +1063,10 @@ impl App {
         }
         let content = App::content_rect(b);
         let dy = rect.y - b.rect.y;
-        let top = header_h() + crate::az::bar_h(b);
+        let m = self.metrics(Some(b));
+        // Details: the rows scroll under the column names, not through them.
+        let head = if m.view == deskboxes_core::model::View::Details { crate::views::DETAILS_HEAD } else { 0.0 };
+        let top = header_h() + crate::az::bar_h(b) + head;
         let vis = Rect::new(content.x, rect.y + top, content.w, (rect.bottom() - rect.y - top - 2.0).max(0.0));
         let fade = if open { 1.0 } else { o };
         let tagged = self.az_tagged(b);
@@ -1071,7 +1074,6 @@ impl App {
         let a = ta.map(|(_, t)| t).unwrap_or(1.0) * fade;
         // The selected icon's whole name over the icons below it: drawn last.
         let mut last = None;
-        let m = self.metrics(Some(b));
         for (i, k, cell) in self.box_cells_in(b, vis.y - dy, vis.bottom() - dy) {
             let cell = cell.offset(0.0, dy);
             if cell.bottom() < vis.y || cell.y > vis.bottom() {

@@ -158,7 +158,8 @@ impl App {
 
     /// The pointer moved: the box it is on brings its icons back.
     pub fn blend_pointer(&mut self, p: Pt) {
-        let on = self.layout.boxes.iter().rev().find(|b| self.shown_rect(b).contains(p)).map(|b| b.id);
+        // From where its resize edge starts, just outside it (as `hit_test`).
+        let on = self.layout.boxes.iter().rev().find(|b| self.shown_rect(b).inflate(crate::app::EDGE / 2.0).contains(p)).map(|b| b.id);
         if on != self.blend_hover.0 {
             self.blend_hover = (on, self.blend_hover.0, Instant::now());
             crate::anim::set(true);
