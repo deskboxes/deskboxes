@@ -70,7 +70,10 @@ fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
         let own = app.own_drag.as_ref().map(|(keys, _)| keys.clone());
         if let Hit::Item { key, .. } = app.hit_test(p) {
             let dragged = own.as_ref().map(|k| k.contains(&key)).unwrap_or(false);
-            if !dragged {
+            // Our own icons next to an icon (its name, the room around it) go in beside it: only
+            // its picture takes them in (as the icons making room show).
+            let beside = own.as_ref().is_some_and(|k| app.onto_icon(p, k).is_none());
+            if !dragged && !beside {
                 if let Some(it) = app.items.get(&key) {
                     if let Some(t) = deskboxes_shell::view::item_drop_target(&it.parsing_name) {
                         let container = it.is_folder() || crate::app::is_recycle_bin(&it.parsing_name) || it.ext.eq_ignore_ascii_case("zip") || it.parsing_name.starts_with("::");

@@ -248,60 +248,112 @@ pub fn settle(l: &mut MonitorLayout, g: &Grid) -> bool {
         l.loose.remove(k);
         l.homes.entry(k.clone()).or_insert(*c);
     }
-    let taken = occupied(l);
-    for (k, c) in step_aside(l, g, covered, &taken) {
-        l.loose.insert(k, c);
+    // Icons pushed along remember their cell too: they go back when the box moves away.
+    for (k, c) in step_aside(l, g, covered) {
+        if let Some(was) = l.loose.insert(k.clone(), c) {
+            l.homes.entry(k).or_insert(was);
+        }
     }
     true
 }
 
-/// Where icons a box covers go: all to the same side of it (the side that is the shortest way
-/// out for the group as a whole), each sliding along its own row or column past the box to the
-/// first free cell, keeping their order. An icon whose line runs off the grid takes the nearest
-/// free cell instead.
-fn step_aside(l: &MonitorLayout, g: &Grid, covered: Vec<(ItemKey, Cell)>, taken: &HashSet<Cell>) -> Vec<(ItemKey, Cell)> {
+/// Where icons a box covers go: all to the same side of it, each pushed along its own row or
+/// column past the box, keeping their order; icons already in that line past the box move along
+/// to make room (up to the first free cell), as on a phone's home screen. Icons that sit in a row
+/// with their neighbours stay in that row, a column in that column (a covered icon jumping up out
+/// of the row, while the box should have pushed the row along, round 13); then the side that
+/// moves them least. An icon whose line runs off the grid takes the nearest free cell instead.
+/// Returns every icon that moves: the covered ones and the ones pushed along.
+fn step_aside(l: &MonitorLayout, g: &Grid, covered: Vec<(ItemKey, Cell)>) -> Vec<(ItemKey, Cell)> {
     // right, down, left, up (ties go in this order)
     const DIRS: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
-    let free = |c: Cell, t: &HashSet<Cell>| !t.contains(&c) && !blocked_by_boxes(l, g, c);
-    let miss = g.cols as f32 * g.cell_w + g.rows as f32 * g.cell_h;
-    let mut best: Option<(f32, Vec<(ItemKey, Cell)>)> = None;
+    let others: HashMap<Cell, ItemKey> = l.loose.iter().map(|(k, c)| (*c, k.clone())).collect();
+    let near = |col: i32, row: i32| others.contains_key(&Cell { col, row });
+    let in_row = covered.iter().filter(|(_, c)| near(c.col - 1, c.row) || near(c.col + 1, c.row)).count();
+    let in_col = covered.iter().filter(|(_, c)| near(c.col, c.row - 1) || near(c.col, c.row + 1)).count();
+    // (icons off their line, across the line they sit in, distance on screen)
+    let mut best: Option<((usize, bool, f32), Vec<(ItemKey, Cell)>)> = None;
     for (dx, dy) in DIRS {
-        let mut order = covered.clone();
-        // The icon farthest from the way out takes the first free cell past the box, the next
-        // one the cell after it: the group keeps its order.
-        order.sort_by_key(|(_, c)| (c.col * dx + c.row * dy, c.row, c.col));
-        let mut t = taken.clone();
-        let mut cost = 0.0;
-        let mut out = vec![];
-        for (k, c) in order {
-            let mut p = Cell { col: c.col + dx, row: c.row + dy };
-            let found = loop {
-                if p.col < 0 || p.row < 0 || p.col >= g.cols || p.row >= g.rows {
-                    break None;
-                }
-                if free(p, &t) {
-                    break Some(p);
-                }
-                p = Cell { col: p.col + dx, row: p.row + dy };
-            };
-            let to = match found {
-                Some(p) => {
-                    cost += ((p.col - c.col) as f32 * g.cell_w).abs() + ((p.row - c.row) as f32 * g.cell_h).abs();
-                    p
-                }
-                None => {
-                    cost += miss;
-                    nearest_free(l, g, c, &t).unwrap_or(c)
-                }
-            };
-            t.insert(to);
+        let across = if dx != 0 { in_col > in_row } else { in_row > in_col };
+        let mut at = others.clone();
+        let mut moved: Vec<(ItemKey, Cell, Cell)> = vec![];
+        let mut stray: Vec<(ItemKey, Cell)> = vec![];
+        // Line by line (rows when going sideways, columns when going up or down).
+        let mut lines: HashMap<i32, Vec<(ItemKey, Cell)>> = HashMap::new();
+        for (k, c) in &covered {
+            lines.entry(if dx != 0 { c.row } else { c.col }).or_default().push((k.clone(), *c));
+        }
+        let mut lines: Vec<(i32, Vec<(ItemKey, Cell)>)> = lines.into_iter().collect();
+        lines.sort_by_key(|(n, _)| *n);
+        for (_, mut line) in lines {
+            // The one farthest from the way out takes the first cell past the box: the line keeps its order.
+            line.sort_by_key(|(_, c)| c.col * dx + c.row * dy);
+            let lead = line.iter().map(|(_, c)| *c).max_by_key(|c| c.col * dx + c.row * dy).unwrap();
+            let start = Cell { col: lead.col + dx, row: lead.row + dy };
+            let (m, s) = push_line(l, g, &mut at, start, (dx, dy), line.into_iter().collect());
+            moved.extend(m);
+            stray.extend(s);
+        }
+        let mut dist: f32 = moved.iter().map(|(_, a, b)| ((b.col - a.col) as f32 * g.cell_w).abs() + ((b.row - a.row) as f32 * g.cell_h).abs()).sum();
+        let mut out: Vec<(ItemKey, Cell)> = moved.into_iter().map(|(k, _, c)| (k, c)).collect();
+        let n_stray = stray.len();
+        let mut taken: HashSet<Cell> = at.keys().copied().collect();
+        for (k, c) in stray {
+            let to = nearest_free(l, g, c, &taken).unwrap_or(c);
+            dist += ((to.col - c.col) as f32 * g.cell_w).abs() + ((to.row - c.row) as f32 * g.cell_h).abs();
+            taken.insert(to);
             out.push((k, to));
         }
-        if best.as_ref().map(|(b, _)| cost < *b).unwrap_or(true) {
+        let cost = (n_stray, across, dist);
+        if best.as_ref().map(|(b, _)| cost.partial_cmp(b) == Some(std::cmp::Ordering::Less)).unwrap_or(true) {
             best = Some((cost, out));
         }
     }
     best.map(|(_, v)| v).unwrap_or_default()
+}
+
+/// Push items into a line of cells from `start`, one cell further each (cells under boxes are
+/// skipped): an icon in a cell they need moves along behind them, up to the first free cell.
+/// `at` is who is where, kept up to date. Returns the moves (item, from, to) and the items left
+/// when the line ran off the grid (with where they were).
+fn push_line(l: &MonitorLayout, g: &Grid, at: &mut HashMap<Cell, ItemKey>, start: Cell, dir: (i32, i32), mut q: std::collections::VecDeque<(ItemKey, Cell)>) -> (Vec<(ItemKey, Cell, Cell)>, Vec<(ItemKey, Cell)>) {
+    let mut c = start;
+    let mut out = vec![];
+    while let Some((k, from)) = q.pop_front() {
+        while c.col >= 0 && c.row >= 0 && c.col < g.cols && c.row < g.rows && blocked_by_boxes(l, g, c) {
+            c = Cell { col: c.col + dir.0, row: c.row + dir.1 };
+        }
+        if c.col < 0 || c.row < 0 || c.col >= g.cols || c.row >= g.rows {
+            q.push_front((k, from));
+            return (out, q.into_iter().collect());
+        }
+        if let Some(o) = at.remove(&c) {
+            q.push_back((o, c));
+        }
+        at.insert(c, k.clone());
+        out.push((k, from, c));
+        c = Cell { col: c.col + dir.0, row: c.row + dir.1 };
+    }
+    (out, vec![])
+}
+
+/// Put items into a row of the loose grid at `at`: the icons from `at` on to the right move
+/// along to make room, up to the first free cell (an icon in a row of icons, dropped between
+/// two of them). What runs off the grid goes to the nearest free cells.
+pub fn insert_in_row(l: &mut MonitorLayout, keys: &[ItemKey], at: Cell, g: &Grid) {
+    remove_everywhere(l, keys);
+    let mut by_cell: HashMap<Cell, ItemKey> = l.loose.iter().map(|(k, c)| (*c, k.clone())).collect();
+    let at = Cell { col: at.col.clamp(0, g.cols - 1), row: at.row.clamp(0, g.rows - 1) };
+    let (moved, stray) = push_line(l, g, &mut by_cell, at, (1, 0), keys.iter().map(|k| (k.clone(), at)).collect());
+    for (k, _, c) in moved {
+        l.loose.insert(k, c);
+    }
+    let mut taken = occupied(l);
+    for (k, c) in stray {
+        let to = nearest_free(l, g, c, &taken).unwrap_or(Cell { col: g.cols - 1, row: g.rows - 1 });
+        taken.insert(to);
+        l.loose.insert(k, to);
+    }
 }
 
 /// Loose icons a box covers move out of its way (see `settle`).
@@ -824,6 +876,43 @@ mod tests {
     }
 
     #[test]
+    fn a_box_pushes_a_row_of_icons_along_and_they_come_back() {
+        let g = grid(); // 10 x 5
+        let k = keys(7);
+        let cell = |col, row| Cell { col, row };
+        // A row along the bottom, k0..k6 in columns 0-6; a box comes down over columns 3-4.
+        let mut l = MonitorLayout::default();
+        for (i, key) in k.iter().enumerate() {
+            l.loose.insert(key.clone(), cell(i as i32, 4));
+        }
+        let b = create_box(&mut l, Rect::new(225.0, 200.0, 150.0, 300.0), "B", BoxStyle::default());
+        assert!(settle(&mut l, &g));
+        // Not up out of the row: the row moves along to the right (left would run off the grid).
+        let row: Vec<Cell> = k.iter().map(|x| l.loose[x]).collect();
+        assert_eq!(row, vec![cell(0, 4), cell(1, 4), cell(2, 4), cell(5, 4), cell(6, 4), cell(7, 4), cell(8, 4)]);
+        // The box goes: all back where they were.
+        assert!(delete_box(&mut l, b, &g));
+        assert!(settle(&mut l, &g));
+        let row: Vec<Cell> = k.iter().map(|x| l.loose[x]).collect();
+        assert_eq!(row, (0..7).map(|c| cell(c, 4)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_in_a_row_moves_the_rest_of_the_row_along() {
+        let g = grid();
+        let k = keys(5);
+        let cell = |col, row| Cell { col, row };
+        let mut l = MonitorLayout::default();
+        for i in 0..4 {
+            l.loose.insert(k[i].clone(), cell(i as i32, 4));
+        }
+        l.loose.insert(k[4].clone(), cell(7, 0));
+        insert_in_row(&mut l, &k[4..5], cell(2, 4), &g);
+        let got: Vec<Cell> = k.iter().map(|x| l.loose[x]).collect();
+        assert_eq!(got, vec![cell(0, 4), cell(1, 4), cell(3, 4), cell(4, 4), cell(2, 4)]);
+    }
+
+    #[test]
     fn insert_between_icons_moves_the_rest_along() {
         let g = grid();
         let mut l = MonitorLayout::default();
@@ -972,16 +1061,19 @@ mod tests {
         reconcile(&mut l, &ks, &g); // (0,0) (0,1) (0,2)
         let b = create_box(&mut l, Rect::new(300.0, 0.0, 140.0, 190.0), "B", BoxStyle::default());
         assert!(!settle(&mut l, &g));
-        // the box moves over the first column: its icons step aside and remember their cells
+        // the box moves over the first column: its icons push the column down and they all
+        // remember their cells (the one pushed along too)
         set_box_rect(&mut l, b, Rect::new(0.0, 0.0, 70.0, 190.0));
         assert!(settle(&mut l, &g));
-        assert_eq!(l.homes.len(), 2);
+        assert_eq!(l.homes.len(), 3);
+        assert_eq!(l.loose[&ks[2]], Cell { col: 0, row: 4 });
         assert_ne!(l.loose[&ks[0]], Cell { col: 0, row: 0 });
         // it moves away again: they go back
         set_box_rect(&mut l, b, Rect::new(300.0, 0.0, 140.0, 190.0));
         assert!(settle(&mut l, &g));
         assert_eq!(l.loose[&ks[0]], Cell { col: 0, row: 0 });
         assert_eq!(l.loose[&ks[1]], Cell { col: 0, row: 1 });
+        assert_eq!(l.loose[&ks[2]], Cell { col: 0, row: 2 });
         assert!(l.homes.is_empty());
         // an icon the user moves in between forgets its old cell
         set_box_rect(&mut l, b, Rect::new(0.0, 0.0, 70.0, 190.0));

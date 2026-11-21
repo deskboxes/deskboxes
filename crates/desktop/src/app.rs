@@ -45,6 +45,8 @@ const T_ROLLCHECK: usize = 11;
 const T_TABHOVER: usize = 12;
 /// The pointer left a box title (the + button goes).
 const T_HDRCHECK: usize = 13;
+/// Dragged icons rested between two others for a moment: those make room.
+const T_ROOM: usize = 17;
 /// The pointer rested on an icon: show its tooltip.
 const T_TIP: usize = 14;
 /// The pointer rested on a title button (search, +): its tooltip.
@@ -470,6 +472,9 @@ pub struct App {
     /// Loose icons as they would settle with the box being moved or resized where it is now
     /// (they step aside live, and back).
     pub preview_loose: Option<std::collections::BTreeMap<ItemKey, Cell>>,
+    /// Our icons dragged in between two loose ones: the dragged icons, where they would go in
+    /// and whether along a row (the icons there make room, shown in `preview_loose`).
+    pub room: Option<(Vec<ItemKey>, Cell, bool)>,
     /// Loose icons gliding to a new cell: (where it started, when).
     pub glide: HashMap<ItemKey, (Pt, Instant)>,
     /// Each loose icon's cell position as last drawn (a change starts a glide).
@@ -981,6 +986,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         last_drag_frame: None,
         taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         preview_loose: None,
+        room: None,
         glide: HashMap::new(),
         glide_at: HashMap::new(),
         no_glide: Default::default(),
@@ -1283,13 +1289,20 @@ impl App {
     /// An item the dragged items would be dropped *into* (a folder, a program, an archive): only
     /// while the pointer is on its icon, so dropping next to it in a box just places the items.
     pub fn drop_onto_item(&self, p: Pt, keys: &[ItemKey]) -> Option<ItemKey> {
+        let key = self.onto_icon(p, keys)?;
+        let it = self.items.get(&key)?;
+        let ext = std::path::Path::new(&it.parsing_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let accepts = it.is_folder() || matches!(ext.as_str(), "exe" | "lnk" | "zip" | "bat" | "cmd") || is_recycle_bin(&it.parsing_name);
+        accepts.then_some(key)
+    }
+
+    /// The icon (not one of `keys`) whose own picture is under `p`: what a drop there goes onto
+    /// (a folder, a program), not in next to.
+    pub fn onto_icon(&self, p: Pt, keys: &[ItemKey]) -> Option<ItemKey> {
         let Hit::Item { key, .. } = self.hit_test(p) else { return None };
         if keys.contains(&key) {
             return None;
         }
-        let it = self.items.get(&key)?;
-        let ext = std::path::Path::new(&it.parsing_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        let accepts = it.is_folder() || matches!(ext.as_str(), "exe" | "lnk" | "zip" | "bat" | "cmd") || is_recycle_bin(&it.parsing_name);
         let (_, cell, bx) = self.visible_cells().into_iter().find(|(k, _, _)| *k == key)?;
         let m = self.metrics_of(bx);
         let (icon, _) = self.item_parts(&key, cell, false, &m);
@@ -1303,25 +1316,92 @@ impl App {
             let x1 = icon.right().min(cell.right() - side);
             Rect::new(x0, icon.y, (x1 - x0).max(4.0), icon.h)
         };
-        (accepts && zone.contains(p)).then_some(key)
+        zone.contains(p).then_some(key)
     }
 
     /// A drop on the loose grid at `p` that goes in between icons: the cell under the pointer
-    /// has another icon, so the dropped ones go before it (upper half) or after it (lower half)
-    /// and the icons after move along. None: an ordinary move.
-    pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<Cell> {
+    /// has another icon, so the dropped ones go before it or after it and the icons after move
+    /// along. In a column (Explorer's order): before it in its upper half, after it in its lower
+    /// half. In a row of icons (neighbours left or right, none above or below): left half
+    /// before, right half after, and the row moves along to the right. Returns the cell and
+    /// whether it is a row. None: an ordinary move.
+    pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<(Cell, bool)> {
         if self.drop_box(p).is_some() {
             return None;
         }
         let g = &self.grid;
-        let col = ((p.x - g.origin.x) / g.cell_w).floor() as i32;
+        let fx = (p.x - g.origin.x) / g.cell_w;
         let fy = (p.y - g.origin.y) / g.cell_h;
-        let under = Cell { col, row: fy.floor() as i32 };
-        if col < 0 || col >= g.cols || under.row < 0 || under.row >= g.rows {
+        let under = Cell { col: fx.floor() as i32, row: fy.floor() as i32 };
+        if under.col < 0 || under.col >= g.cols || under.row < 0 || under.row >= g.rows {
             return None;
         }
-        let taken = self.layout.loose.iter().any(|(k, c)| *c == under && !keys.contains(k) && self.items.contains_key(k));
-        taken.then_some(Cell { col, row: (fy.round() as i32).clamp(0, g.rows - 1) })
+        let others: std::collections::HashSet<Cell> = self.layout.loose.iter().filter(|(k, _)| !keys.contains(k) && self.items.contains_key(*k)).map(|(_, c)| *c).collect();
+        if !others.contains(&under) {
+            return None;
+        }
+        let near = |dc: i32, dr: i32| others.contains(&Cell { col: under.col + dc, row: under.row + dr });
+        if (near(-1, 0) || near(1, 0)) && !near(0, -1) && !near(0, 1) {
+            let col = fx.round() as i32;
+            return (col < g.cols).then_some((Cell { col, row: under.row }, true));
+        }
+        Some((Cell { col: under.col, row: (fy.round() as i32).clamp(0, g.rows - 1) }, false))
+    }
+
+    /// Our icons dragged to `p` (None: the drag left or ended): in between two loose icons,
+    /// after a moment there, those make room as the drop would place them (a phone's home
+    /// screen); onto an icon that takes them in (a folder, a program), a box or open space,
+    /// nothing moves.
+    pub fn make_room(&mut self, p: Option<Pt>, keys: &[ItemKey]) {
+        let at = p.filter(|p| self.drop_onto_item(*p, keys).is_none()).and_then(|p| self.grid_insert_at(p, keys));
+        if at == self.room.as_ref().map(|(_, c, r)| (*c, *r)) {
+            return;
+        }
+        match at {
+            Some((c, row)) => {
+                self.room = Some((keys.to_vec(), c, row));
+                unsafe {
+                    SetTimer(Some(self.msg_hwnd), T_ROOM, 140, None);
+                }
+            }
+            None => {
+                self.room = None;
+                if self.preview_loose.take().is_some() {
+                    self.invalidate();
+                }
+            }
+        }
+    }
+
+    /// The pointer stayed where the dragged icons would go in: the icons there move aside.
+    fn room_due(&mut self) {
+        let Some((keys, at, row)) = self.room.clone() else { return };
+        if self.own_drag.is_none() && !matches!(self.drag, Drag::Items { .. }) {
+            self.room = None;
+            return;
+        }
+        let mut l = self.layout.clone();
+        if row {
+            layout::insert_in_row(&mut l, &keys, at, &self.grid);
+        } else {
+            layout::insert_in_grid(&mut l, &keys, at, &self.grid);
+        }
+        layout::settle(&mut l, &self.grid);
+        // The gap stays empty: the dragged icons go there only when dropped (they are with the
+        // pointer). They stay where they were, unless an icon making room moved in there.
+        let others: std::collections::HashSet<Cell> = l.loose.iter().filter(|(k, _)| !keys.contains(k)).map(|(_, c)| *c).collect();
+        for k in &keys {
+            match self.layout.loose.get(k) {
+                Some(c) if !others.contains(c) => {
+                    l.loose.insert(k.clone(), *c);
+                }
+                _ => {
+                    l.loose.remove(k);
+                }
+            }
+        }
+        self.preview_loose = Some(l.loose);
+        self.invalidate();
     }
 
     /// Box under the pointer for a drop (body, header or one of its items).
@@ -1930,6 +2010,12 @@ impl App {
             self.invalidate();
         }
         self.drop_at = p;
+        // Our icons in between others make room; not over an icon that takes the drop (Windows'
+        // own target, highlighted), nor for files from an app.
+        match self.own_drag.as_ref().map(|(k, _)| k.clone()).filter(|_| self.drop_hl.is_none()) {
+            Some(keys) if p.is_some() => self.make_room(p, &keys),
+            _ => self.make_room(None, &[]),
+        }
     }
 
     /// The window under the pointer is our surface (or the desktop it sits on).
@@ -4798,6 +4884,7 @@ impl App {
                     return After::OleDrag(paths, ghost);
                 }
                 self.drag_hover(p);
+                self.make_room(Some(p), &keys);
                 Drag::Items { keys, start, cur: p }
             }
             Drag::MoveBox { id, start, orig, .. } => {
@@ -5021,6 +5108,7 @@ impl App {
         }
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         self.preview_loose = None;
+        self.room = None;
         match drag {
             Drag::Pending { hit, ctrl, shift, .. } => match hit {
                 Hit::Item { key, .. } => {
@@ -5088,6 +5176,7 @@ impl App {
             _ => {}
         }
         self.preview_loose = None;
+        self.room = None;
     }
 
     pub fn drop_items(&mut self, keys: Vec<ItemKey>, start: Pt, cur: Pt) {
@@ -5166,13 +5255,14 @@ impl App {
                 });
             }
             None if self.grid_insert_at(cur, &keys).is_some() => {
-                // Onto another icon or the gap between two: in between them, in the order shown.
-                let at = self.grid_insert_at(cur, &keys).unwrap();
+                // Onto another icon or the gap between two: in between them, in the order shown
+                // (where they made room while dragged).
+                let (at, row) = self.grid_insert_at(cur, &keys).unwrap();
                 let order = self.order();
                 let mut ks = keys.clone();
                 ks.sort_by_key(|k| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
-                log::info!("insert {} icon(s) at {at:?}", ks.len());
-                self.change_layout(|l, g| layout::insert_in_grid(l, &ks, at, g));
+                log::info!("insert {} icon(s) at {at:?}{}", ks.len(), if row { " in a row" } else { "" });
+                self.change_layout(|l, g| if row { layout::insert_in_row(l, &ks, at, g) } else { layout::insert_in_grid(l, &ks, at, g) });
             }
             None => {
                 // Loose grid: every item moves by the drag offset, so the group keeps its shape
@@ -5797,6 +5887,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                     T_REVEAL => app.reveal_pending(),
                     T_ROLLCHECK => app.roll_check(),
                     T_TABHOVER => app.tab_switch_pending(),
+                    T_ROOM => app.room_due(),
                     T_HDRCHECK => app.hdr_check(),
                     T_TIP => app.tip_due(),
                     T_BTNTIP => app.btn_tip_due(),

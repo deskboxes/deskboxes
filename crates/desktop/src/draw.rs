@@ -316,9 +316,10 @@ impl App {
             }
         } else if let (true, Drag::Items { keys, .. }) = (own, &self.drag) {
             // In between icons on the desktop: a line where they go.
-            if let Some(at) = self.grid_insert_at(cur, keys) {
+            if let (Some((at, row)), None) = (self.grid_insert_at(cur, keys), &self.preview_loose) {
                 let r0 = self.grid.cell_rect(at);
-                r::fill_round(dc, rf(Rect::new(r0.x + 8.0, r0.y - 1.5, r0.w - 16.0, 3.0)), 1.5, rgba(ar, ag, ab, 1.0))?;
+                let line = if row { Rect::new(r0.x - 1.5, r0.y + 8.0, 3.0, r0.h - 16.0) } else { Rect::new(r0.x + 8.0, r0.y - 1.5, r0.w - 16.0, 3.0) };
+                r::fill_round(dc, rf(line), 1.5, rgba(ar, ag, ab, 1.0))?;
             }
         }
         Ok(())
