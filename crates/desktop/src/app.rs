@@ -47,6 +47,8 @@ const T_TABHOVER: usize = 12;
 const T_HDRCHECK: usize = 13;
 /// Dragged icons rested between two others for a moment: those make room.
 const T_ROOM: usize = 17;
+/// A box scrolled under a drag: Windows asks the drop target again (see `drag_nudge`).
+const T_DRAGNUDGE: usize = 18;
 /// The pointer rested on an icon: show its tooltip.
 const T_TIP: usize = 14;
 /// The pointer rested on a title button (search, +): its tooltip.
@@ -475,6 +477,16 @@ pub struct App {
     /// Our icons dragged in between two loose ones: the dragged icons, where they would go in
     /// and which way the icons there move to make room (shown in `preview_loose`).
     pub room: Option<(Vec<ItemKey>, Cell, (i32, i32))>,
+    /// Our icons dragged inside their folder box: the box, the dragged icons and its order with
+    /// them where they would go (the cell under the pointer); shown once the pointer rests
+    /// (`box_room`), the others gliding aside as on the desktop.
+    pub(crate) box_want: Option<(u32, Vec<ItemKey>, std::rc::Rc<Vec<ItemKey>>)>,
+    pub box_room: Option<(u32, Vec<ItemKey>, std::rc::Rc<Vec<ItemKey>>)>,
+    /// Boxes whose icons glide when their order changes (one icons are being dragged in), and
+    /// for each icon where it was in the box's content (unscrolled) and its glide.
+    glide_boxes: BTreeSet<u32>,
+    box_glide_at: HashMap<ItemKey, Pt>,
+    box_glide: HashMap<ItemKey, (Pt, Instant)>,
     /// Loose icons gliding to a new cell: (where it started, when).
     pub glide: HashMap<ItemKey, (Pt, Instant)>,
     /// Each loose icon's cell position as last drawn (a change starts a glide).
@@ -568,7 +580,11 @@ pub fn drag_wheel_hook(on: bool) {
         if code == HC_ACTION as i32 && w.0 as u32 == WM_MOUSEWHEEL {
             let m = &*(l.0 as *const MSLLHOOKSTRUCT);
             let delta = ((m.mouseData >> 16) & 0xffff) as i16;
-            if with(|app| app.drag_wheel(m.pt.x, m.pt.y, delta)).unwrap_or(false) {
+            // Only a look here (all input waits while the hook runs): the box scrolls when the
+            // message comes.
+            if let Some(Some(h)) = with(|app| app.drag_wheel_over(m.pt.x, m.pt.y).then_some(app.msg_hwnd)) {
+                let xy = (m.pt.x as u32 as u64) | ((m.pt.y as u32 as u64) << 32);
+                let _ = PostMessageW(Some(h), crate::events::WM_APP_DRAGWHEEL, WPARAM(delta as u16 as usize), LPARAM(xy as isize));
                 return LRESULT(1);
             }
         }
@@ -1019,6 +1035,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         preview_loose: None,
         room: None,
+        box_want: None,
+        box_room: None,
+        glide_boxes: BTreeSet::new(),
+        box_glide_at: HashMap::new(),
+        box_glide: HashMap::new(),
         glide: HashMap::new(),
         glide_at: HashMap::new(),
         no_glide: Default::default(),
@@ -1275,7 +1296,11 @@ impl App {
         let used = cols as f32 * m.cell_w;
         let x0 = c.x + (c.w - used) / 2.0;
         let top = c.y + 2.0 - self.shown_scroll(b.id);
-        let items = self.shown_items(b, tab);
+        // Icons dragged in their folder box: the order with them where they would go.
+        let items = match &self.box_room {
+            Some((id, _, order)) if *id == b.id => order.clone(),
+            _ => self.shown_items(b, tab),
+        };
         let ch = m.cell_h.max(1.0);
         let first_row = if y0 == f32::MIN { 0 } else { ((y0 - top) / ch).floor().max(0.0) as usize };
         let last_row = if y1 == f32::MAX { usize::MAX } else { ((y1 - top) / ch).floor().max(0.0) as usize };
@@ -1375,7 +1400,22 @@ impl App {
         }
         let all: std::collections::HashSet<Cell> = self.layout.loose.iter().filter(|(k, _)| self.items.contains_key(*k)).map(|(_, c)| *c).collect();
         let near = |dc: i32, dr: i32| all.contains(&Cell { col: under.col + dc, row: under.row + dr });
-        let along = (near(-1, 0) || near(1, 0)) && !near(0, -1) && !near(0, 1);
+        // Along a row or down a column: moved within its own row, the row; within its own
+        // column, the column (in a block of icons a move to the side pushed the column down,
+        // round 13). From elsewhere: a row of icons or a column of them; in a block (or alone),
+        // the nearer edge of the icon under the pointer, its sides or its top and bottom.
+        let olds: Vec<Cell> = keys.iter().filter_map(|k| self.layout.loose.get(k)).copied().collect();
+        let along = if olds.iter().any(|o| o.row == under.row) {
+            true
+        } else if olds.iter().any(|o| o.col == under.col) {
+            false
+        } else {
+            match (near(-1, 0) || near(1, 0), near(0, -1) || near(0, 1)) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => (fx - fx.floor() - 0.5).abs() > (fy - fy.floor() - 0.5).abs(),
+            }
+        };
         // The line between two icons the pointer is nearest to.
         let b = if along { fx.round() as i32 } else { fy.round() as i32 };
         // Moved along its own line, toward the end: the icons it passes move back into the cell
@@ -1395,33 +1435,45 @@ impl App {
     /// screen); onto an icon that takes them in (a folder, a program), a box or open space,
     /// nothing moves.
     pub fn make_room(&mut self, p: Option<Pt>, keys: &[ItemKey]) {
-        let at = p.filter(|p| self.drop_onto_item(*p, keys).is_none()).and_then(|p| self.grid_insert_at(p, keys));
-        if at == self.room.as_ref().map(|(_, c, r)| (*c, *r)) {
+        // In their own folder box: its order.
+        let bw = p.and_then(|p| self.box_room_order(p, keys)).map(|(id, o)| (id, keys.to_vec(), std::rc::Rc::new(o)));
+        let at = if bw.is_some() { None } else { p.filter(|p| self.drop_onto_item(*p, keys).is_none()).and_then(|p| self.grid_insert_at(p, keys)) };
+        let same_grid = at == self.room.as_ref().map(|(_, c, r)| (*c, *r));
+        let same_box = bw.as_ref().map(|(i, _, o)| (*i, o.clone())) == self.box_want.as_ref().map(|(i, _, o)| (*i, o.clone()));
+        if same_grid && same_box {
             return;
         }
-        match at {
-            Some((c, dir)) => {
-                self.room = Some((keys.to_vec(), c, dir));
-                unsafe {
-                    SetTimer(Some(self.msg_hwnd), T_ROOM, 140, None);
-                }
-            }
-            None => {
-                self.room = None;
-                if self.preview_loose.take().is_some() {
-                    self.invalidate();
-                }
+        self.room = at.map(|(c, dir)| (keys.to_vec(), c, dir));
+        self.box_want = bw;
+        if self.room.is_none() && self.preview_loose.take().is_some() {
+            self.invalidate();
+        }
+        if self.box_want.is_none() && self.box_room.take().is_some() {
+            self.invalidate();
+        }
+        if self.room.is_some() || self.box_want.is_some() {
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), T_ROOM, 140, None);
             }
         }
     }
 
     /// The pointer stayed where the dragged icons would go in: the icons there move aside.
     fn room_due(&mut self) {
-        let Some((keys, at, dir)) = self.room.clone() else { return };
         if self.own_drag.is_none() && !matches!(self.drag, Drag::Items { .. }) {
             self.room = None;
+            self.box_want = None;
             return;
         }
+        if let Some(bw) = self.box_want.clone() {
+            // Where its icons are now, so they glide from there.
+            if self.glide_boxes.insert(bw.0) {
+                self.track_box_glides();
+            }
+            self.box_room = Some(bw);
+            self.invalidate();
+        }
+        let Some((keys, at, dir)) = self.room.clone() else { return };
         let mut l = self.layout.clone();
         layout::insert_along(&mut l, &keys, at, dir, &self.grid);
         layout::settle(&mut l, &self.grid);
@@ -1699,7 +1751,57 @@ impl App {
         glide.retain(|_, (_, t0)| now.duration_since(*t0).as_secs_f32() < GLIDE_S);
         self.glide_at = at;
         self.glide = glide;
+        self.track_box_glides();
         self.no_glide.clear();
+    }
+
+    /// Glides of the icons in boxes icons are being dragged in (see `glide_boxes`): where each
+    /// is in its box's content, unscrolled (scrolling moves them all, not one).
+    fn track_box_glides(&mut self) {
+        let now = Instant::now();
+        let mut at = std::mem::take(&mut self.box_glide_at);
+        let mut glide = std::mem::take(&mut self.box_glide);
+        for id in self.glide_boxes.clone() {
+            let Some(b) = self.box_by_id(id) else { continue };
+            if !self.fully_open(b) {
+                continue;
+            }
+            let c = Self::content_rect(b);
+            let s = self.shown_scroll(id);
+            let m = self.metrics(Some(b));
+            for (_, k, r) in self.box_cells_in(b, c.y - m.cell_h, c.bottom() + m.cell_h) {
+                let tgt = Pt { x: r.x - c.x, y: r.y - c.y + s };
+                if let Some(prev) = at.insert(k.clone(), tgt) {
+                    if prev != tgt && !self.no_glide.contains(&k) {
+                        let from = glide_pos(glide.get(&k), prev, now);
+                        glide.insert(k, (from, now));
+                    }
+                }
+            }
+        }
+        glide.retain(|_, (_, t0)| now.duration_since(*t0).as_secs_f32() < GLIDE_S);
+        self.box_glide_at = at;
+        self.box_glide = glide;
+        // The drag is over and they have arrived: no more tracking.
+        if self.box_want.is_none() && self.box_room.is_none() && self.box_glide.is_empty() && self.own_drag.is_none() && !matches!(self.drag, Drag::Items { .. }) {
+            self.glide_boxes.clear();
+            self.box_glide_at.clear();
+        }
+    }
+
+    /// A box's icon cell as drawn now (mid-glide: on its way to `r`).
+    pub fn box_glided(&self, b: &BoxModel, k: &ItemKey, r: Rect) -> Rect {
+        let Some(g) = self.box_glide.get(k) else { return r };
+        let c = Self::content_rect(b);
+        let tgt = Pt { x: r.x - c.x, y: r.y - c.y + self.shown_scroll(b.id) };
+        let p = glide_pos(Some(g), tgt, Instant::now());
+        r.offset(p.x - tgt.x, p.y - tgt.y)
+    }
+
+    /// One of the icons being dragged in their folder box: not drawn (where it would go is
+    /// left empty).
+    pub fn is_box_room_gap(&self, id: u32, k: &ItemKey) -> bool {
+        self.box_room.as_ref().is_some_and(|(b, keys, _)| *b == id && keys.contains(k))
     }
 
     /// A loose icon's cell rect as drawn now (mid-glide: on its way to `cell`).
@@ -1719,6 +1821,7 @@ impl App {
     pub fn animating(&self) -> bool {
         self.anim_roll
             || !self.glide.is_empty()
+            || !self.box_glide.is_empty()
             || self.tab_anim.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_ANIM_S).unwrap_or(false)
             || self.tab_color_from.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_COLOR_S).unwrap_or(false)
             || self.tip.as_ref().map(|t| t.4.elapsed().as_secs_f32() < TIP_FADE_S).unwrap_or(false)
@@ -1809,7 +1912,7 @@ impl App {
 
     /// Whether icons `keys` may be dropped into box `to` (None: onto the desktop): neither where
     /// they come from nor where they go is locked.
-    fn icons_movable(&self, keys: &[ItemKey], to: Option<u32>) -> bool {
+    pub(crate) fn icons_movable(&self, keys: &[ItemKey], to: Option<u32>) -> bool {
         let locked_box = |id: u32| self.locks_of(id).icons;
         if let Some(t) = to {
             if locked_box(t) {
@@ -2061,24 +2164,33 @@ impl App {
     /// the wheel never reaches our window; see `drag_wheel_hook`): a box under the pointer
     /// scrolls. The drag image is Windows', on the pointer, so it stays there; the insertion
     /// marker and the icon that takes the drop follow the scrolled icons. True: handled.
-    pub fn drag_wheel(&mut self, x: i32, y: i32, delta: i16) -> bool {
-        if self.drop_at.is_none() {
-            return false;
-        }
+    pub fn drag_wheel(&mut self, x: i32, y: i32, delta: i16) {
         let p = self.screen_to_dip(x, y);
-        if self.drop_box(p).is_none() {
-            return false;
-        }
         self.on_wheel(p, delta, false);
         self.drop_slot = None;
         self.invalidate();
-        // Windows asks the drop target again on a mouse move: a move of nothing, so the icon now
-        // under the pointer is the one that takes the drop.
+        unsafe {
+            SetTimer(Some(self.msg_hwnd), T_DRAGNUDGE, 80, None);
+        }
+    }
+
+    /// The wheel at screen `x`, `y` is for `drag_wheel`: something is dragged over a box there.
+    pub fn drag_wheel_over(&self, x: i32, y: i32) -> bool {
+        self.drop_at.is_some() && self.drop_box(self.screen_to_dip(x, y)).is_some()
+    }
+
+    /// After scrolling under a drag: Windows asks the drop target again on a mouse move, so a
+    /// move of nothing makes the icon now under the pointer the one that takes the drop. Once
+    /// the wheel rests, outside the mouse hook (input sent from inside it waits for the hook
+    /// itself: the wheel froze for a moment each notch).
+    fn drag_nudge(&mut self) {
+        if self.drop_at.is_none() {
+            return;
+        }
         unsafe {
             let i = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: MOUSEEVENTF_MOVE, ..Default::default() } } };
             SendInput(&[i], std::mem::size_of::<INPUT>() as i32);
         }
-        true
     }
 
     /// The window under the pointer is our surface (or the desktop it sits on).
@@ -5172,6 +5284,8 @@ impl App {
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         self.preview_loose = None;
         self.room = None;
+        self.box_want = None;
+        self.box_room = None;
         match drag {
             Drag::Pending { hit, ctrl, shift, .. } => match hit {
                 Hit::Item { key, .. } => {
@@ -5240,6 +5354,8 @@ impl App {
         }
         self.preview_loose = None;
         self.room = None;
+        self.box_want = None;
+        self.box_room = None;
     }
 
     pub fn drop_items(&mut self, keys: Vec<ItemKey>, start: Pt, cur: Pt) {
@@ -5286,6 +5402,18 @@ impl App {
             return;
         }
         match self.drop_box(cur) {
+            Some(id) if self.box_room_order(cur, &keys).is_some() => {
+                // Where the others made room: before the first icon after them in that order, as
+                // an index into the tab's full list (icons not on disk keep their places).
+                let (_, order) = self.box_room_order(cur, &keys).unwrap();
+                let ks: Vec<ItemKey> = order.iter().filter(|k| keys.contains(k)).cloned().collect();
+                let at = order.iter().position(|k| keys.contains(k)).unwrap_or(order.len());
+                let next = order[at..].iter().find(|k| !keys.contains(k)).cloned();
+                let index = self.box_by_id(id).and_then(|b| b.active()).map(|t| next.and_then(|n| t.items.iter().position(|k| *k == n)).unwrap_or(t.items.len()));
+                self.change_layout(|l, _| {
+                    layout::move_to_box(l, &ks, id, index);
+                });
+            }
             Some(id) => {
                 // The slot under the pointer, as an index into the tab's full list (items not on
                 // disk right now keep their places).
@@ -5932,6 +6060,11 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 app.draw();
                 Some(LRESULT(0))
             }
+            crate::events::WM_APP_DRAGWHEEL => {
+                let xy = l.0 as u64;
+                app.drag_wheel((xy & 0xffff_ffff) as u32 as i32, (xy >> 32) as u32 as i32, w.0 as u16 as i16);
+                Some(LRESULT(0))
+            }
             crate::events::WM_APP_FOREGROUND => {
                 app.on_foreground(HWND(l.0 as _));
                 Some(LRESULT(0))
@@ -5951,6 +6084,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                     T_ROLLCHECK => app.roll_check(),
                     T_TABHOVER => app.tab_switch_pending(),
                     T_ROOM => app.room_due(),
+                    T_DRAGNUDGE => app.drag_nudge(),
                     T_HDRCHECK => app.hdr_check(),
                     T_TIP => app.tip_due(),
                     T_BTNTIP => app.btn_tip_due(),

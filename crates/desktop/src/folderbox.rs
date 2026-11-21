@@ -230,15 +230,8 @@ impl App {
         if p.y < b.rect.y + header_h() {
             return true;
         }
-        let (i, _) = self.box_drop_slot(b, p);
-        let Some(tab) = b.active() else { return true };
-        let shown: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k)).cloned().collect();
-        let before = shown.iter().take(i).filter(|k| keys.contains(k)).count();
-        let mut order: Vec<ItemKey> = shown.into_iter().filter(|k| !keys.contains(k)).collect();
-        let at = (i - before).min(order.len());
-        for (n, k) in keys.iter().enumerate() {
-            order.insert(at + n, k.clone());
-        }
+        // Where they made room while dragged: the cell under the pointer.
+        let Some((_, order)) = self.box_room_order(p, keys) else { return true };
         let key = dir.to_lowercase();
         self.change_layout(|l, _| {
             l.folder_orders.insert(key, order);
@@ -246,6 +239,50 @@ impl App {
         self.fill_folder_boxes();
         self.invalidate();
         true
+    }
+
+    /// Our icons dragged over a box's icons at `p` (in a folder box: its own files only): the box
+    /// and its icons in the order they would have, the dragged ones in the cell under the
+    /// pointer (the others make room there, as on a phone's home screen). None: not over a
+    /// box's icons (its title, the desktop, onto a folder or program in it), icons that cannot
+    /// go there (locked, a folder box's files into another box), or a box shown by name (A–Z)
+    /// or filtered by a search.
+    pub fn box_room_order(&self, p: Pt, keys: &[ItemKey]) -> Option<(u32, Vec<ItemKey>)> {
+        let id = self.drop_box(p)?;
+        let b = self.box_by_id(id)?;
+        if b.az || !self.fully_open(b) || !self.search_query().trim().is_empty() || p.y < App::content_rect(b).y || keys.is_empty() {
+            return None;
+        }
+        if b.is_folder() {
+            let dir = b.folder_now().trim_end_matches('\\').to_string();
+            if !keys.iter().all(|k| self.items.get(k).map(|i| same(parent_of(&i.parsing_name), &dir)).unwrap_or(false)) {
+                return None;
+            }
+        } else if keys.iter().any(|k| self.is_folder_item(k) || !self.items.contains_key(k)) || !self.icons_movable(keys, Some(id)) {
+            return None;
+        }
+        if self.drop_onto_item(p, keys).is_some() {
+            return None;
+        }
+        let tab = b.active()?;
+        let shown = self.shown_items(b, tab);
+        let mut order: Vec<ItemKey> = shown.iter().filter(|k| !keys.contains(k)).cloned().collect();
+        let m = self.metrics(Some(b));
+        let cols = self.box_cols(b);
+        let c = App::content_rect(b);
+        let x0 = c.x + (c.w - cols as f32 * m.cell_w) / 2.0;
+        let top = c.y + 2.0 - self.shown_scroll(b.id);
+        let col = (((p.x - x0) / m.cell_w).floor().max(0.0) as usize).min(cols - 1);
+        let row = ((p.y - top) / m.cell_h.max(1.0)).floor().max(0.0) as usize;
+        let at = (row * cols + col).min(order.len());
+        // Its own first, in its order; then ones coming from elsewhere.
+        let mut dragged: Vec<ItemKey> = shown.iter().filter(|k| keys.contains(k)).cloned().collect();
+        let incoming: Vec<ItemKey> = keys.iter().filter(|k| !dragged.contains(k)).cloned().collect();
+        dragged.extend(incoming);
+        for (n, k) in dragged.into_iter().enumerate() {
+            order.insert(at + n, k);
+        }
+        Some((id, order))
     }
 
     /// A folder box's Sort by: its open folder in that order from now on (name: as Explorer

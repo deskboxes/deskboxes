@@ -299,7 +299,8 @@ impl App {
                 Drag::Items { keys, .. } => !b.is_folder() || self.folder_box_owns(b, keys),
                 _ => !b.is_folder(),
             };
-            if own && ours && self.fully_open(b) && cur.y >= App::content_rect(b).y && !b.az {
+            // (Where the icons make room instead, none.)
+            if own && ours && self.fully_open(b) && cur.y >= App::content_rect(b).y && !b.az && self.box_want.is_none() && self.box_room.is_none() {
                 let (_, at) = self.box_drop_slot(b, cur);
                 let c = App::content_rect(b);
                 let m = self.metrics(Some(b));
@@ -1081,7 +1082,10 @@ impl App {
         // The selected icon's whole name over the icons below it: drawn last.
         let mut last = None;
         for (i, k, cell) in self.box_cells_in(b, vis.y - dy, vis.bottom() - dy) {
-            let cell = cell.offset(0.0, dy);
+            if self.is_box_room_gap(b.id, &k) {
+                continue;
+            }
+            let cell = self.box_glided(b, &k, cell).offset(0.0, dy);
             if cell.bottom() < vis.y || cell.y > vis.bottom() {
                 continue;
             }
