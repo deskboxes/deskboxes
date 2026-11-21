@@ -1,5 +1,5 @@
 """Turn the rendered stills (tools/art/out/NAME_THEME.png, from render.mjs) into the Settings pictures
-in res/settings: NAME.jpg (dark theme) and NAME_l.jpg (light theme) at 800x450, the Home tiles'
+in res/settings: NAME.jpg (dark theme) and NAME_l.jpg (light theme) at 1280x720, the Home tiles'
 t_NAME[_l].jpg at 440x248, and the Home banner home[_l].jpg at 1440x400. The clips (NAME[_l].mp4)
 are written by render.mjs itself; their first frame is the still."""
 import os
@@ -27,7 +27,7 @@ for f in sorted(os.listdir(os.path.join(A, 'out'))):
     if name == 'home':
         save(im, (1440, 400), 'home' + suf + '.jpg')
     else:
-        save(im, (800, 450), name + suf + '.jpg')
+        save(im, (1280, 720), name + suf + '.jpg')
         if name in TILES:
             save(im, (440, 248), 't_' + name + suf + '.jpg')
             n += 1

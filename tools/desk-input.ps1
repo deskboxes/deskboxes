@@ -1,6 +1,6 @@
 # desk-input.ps1: guarded input on the real desktop for checking Deskboxes by eye during
 # development. Every click must land on a Deskboxes window (core surface or its menu host).
-#   desk-input.ps1 rclick 'X,Y' | click 'X,Y' | wheel 'X,Y,NOTCHES' | dclick X Y | drag X0 Y0 X1 Y1 | key VK[,VK...] | esc
+#   desk-input.ps1 rclick 'X,Y' | click 'X,Y' | wheel 'X,Y,NOTCHES' | cwheel 'X,Y,NOTCHES' (Ctrl held) | dclick X Y | drag X0 Y0 X1 Y1 | key VK[,VK...] | esc
 # A press-move-release stays in the process it started in: a drag from a test window that ends
 # over the real desktop is a real drop (it moved two test files into the Desktop folder once,
 # 2026-11-19). -Cross allows it (for drag images over other apps; cancel those with esc).
@@ -20,8 +20,8 @@ if ($AlsoPid) { [void][TestInput]::Allowed.Add($AlsoPid) }  # a test window of o
 $held = Join-Path $env:TEMP 'desk-input-held.txt'
 if ($Only) {
     [void][TestInput]::Allowed.Add($Only)
-    if ($Op -in 'rclick', 'click', 'wheel', 'dclick', 'drag', 'rdrag', 'down', 'path', 'move', 'up' -and $A.Count -ge 2) {
-        for ($i = 0; $i + 1 -lt $A.Count -and ($Op -ne 'wheel' -or $i -eq 0); $i += 2) {
+    if ($Op -in 'rclick', 'click', 'wheel', 'cwheel', 'dclick', 'drag', 'rdrag', 'down', 'path', 'move', 'up' -and $A.Count -ge 2) {
+        for ($i = 0; $i + 1 -lt $A.Count -and ($Op -notin 'wheel', 'cwheel' -or $i -eq 0); $i += 2) {
             $p = [TestInput]::PidAt($A[$i], $A[$i + 1])
             # Our menu host (a menu the test window opened) is fine too.
             $menu = @(Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | ForEach-Object Id)
@@ -38,6 +38,8 @@ switch ($Op) {
     'rclick' { [TestInput]::Click($A[0], $A[1], 1) }
     'click' { [TestInput]::Click($A[0], $A[1], 0) }
     'wheel' { [TestInput]::Wheel($A[0], $A[1], $A[2]) }
+    # Ctrl+wheel (icon size): Ctrl held around the wheel.
+    'cwheel' { [void][TestInput]::Keys([uint16[]]@(0x11)); Start-Sleep -Milliseconds 30; [TestInput]::Wheel($A[0], $A[1], $A[2]); Start-Sleep -Milliseconds 30; [void][TestInput]::Keys([uint16[]]@(0x8011)) }
     'dclick' { [TestInput]::Click($A[0], $A[1], 0); Start-Sleep -Milliseconds 60; [TestInput]::Click($A[0], $A[1], 0) }
     'drag' { Assert-Same $A[0] $A[1] $A[2] $A[3]; [TestInput]::Drag($A[0], $A[1], $A[2], $A[3], 0, 30) }
     'rdrag' { Assert-Same $A[0] $A[1] $A[2] $A[3]; [TestInput]::Drag($A[0], $A[1], $A[2], $A[3], 1, 30) }

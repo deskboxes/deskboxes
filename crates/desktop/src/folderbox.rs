@@ -55,9 +55,11 @@ impl App {
     pub fn folder_sync(&mut self) {
         let mut want: Vec<String> = vec![];
         for b in self.layout.boxes.iter().filter(|b| b.is_folder()) {
-            let f = b.folder_now().to_string();
-            if !want.iter().any(|w| same(w, &f)) {
-                want.push(f);
+            for ti in 0..b.tabs.len() {
+                let f = b.tab_now(ti).to_string();
+                if !want.iter().any(|w| same(w, &f)) {
+                    want.push(f);
+                }
             }
         }
         if want != self.folders_sent {
@@ -94,12 +96,20 @@ impl App {
         for v in by_dir.values_mut() {
             v.sort_by(|a, b| b.is_folder().cmp(&a.is_folder()).then_with(|| natural(&a.display_name, &b.display_name)));
         }
+        let orders = &self.layout.folder_orders;
         for b in self.layout.boxes.iter_mut().filter(|b| b.is_folder()) {
-            let keys: Vec<ItemKey> = by_dir.get(&b.folder_now().trim_end_matches('\\').to_lowercase()).map(|v| v.iter().map(|i| i.key.clone()).collect()).unwrap_or_default();
-            b.tabs.truncate(1);
-            b.active_tab = 0;
-            if let Some(t) = b.tabs.first_mut() {
-                t.items = keys;
+            for ti in 0..b.tabs.len() {
+                let dir = b.tab_now(ti).trim_end_matches('\\').to_lowercase();
+                let mut keys: Vec<ItemKey> = by_dir.get(&dir).map(|v| v.iter().map(|i| i.key.clone()).collect()).unwrap_or_default();
+                // An order the user made by dragging (or a Sort by): items it has first, in
+                // its order; new ones after them, sorted.
+                if let Some(o) = orders.get(&dir) {
+                    let pos: HashMap<&ItemKey, usize> = o.iter().enumerate().map(|(i, k)| (k, i)).collect();
+                    keys.sort_by_key(|k| pos.get(k).copied().unwrap_or(usize::MAX));
+                }
+                if let Some(t) = b.tabs.get_mut(ti) {
+                    t.items = keys;
+                }
             }
         }
     }
@@ -111,7 +121,9 @@ impl App {
             return false;
         }
         let Some(b) = self.layout.boxes.iter_mut().find(|b| b.id == id && b.is_folder()) else { return false };
-        b.folder_at = if same(path, &b.folder) { String::new() } else { path.to_string() };
+        let (ti, root) = (b.active_tab, b.folder_root().to_string());
+        let at = if same(path, &root) { String::new() } else { path.to_string() };
+        b.set_tab_folder(ti, &root, &at);
         self.folder_moved(id);
         true
     }
@@ -119,15 +131,18 @@ impl App {
     /// Up one folder (not above the box's own folder).
     pub fn folder_back(&mut self, id: u32) {
         let Some(b) = self.layout.boxes.iter_mut().find(|b| b.id == id && b.is_folder()) else { return };
-        if b.folder_at.is_empty() {
+        let ti = b.active_tab;
+        if !b.tab_in_sub(ti) {
             return;
         }
-        let up = parent_of(&b.folder_at).to_string();
-        b.folder_at = if up.is_empty() || same(&up, &b.folder) || up.len() < b.folder.len() { String::new() } else { up };
+        let (root, now) = (b.folder_root().to_string(), b.folder_now().to_string());
+        let up = parent_of(&now).to_string();
+        let at = if up.is_empty() || same(&up, &root) || up.len() < root.len() { String::new() } else { up };
+        b.set_tab_folder(ti, &root, &at);
         self.folder_moved(id);
     }
 
-    fn folder_moved(&mut self, id: u32) {
+    pub fn folder_moved(&mut self, id: u32) {
         self.scroll.remove(&id);
         self.sel.set.clear();
         self.sel.focus = None;
@@ -139,7 +154,7 @@ impl App {
 
     /// The back arrow in a folder box's title (shown while it is in a subfolder).
     pub fn folder_back_rect(&self, b: &BoxModel) -> Option<deskboxes_core::geom::Rect> {
-        if !b.is_folder() || b.folder_at.is_empty() {
+        if !b.is_folder() || !b.tab_in_sub(b.active_tab) {
             return None;
         }
         let r = self.shown_rect(b);
@@ -156,14 +171,6 @@ impl App {
         None
     }
 
-    /// What a folder box's title says: its own title in its folder, the subfolder's name below.
-    pub fn folder_title(&self, b: &BoxModel) -> Option<String> {
-        if !b.is_folder() || b.folder_at.is_empty() {
-            return None;
-        }
-        let name = b.folder_at.trim_end_matches('\\').rsplit('\\').next().unwrap_or("").to_string();
-        Some(name)
-    }
 
     /// A new folder box for `path` at `at` (4 × 3 icons), named after the folder.
     pub fn new_folder_box(&mut self, path: &str, at: Pt) {
@@ -211,6 +218,61 @@ impl App {
         let _ = self.worker.send(Req::DropOnItem { target, paths, copy });
     }
 
+    /// Icons of the folder box's open folder dropped in it again: they go to the slot under the
+    /// pointer, and that folder keeps this order. False: they are not all from that folder.
+    pub fn reorder_folder_box(&mut self, keys: &[ItemKey], id: u32, p: Pt) -> bool {
+        let Some(b) = self.box_by_id(id) else { return false };
+        let dir = b.folder_now().trim_end_matches('\\').to_string();
+        let all_here = !keys.is_empty() && keys.iter().all(|k| self.items.get(k).map(|i| same(parent_of(&i.parsing_name), &dir)).unwrap_or(false));
+        if !all_here {
+            return false;
+        }
+        if p.y < b.rect.y + header_h() {
+            return true;
+        }
+        let (i, _) = self.box_drop_slot(b, p);
+        let Some(tab) = b.active() else { return true };
+        let shown: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k)).cloned().collect();
+        let before = shown.iter().take(i).filter(|k| keys.contains(k)).count();
+        let mut order: Vec<ItemKey> = shown.into_iter().filter(|k| !keys.contains(k)).collect();
+        let at = (i - before).min(order.len());
+        for (n, k) in keys.iter().enumerate() {
+            order.insert(at + n, k.clone());
+        }
+        let key = dir.to_lowercase();
+        self.change_layout(|l, _| {
+            l.folder_orders.insert(key, order);
+        });
+        self.fill_folder_boxes();
+        self.invalidate();
+        true
+    }
+
+    /// A folder box's Sort by: its open folder in that order from now on (name: as Explorer
+    /// sorts, folders first).
+    pub fn sort_folder_box(&mut self, id: u32, by: &str) {
+        let Some(b) = self.box_by_id(id) else { return };
+        let dir = b.folder_now().trim_end_matches('\\').to_lowercase();
+        let mut its: Vec<&Item> = self.items.values().filter(|i| i.source == Source::Folder && parent_of(&i.parsing_name).eq_ignore_ascii_case(&dir)).collect();
+        sort_items(&mut its, by);
+        let order: Vec<ItemKey> = its.into_iter().map(|i| i.key.clone()).collect();
+        self.change_layout(|l, _| {
+            if by == "name" {
+                l.folder_orders.remove(&dir);
+            } else {
+                l.folder_orders.insert(dir.clone(), order);
+            }
+        });
+        self.fill_folder_boxes();
+        self.invalidate();
+    }
+
+    /// All of `keys` are in the folder this folder box shows now.
+    pub fn folder_box_owns(&self, b: &BoxModel, keys: &[ItemKey]) -> bool {
+        let dir = b.folder_now().trim_end_matches('\\');
+        !keys.is_empty() && keys.iter().all(|k| self.items.get(k).map(|i| same(parent_of(&i.parsing_name), dir)).unwrap_or(false))
+    }
+
     /// Hit for a menu or drop: the folder a folder box shows at `p`.
     pub fn folder_box_at(&self, p: Pt) -> Option<String> {
         self.drop_box(p).and_then(|id| self.box_by_id(id)).filter(|b| b.is_folder()).map(|b| b.folder_now().to_string())
@@ -238,7 +300,7 @@ impl App {
     pub fn pick_start(&self, r: &PickReq) -> String {
         r.change
             .and_then(|id| self.box_by_id(id))
-            .map(|b| b.folder.clone())
+            .map(|b| b.folder_root().to_string())
             .or_else(|| deskboxes_shell::items::known_folders().into_iter().find(|(n, _)| *n == "documents").map(|(_, p)| p.display().to_string()))
             .unwrap_or_default()
     }
@@ -256,15 +318,19 @@ impl App {
                 let p = path.to_string();
                 self.change_layout(|l, _| {
                     if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id && b.is_folder()) {
-                        // Its title follows the folder when it was the old folder's name.
-                        let old = std::path::Path::new(&b.folder).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        if let Some(t) = b.tabs.first_mut() {
+                        // The open tab shows it; its title follows the folder when it was the old
+                        // folder's name.
+                        let ti = b.active_tab;
+                        let old = std::path::Path::new(b.folder_root()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if let Some(t) = b.tabs.get_mut(ti) {
                             if t.title == old || t.title.is_empty() {
                                 t.title = title.clone();
                             }
                         }
-                        b.folder = p.clone();
-                        b.folder_at = String::new();
+                        if ti == 0 {
+                            b.folder = p.clone();
+                        }
+                        b.set_tab_folder(ti, &p, "");
                     }
                 });
                 self.folder_moved(id);
@@ -294,6 +360,22 @@ pub fn pick_folder(owner: windows::Win32::Foundation::HWND, title: &str, start: 
         let s = p.to_string().ok();
         CoTaskMemFree(Some(p.0 as _));
         s
+    }
+}
+
+/// Explorer's Sort by (name, size, type, date modified): folders first, then files, names
+/// breaking ties.
+pub fn sort_items(v: &mut [&Item], by: &str) {
+    let group = |i: &Item| match i.kind {
+        ItemKind::Virtual => 0,
+        ItemKind::Folder => 1,
+        _ => 2,
+    };
+    match by {
+        "size" => v.sort_by(|a, b| group(a).cmp(&group(b)).then(a.size.cmp(&b.size)).then_with(|| natural(&a.display_name, &b.display_name))),
+        "type" => v.sort_by(|a, b| group(a).cmp(&group(b)).then_with(|| a.ext.to_lowercase().cmp(&b.ext.to_lowercase())).then_with(|| natural(&a.display_name, &b.display_name))),
+        "modified" => v.sort_by(|a, b| group(a).cmp(&group(b)).then(b.modified.cmp(&a.modified)).then_with(|| natural(&a.display_name, &b.display_name))),
+        _ => v.sort_by(|a, b| group(a).cmp(&group(b)).then_with(|| natural(&a.display_name, &b.display_name))),
     }
 }
 

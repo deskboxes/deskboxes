@@ -361,6 +361,8 @@ pub struct App {
     pub own_drag: Option<(Vec<ItemKey>, Pt)>,
     /// Desktop labels pre-rendered with their shadow (same keys as `labels`).
     pub label_bmps: HashMap<(ItemKey, bool, i32), deskboxes_render::Bitmap>,
+    /// Boxes' own views: icons at other sizes, type names, Details texts.
+    pub views: crate::views::ViewState,
     pub label_tf: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     pub title_tf: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     pub title_tf_bold: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
@@ -455,6 +457,8 @@ pub struct App {
     /// No snapshot to show yet (first run): keep Explorer's icons until the first scan is drawn,
     /// so the desktop is never empty while the cold scan runs.
     pub hide_after_scan: bool,
+    /// Sort into the default boxes after the first scan (a fresh install; see `template`).
+    pub template_pending: bool,
     /// Every frame's draw time (ms), for the stats and the diagnostics overlay.
     pub draw_times: Vec<f32>,
     pub frame_marks: std::collections::VecDeque<Instant>,
@@ -721,6 +725,8 @@ pub fn run(args: Args, paths: Paths, t0: Instant) -> i32 {
 }
 
 unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
+    // A fresh install (no settings written yet): the first scan sorts the desktop into boxes.
+    let fresh_install = !paths.settings.exists();
     let mut settings = persist::load_settings(&paths.settings);
     crate::az::set_bar(settings.az.letter_bar);
     if args.enable && !settings.enabled {
@@ -848,6 +854,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let topology = format!("primary-{}x{}-{}", mon_full.right - mon_full.left, mon_full.bottom - mon_full.top, dpi);
     let lay = persist::load_layout(&paths.layouts, &topology).unwrap_or_default();
     let first_run = !persist::layout_path(&paths.layouts, &topology).exists();
+    let template_pending = args.first_run_template || (fresh_install && first_run && args.desktop_dir.is_none());
     let seed: Vec<Item> = snap.as_ref().filter(|s| s.icon_px == icon_px).map(|s| s.items.clone()).unwrap_or_default();
     let first_icon_id = snap.as_ref().map(|s| s.icons.len() as u32).unwrap_or(0);
     let seeded = !seed.is_empty();
@@ -906,6 +913,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         labels: HashMap::new(),
         own_drag: None,
         label_bmps: HashMap::new(),
+        views: Default::default(),
         label_tf,
         title_tf,
         title_tf_bold,
@@ -964,6 +972,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         scanned_once: false,
         quitting: false,
         hide_after_scan: false,
+        template_pending,
         draw_times: Vec::new(),
         frame_marks: std::collections::VecDeque::new(),
         diag: false,
@@ -1203,12 +1212,14 @@ impl App {
 
     /// Where a box's icons are: under its title (and an A–Z box's letter bar).
     pub fn content_rect(b: &BoxModel) -> Rect {
-        let top = header_h() + crate::az::bar_h(b);
+        let head = if b.view() == View::Details { crate::views::DETAILS_HEAD } else { 0.0 };
+        let top = header_h() + crate::az::bar_h(b) + head;
         Rect::new(b.rect.x, b.rect.y + top, b.rect.w, (b.rect.h - top).max(0.0))
     }
 
     pub fn box_cols(&self, b: &BoxModel) -> usize {
-        (((b.rect.w - 2.0 * PAD) / self.grid.cell_w).floor() as usize).max(1)
+        let m = self.metrics(Some(b));
+        (((b.rect.w - 2.0 * PAD) / m.cell_w).floor() as usize).max(1)
     }
 
     /// Cell rects of the active tab's items of a box (scrolled; may extend past the content rect).
@@ -1220,13 +1231,14 @@ impl App {
     /// (index in the shown order, item, cell). A box of 800 icons shows about 50.
     pub fn box_cells_in(&self, b: &BoxModel, y0: f32, y1: f32) -> Vec<(usize, ItemKey, Rect)> {
         let Some(tab) = b.active() else { return vec![] };
+        let m = self.metrics(Some(b));
         let cols = self.box_cols(b);
         let c = Self::content_rect(b);
-        let used = cols as f32 * self.grid.cell_w;
+        let used = cols as f32 * m.cell_w;
         let x0 = c.x + (c.w - used) / 2.0;
         let top = c.y + 2.0 - self.shown_scroll(b.id);
         let items = self.shown_items(b, tab);
-        let ch = self.grid.cell_h.max(1.0);
+        let ch = m.cell_h.max(1.0);
         let first_row = if y0 == f32::MIN { 0 } else { ((y0 - top) / ch).floor().max(0.0) as usize };
         let last_row = if y1 == f32::MAX { usize::MAX } else { ((y1 - top) / ch).floor().max(0.0) as usize };
         let start = first_row.saturating_mul(cols).min(items.len());
@@ -1236,7 +1248,7 @@ impl App {
                 (
                     i,
                     items[i].clone(),
-                    Rect::new(x0 + (i % cols) as f32 * self.grid.cell_w, top + (i / cols) as f32 * self.grid.cell_h, self.grid.cell_w, self.grid.cell_h),
+                    Rect::new(x0 + (i % cols) as f32 * m.cell_w, top + (i / cols) as f32 * m.cell_h, m.cell_w, m.cell_h),
                 )
             })
             .collect()
@@ -1245,20 +1257,25 @@ impl App {
     /// Where items dropped at `p` go in a box: the insertion index among the shown items and
     /// the top-left of the slot (for the insertion marker).
     pub fn box_drop_slot(&self, b: &BoxModel, p: Pt) -> (usize, Pt) {
+        let m = self.metrics(Some(b));
         let cols = self.box_cols(b);
         let c = Self::content_rect(b);
-        let x0 = c.x + (c.w - cols as f32 * self.grid.cell_w) / 2.0;
+        let x0 = c.x + (c.w - cols as f32 * m.cell_w) / 2.0;
         let y0 = c.y + 2.0 - self.shown_scroll(b.id);
         let n = b.active().map(|t| t.items.iter().filter(|k| self.items.contains_key(*k)).count()).unwrap_or(0);
-        let row = ((p.y - y0) / self.grid.cell_h).floor().max(0.0) as usize;
-        let col = (((p.x - x0) / self.grid.cell_w).round().max(0.0) as usize).min(cols);
+        // One column of rows: above or below a row (by its middle); else between two cells.
+        let (row, col) = if m.row() && cols == 1 {
+            (((p.y - y0) / m.cell_h).round().max(0.0) as usize, 0)
+        } else {
+            (((p.y - y0) / m.cell_h).floor().max(0.0) as usize, (((p.x - x0) / m.cell_w).round().max(0.0) as usize).min(cols))
+        };
         let i = (row * cols + col).min(n);
         let (r, cc) = if i == row * cols + col { (row, col) } else { (i / cols, i % cols) };
         (
             i,
             Pt {
-                x: x0 + cc as f32 * self.grid.cell_w,
-                y: y0 + r as f32 * self.grid.cell_h,
+                x: x0 + cc as f32 * m.cell_w,
+                y: y0 + r as f32 * m.cell_h,
             },
         )
     }
@@ -1273,9 +1290,38 @@ impl App {
         let it = self.items.get(&key)?;
         let ext = std::path::Path::new(&it.parsing_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         let accepts = it.is_folder() || matches!(ext.as_str(), "exe" | "lnk" | "zip" | "bat" | "cmd") || is_recycle_bin(&it.parsing_name);
-        let (_, cell, _) = self.visible_cells().into_iter().find(|(k, _, _)| *k == key)?;
-        let (icon, _) = self.item_parts(&key, cell, false);
-        (accepts && icon.inflate(6.0).contains(p)).then_some(key)
+        let (_, cell, bx) = self.visible_cells().into_iter().find(|(k, _, _)| *k == key)?;
+        let m = self.metrics_of(bx);
+        let (icon, _) = self.item_parts(&key, cell, false, &m);
+        // Only the icon itself takes the drop, not the room around it: the gap between two
+        // icons is where they go in between (Explorer's insertion).
+        let zone = if m.row() {
+            Rect::new(cell.x, cell.y + cell.h * 0.25, cell.w, cell.h * 0.5)
+        } else {
+            let side = (cell.w * 0.2).max(10.0);
+            let x0 = icon.x.max(cell.x + side);
+            let x1 = icon.right().min(cell.right() - side);
+            Rect::new(x0, icon.y, (x1 - x0).max(4.0), icon.h)
+        };
+        (accepts && zone.contains(p)).then_some(key)
+    }
+
+    /// A drop on the loose grid at `p` that goes in between icons: the cell under the pointer
+    /// has another icon, so the dropped ones go before it (upper half) or after it (lower half)
+    /// and the icons after move along. None: an ordinary move.
+    pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<Cell> {
+        if self.drop_box(p).is_some() {
+            return None;
+        }
+        let g = &self.grid;
+        let col = ((p.x - g.origin.x) / g.cell_w).floor() as i32;
+        let fy = (p.y - g.origin.y) / g.cell_h;
+        let under = Cell { col, row: fy.floor() as i32 };
+        if col < 0 || col >= g.cols || under.row < 0 || under.row >= g.rows {
+            return None;
+        }
+        let taken = self.layout.loose.iter().any(|(k, c)| *c == under && !keys.contains(k) && self.items.contains_key(k));
+        taken.then_some(Cell { col, row: (fy.round() as i32).clamp(0, g.rows - 1) })
     }
 
     /// Box under the pointer for a drop (body, header or one of its items).
@@ -1315,7 +1361,7 @@ impl App {
     pub fn max_scroll(&self, b: &BoxModel) -> f32 {
         let n = b.active().map(|t| t.items.iter().filter(|k| self.items.contains_key(*k)).count()).unwrap_or(0);
         let rows = n.div_ceil(self.box_cols(b)) as f32;
-        (rows * self.grid.cell_h + 4.0 - Self::content_rect(b).h).max(0.0)
+        (rows * self.metrics(Some(b)).cell_h + 4.0 - Self::content_rect(b).h).max(0.0)
     }
 
     /// Every visible item with its cell rect and box, in display order (loose grid in
@@ -1366,11 +1412,14 @@ impl App {
         self.visible_cells().into_iter().map(|(k, _, _)| k).collect()
     }
 
-    /// Icon rect and label rect of an item in a cell.
-    pub fn item_parts(&self, key: &ItemKey, cell: Rect, full: bool) -> (Rect, Rect) {
+    /// Icon rect and label rect of an item in a cell (of a box with metrics `m`).
+    pub fn item_parts(&self, key: &ItemKey, cell: Rect, full: bool, m: &crate::views::Metrics) -> (Rect, Rect) {
+        if m.row() {
+            return self.row_parts(cell, m);
+        }
         // Where Explorer puts them (measured on its own desktop): the icon 7 DIPs into the cell,
         // the label 3 DIPs under it.
-        let icon = Rect::new(cell.x + (cell.w - self.icon_dip) / 2.0, cell.y + 7.0, self.icon_dip, self.icon_dip);
+        let icon = Rect::new(cell.x + (cell.w - m.icon) / 2.0, cell.y + 7.0, m.icon, m.icon);
         let lw = cell.w - 4.0;
         let lh = self.label_height(key, lw, full);
         (icon, Rect::new(cell.x + 2.0, icon.bottom() + 3.0, lw, lh))
@@ -1380,6 +1429,15 @@ impl App {
         match self.labels.get(&(key.clone(), full, w as i32)) {
             Some(l) => deskboxes_render::text_height(l),
             None => self.line_h * if full { 1.0 } else { 2.0 },
+        }
+    }
+
+    /// The name's layout as `label_spec` says (a row view's one line, or under the icon).
+    pub fn label_for(&mut self, key: &ItemKey, w: f32, full: bool, row: bool) -> Option<TextLayout> {
+        if row {
+            self.row_label(key, w)
+        } else {
+            self.label_layout(key, w, full)
         }
     }
 
@@ -1394,9 +1452,12 @@ impl App {
         Some(l)
     }
 
-    pub fn hit_rect(&self, key: &ItemKey, cell: Rect) -> Rect {
+    pub fn hit_rect(&self, key: &ItemKey, cell: Rect, m: &crate::views::Metrics) -> Rect {
+        if m.row() {
+            return Rect::new(cell.x + 1.0, cell.y + 1.0, cell.w - 2.0, cell.h - 2.0);
+        }
         let full = self.is_full_label(key);
-        let (i, l) = self.item_parts(key, cell, full);
+        let (i, l) = self.item_parts(key, cell, full, m);
         Rect::new(cell.x + 1.0, i.y - 2.0, cell.w - 2.0, l.bottom() - i.y + 4.0)
     }
 
@@ -1619,9 +1680,6 @@ impl App {
     pub fn locks(&self, b: &BoxModel) -> deskboxes_core::model::BoxLocks {
         if self.settings.lock_all {
             deskboxes_core::model::BoxLocks::ALL
-        } else if b.is_folder() {
-            // A folder box shows one folder: no tabs.
-            deskboxes_core::model::BoxLocks { tabs: true, ..b.locks }
         } else {
             b.locks
         }
@@ -1824,7 +1882,7 @@ impl App {
                     return false;
                 }
                 let visible = b.and_then(|id| self.box_by_id(id)).map(|bx| Self::content_rect(bx).intersects(cell)).unwrap_or(true);
-                visible && self.hit_rect(k, *cell).intersects(&band)
+                visible && self.hit_rect(k, *cell, &self.metrics_of(*b)).intersects(&band)
             })
             .map(|(k, _, _)| k)
             .collect()
@@ -1969,13 +2027,11 @@ impl App {
                 add,
             };
         }
-        let mut ws: Vec<f32> = b
-            .tabs
-            .iter()
-            .map(|t| {
+        let mut ws: Vec<f32> = (0..b.tabs.len())
+            .map(|i| {
                 let w = self
                     .gpu
-                    .label(&self.title_tf_bold, &t.title, 10_000.0, self.title_line_h, 1, false)
+                    .label(&self.title_tf_bold, &self.tab_label(b, i), 10_000.0, self.title_line_h, 1, false)
                     .map(|l| deskboxes_render::text_width(&l))
                     .unwrap_or(60.0);
                 (w.min(180.0) + 24.0).max(48.0)
@@ -1989,8 +2045,10 @@ impl App {
                 }
             }
         }
-        // Room at the right for the magnifier and +.
-        let avail = r.w - 12.0 - 68.0 - TAB_GAP * (n - 1) as f32;
+        // Room at the right for the magnifier and +, and at the left for a folder box's folder
+        // glyph or back arrow.
+        let lead = if b.is_folder() { 28.0 } else { 0.0 };
+        let avail = r.w - 12.0 - 68.0 - lead - TAB_GAP * (n - 1) as f32;
         let sum: f32 = ws.iter().sum();
         if sum > avail && sum > 0.0 {
             let k = avail / sum;
@@ -1998,7 +2056,7 @@ impl App {
                 *w = (*w * k).max(28.0);
             }
         }
-        let mut x = r.x + 6.0;
+        let mut x = r.x + 6.0 + lead;
         let tabs = ws
             .iter()
             .map(|w| {
@@ -2174,17 +2232,34 @@ impl App {
             || self.btn_tip.as_ref().map(|t| busy(t.2, TIP_FADE_S)).unwrap_or(false)
     }
 
-    /// A new tab in a box, its title being edited.
+    /// A new tab in a box, its title being edited. A folder box's new tab shows the open tab's
+    /// folder and is named after it, as in File Explorer.
     fn add_tab(&mut self, id: u32) {
-        let title = t(self.lang, S::NewTabTitle).to_string();
+        let folder = self.box_by_id(id).filter(|b| b.is_folder()).map(|b| b.folder_root().to_string());
+        let title = match &folder {
+            Some(f) => f.trim_end_matches('\\').rsplit('\\').next().unwrap_or("").to_string(),
+            None => t(self.lang, S::NewTabTitle).to_string(),
+        };
         let mut ix = None;
         self.change_layout(|l, _| ix = layout::add_tab(l, id, &title));
         if let Some(tab) = ix {
             self.scroll.remove(&id);
             self.tab_grow = Some((id, tab, Instant::now()));
             crate::anim::set(true);
-            self.begin_rename(RenameTarget::Box { id, tab });
+            if folder.is_some() {
+                self.folder_moved(id);
+            } else {
+                self.begin_rename(RenameTarget::Box { id, tab });
+            }
         }
+    }
+
+    /// What a tab says: its title (a folder box's tab in a subfolder: that folder's name).
+    pub fn tab_label(&self, b: &BoxModel, i: usize) -> String {
+        if b.is_folder() && b.tab_in_sub(i) {
+            return b.tab_now(i).trim_end_matches('\\').rsplit('\\').next().unwrap_or("").to_string();
+        }
+        b.tabs.get(i).map(|t| t.title.clone()).unwrap_or_default()
     }
 
     /// A dragged tab released at `cur`: reorder in its own title, move into the box whose title
@@ -2252,11 +2327,12 @@ impl App {
                 return Hit::BoxBody { id: b.id };
             }
             let c = Self::content_rect(b);
-            for (_, k, cell) in self.box_cells_in(b, p.y - 3.0 * self.grid.cell_h, p.y + self.grid.cell_h) {
+            let m = self.metrics(Some(b));
+            for (_, k, cell) in self.box_cells_in(b, p.y - 3.0 * m.cell_h, p.y + m.cell_h) {
                 if cell.bottom() < c.y || cell.y > c.bottom() {
                     continue;
                 }
-                if self.hit_rect(&k, cell).contains(p) && c.contains(p) {
+                if self.hit_rect(&k, cell, &m).contains(p) && c.contains(p) {
                     return Hit::Item { key: k, in_box: Some(b.id) };
                 }
             }
@@ -2270,7 +2346,7 @@ impl App {
                 continue;
             }
             let cell = self.grid.cell_rect(*c);
-            if cell.inflate(2.0).contains(p) && self.hit_rect(k, cell).contains(p) {
+            if cell.inflate(2.0).contains(p) && self.hit_rect(k, cell, &self.metrics(None)).contains(p) {
                 return Hit::Item { key: k.clone(), in_box: None };
             }
         }
@@ -2311,8 +2387,13 @@ impl App {
         deskboxes_core::rules::apply(&mut self.layout, &its, fresh, deskboxes_core::rules::now_filetime())
     }
 
-    /// "Sort the desktop now": one undo step.
+    /// "Sort the desktop now": one undo step. With no rules yet: the default boxes, with a rule
+    /// for each (it did nothing before, which said nothing about what it is for).
     pub fn sort_now(&mut self) {
+        if self.layout.rules.is_empty() {
+            self.apply_template();
+            return;
+        }
         let before = self.layout.clone();
         if self.apply_rules(None, false) {
             layout::evict_from_boxes(&mut self.layout, &self.grid);
@@ -2425,14 +2506,14 @@ impl App {
             .into_iter()
             .map(|(k, cell, b)| {
                 let it = &self.items[&k];
-                json!({ "key": k.0, "name": it.display_name, "path": it.parsing_name, "rect": px(self.hit_rect(&k, cell)), "box": b, "selected": self.sel.is_selected(&k) })
+                json!({ "key": k.0, "name": it.display_name, "path": it.parsing_name, "rect": px(self.hit_rect(&k, cell, &self.metrics_of(b))), "box": b, "selected": self.sel.is_selected(&k) })
             })
             .collect();
         let boxes: Vec<Value> = self
             .layout
             .boxes
             .iter()
-            .map(|b| json!({ "id": b.id, "rect": px(b.rect), "tabs": b.tabs.iter().map(|t| json!({"title": t.title, "items": t.items.len()})).collect::<Vec<_>>(), "active": b.active_tab }))
+            .map(|b| json!({ "id": b.id, "rect": px(b.rect), "tabs": b.tabs.iter().map(|t| json!({"title": t.title, "items": t.items.len()})).collect::<Vec<_>>(), "active": b.active_tab, "view": b.view, "icon_size": b.icon_size }))
             .collect();
         let v = json!({ "items": items, "boxes": boxes, "scale": self.scale, "loose": self.layout.loose.len() });
         let _ = persist::write_atomic(p, serde_json::to_string_pretty(&v).unwrap_or_default().as_bytes());
@@ -2455,11 +2536,12 @@ impl App {
                 continue;
             }
             let Some(it) = self.items.get(&k) else { continue };
-            let full = self.is_full_label(&k);
-            let (icon_rect, label) = self.item_parts(&k, cell, full);
-            let lk = (k.clone(), full, (cell.w - 4.0) as i32);
+            let m = self.metrics_of(bx);
+            let (lw, full, row) = self.label_spec(&k, cell, &m);
+            let (icon_rect, label) = self.item_parts(&k, cell, full, &m);
+            let lk = App::lkey(&k, lw, full, row);
             self.vanishing.push(Vanish {
-                icon: self.bitmaps.get(&it.icon).cloned(),
+                icon: self.icon_bitmap(it, &m).map(|(_, b)| b.clone()),
                 label: self.labels.get(&lk).map(|l| (l.clone(), self.label_bmps.get(&lk).cloned())),
                 icon_rect,
                 label_at: Pt { x: label.x, y: label.y },
@@ -2484,7 +2566,9 @@ impl App {
             // The worker numbers icons independently of an unusable snapshot: replace the table.
             self.bitmaps.clear();
             self.icon_imgs.clear();
+            self.views.forget_icons();
         }
+        self.views.forget_texts();
         for (id, img) in icons {
             match self.gpu.bitmap(&img) {
                 Ok(b) => {
@@ -2589,6 +2673,11 @@ impl App {
             _ => changed,
         };
         self.fill_folder_boxes();
+        if first && self.template_pending {
+            self.template_pending = false;
+            log::info!("first run: the default boxes");
+            self.apply_template();
+        }
         self.sel.set.retain(|k| self.items.contains_key(k));
         self.scanned_once = true;
         self.stats.items = self.items.len();
@@ -2764,7 +2853,7 @@ impl App {
                     sub.push(json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
                     sub.push(json!({ "separator": true }));
                 }
-                sub.push(json!({ "id": "dbx.sortnow", "text": t(self.lang, S::SortNow), "glyph": "\u{E8CB}" }));
+                sub.push(json!({ "id": "dbx.sortnow", "text": t(self.lang, self.sort_now_text()), "glyph": "\u{E8CB}" }));
                 sub.push(json!({ "id": "dbx.rules", "text": t(self.lang, S::SortingRules), "glyph": "\u{E71C}" }));
                 sub.push(json!({ "separator": true }));
                 if self.settings.saved.in_menu {
@@ -2792,13 +2881,31 @@ impl App {
                 let _ = (at, new_rect);
                 // View and Sort by, as Explorer's desktop has them (Windows' own text, "@dll,-id").
                 let size = self.icon_dip.round() as u32;
-                let view = vec![
-                    json!({ "id": "iconsize.large", "text": "@ExplorerFrame.dll,-41729", "radio": true, "checked": size >= 40 }),
-                    json!({ "id": "iconsize.medium", "text": "@ExplorerFrame.dll,-41730", "radio": true, "checked": (24..40).contains(&size) }),
-                    json!({ "id": "iconsize.smallicon", "text": "@ExplorerFrame.dll,-41731", "radio": true, "checked": size < 24 }),
-                    json!({ "separator": true }),
-                    json!({ "id": "showdesktop", "text": t(self.lang, S::ShowDesktopIcons), "checkable": true, "checked": self.settings.show_icons }),
-                ];
+                let all = json!({ "id": "dbx.allviewmenu", "text": t(self.lang, S::AllBoxesView), "glyph": "\u{E8A9}", "children": self.view_entries("dbx.allview:", &self.all_boxes_preset()) });
+                // A box: its own view (as a File Explorer window's), then all boxes'. The desktop:
+                // its icon size, as Explorer's desktop has it, then all boxes'.
+                let view = match bid.and_then(|id| self.box_by_id(id)) {
+                    Some(b) => {
+                        let mut v = self.view_entries("dbx.view:", crate::views::preset_of(b));
+                        v.push(json!({ "separator": true }));
+                        v.push(all);
+                        v
+                    }
+                    None => vec![
+                        json!({ "id": "iconsize.large", "text": "@ExplorerFrame.dll,-41729", "radio": true, "checked": size >= 40 }),
+                        json!({ "id": "iconsize.medium", "text": "@ExplorerFrame.dll,-41730", "radio": true, "checked": (24..40).contains(&size) }),
+                        json!({ "id": "iconsize.smallicon", "text": "@ExplorerFrame.dll,-41731", "radio": true, "checked": size < 24 }),
+                        json!({ "separator": true }),
+                        all,
+                        json!({ "separator": true }),
+                        json!({ "id": "showdesktop", "text": t(self.lang, S::ShowDesktopIcons), "checkable": true, "checked": self.settings.show_icons }),
+                    ],
+                };
+                // A folder box's menu is its folder's (Windows' own, without our View): its view
+                // goes at the top with the box's entries.
+                if bid.and_then(|id| self.box_by_id(id)).map(|b| b.is_folder()).unwrap_or(false) {
+                    extra.insert(0, json!({ "id": "dbx.viewmenu", "text": t(self.lang, S::ViewMenu), "glyph": "\u{E8A9}", "children": view.clone(), "placement": "top" }));
+                }
                 let sort = vec![
                     json!({ "id": "sort.name", "text": "@propsys.dll,-38671" }),
                     json!({ "id": "sort.size", "text": "@propsys.dll,-38657" }),
@@ -2811,6 +2918,42 @@ impl App {
                 }
                 json!({ "kind": "background", "folder": self.folder_arg(), "desktop": true, "shift": key_down(VK_SHIFT), "undo": self.hist.can_undo(), "redo": self.hist.can_redo(), "undo_text": self.undo_text(true), "redo_text": self.undo_text(false), "extra": extra, "own": { "view": view, "arrange": sort } })
             }
+        }
+    }
+
+    /// What "Sort now" does: by the rules, or (none yet) into new boxes by type.
+    fn sort_now_text(&self) -> S {
+        if self.layout.rules.is_empty() {
+            S::SortByType
+        } else {
+            S::SortNow
+        }
+    }
+
+    /// Explorer's views as menu entries (`prefix` + preset id), `cur` checked.
+    fn view_entries(&self, prefix: &str, cur: &str) -> Vec<Value> {
+        let l = self.lang;
+        let e = |id: &str, s: S| json!({ "id": format!("{prefix}{id}"), "text": t(l, s), "radio": true, "checked": cur == id });
+        vec![
+            e("xl", S::ViewXl),
+            e("large", S::ViewLarge),
+            e("medium", S::ViewMedium),
+            e("small", S::ViewSmall),
+            json!({ "separator": true }),
+            e("list", S::ViewList),
+            e("details", S::ViewDetails),
+            e("tiles", S::ViewTiles),
+            json!({ "separator": true }),
+            e("desktop", S::ViewAsDesktop),
+        ]
+    }
+
+    /// The view every box has, if they all have the same one ("" else).
+    fn all_boxes_preset(&self) -> String {
+        let mut v = self.layout.boxes.iter().map(crate::views::preset_of);
+        match v.next() {
+            Some(first) if v.all(|x| x == first) => first.to_string(),
+            _ => String::new(),
         }
     }
 
@@ -3314,6 +3457,11 @@ impl App {
             v.push(json!({ "id": "dbx.boxfromsel", "text": t(self.lang, S::BoxFromSelection), "glyph": "\u{E8A9}", "placement": "beforeProperties" }));
         }
         if let [one] = items {
+            // A folder in a folder box: open it in a new tab of that box (as Explorer's).
+            let in_fb = self.items.values().find(|i| i.parsing_name == *one).and_then(|i| self.folder_to_open(&i.key)).is_some();
+            if in_fb && self.can_show_folder(one) {
+                v.push(json!({ "id": "dbx.opennewtab", "text": t(self.lang, S::OpenNewTab), "glyph": "\u{E8A7}", "placement": "top" }));
+            }
             if self.can_show_folder(one) {
                 v.push(json!({ "id": "dbx.asfolderbox", "text": t(self.lang, S::FolderBoxShow), "glyph": "\u{E8B7}", "placement": "beforeProperties" }));
             }
@@ -3432,7 +3580,7 @@ impl App {
             json!({ "id": "dbx.newhere", "text": t(l, S::NewIconsHere), "checkable": true, "checked": self.layout.new_items_to == Some(tab_id) }),
             json!({ "id": "dbx.az", "text": t(l, S::AzIndex), "checkable": true, "checked": b.az }),
             json!({ "separator": true }),
-            json!({ "id": "dbx.sortnow", "text": t(l, S::SortNow), "glyph": "\u{E8CB}" }),
+            json!({ "id": "dbx.sortnow", "text": t(l, self.sort_now_text()), "glyph": "\u{E8CB}" }),
             json!({ "id": "dbx.rules", "text": t(l, S::SortingRules), "glyph": "\u{E71C}" }),
         ];
         sub.push(json!({ "id": "dbx.sortmenu", "text": t(l, S::SortingMenu), "glyph": "\u{E8CB}", "children": sorting }));
@@ -3449,12 +3597,12 @@ impl App {
         sub.push(json!({ "id": "dbx.removebox", "text": t(l, S::DeleteBox), "glyph": "\u{E74D}" }));
         sub.push(json!({ "id": "dbx.boxsettings", "text": t(l, S::MoreSettings), "glyph": "\u{E713}" }));
         if b.is_folder() {
-            // No tabs and no sorting here: it shows its folder as it is.
-            sub.retain(|e| !matches!(e["id"].as_str(), Some("dbx.addtab" | "dbx.sortmenu")));
+            // No sorting rules here: it shows its folder as it is.
+            sub.retain(|e| !matches!(e["id"].as_str(), Some("dbx.sortmenu")));
         }
         let mut top = vec![json!({ "id": "dbx.boxmenu", "text": t(l, S::BoxSettings), "glyph": "\u{E8A9}", "children": sub, "placement": "top" })];
         if b.is_folder() {
-            if !b.folder_at.is_empty() {
+            if b.tab_in_sub(b.active_tab) {
                 top.push(json!({ "id": "dbx.folderup", "text": t(l, S::FolderUp), "glyph": "\u{E72B}", "placement": "top" }));
             }
             top.push(json!({ "id": "dbx.folderexplore", "text": t(l, S::FolderOpenExplorer), "glyph": "\u{EC50}", "placement": "top" }));
@@ -3816,6 +3964,18 @@ impl App {
                     });
                 }
             }
+            "dbx.opennewtab" => {
+                let target = self.sel.focus.clone().or_else(|| self.sel.set.iter().next().cloned()).and_then(|k| self.folder_to_open(&k));
+                if let Some((id, path)) = target {
+                    let mut ix = None;
+                    self.change_layout(|l, _| ix = layout::open_in_new_tab(l, id, &path));
+                    if let Some(tab) = ix {
+                        self.tab_grow = Some((id, tab, Instant::now()));
+                        crate::anim::set(true);
+                        self.folder_moved(id);
+                    }
+                }
+            }
             "dbx.addtab" => {
                 if let Some(id) = box_id {
                     self.add_tab(id);
@@ -3872,7 +4032,19 @@ impl App {
                 }
             }
             "dbx.sortnow" => self.sort_now(),
-            c if c.starts_with("sort.") => self.sort_desktop(&c["sort.".len()..]),
+            // Sort by: in a box, that box's open tab (a folder box's folder); else the desktop.
+            c if c.starts_with("sort.") => match box_id {
+                Some(id) if self.is_folder_box(id) => self.sort_folder_box(id, &c["sort.".len()..]),
+                Some(id) => self.sort_box_tab(id, &c["sort.".len()..]),
+                None => self.sort_desktop(&c["sort.".len()..]),
+            },
+            c if c.starts_with("dbx.view:") || c.starts_with("dbx.allview:") => {
+                let (k, v) = c.split_once(':').unwrap_or(("", ""));
+                if let Some((view, size)) = crate::views::preset(v) {
+                    let ids: Vec<u32> = if k == "dbx.allview" { self.layout.boxes.iter().map(|b| b.id).collect() } else { box_id.into_iter().collect() };
+                    self.set_box_view(&ids, view, size);
+                }
+            }
             "iconsize.large" => self.set_icon_size(48),
             "iconsize.medium" => self.set_icon_size(32),
             "iconsize.smallicon" => self.set_icon_size(16),
@@ -3989,6 +4161,22 @@ impl App {
         });
     }
 
+    /// A box's Sort by: its open tab's icons in that order. One undo step.
+    fn sort_box_tab(&mut self, id: u32, by: &str) {
+        let Some(tab) = self.box_by_id(id).and_then(|b| b.active()) else { return };
+        let mut its: Vec<&Item> = tab.items.iter().filter_map(|k| self.items.get(k)).collect();
+        crate::folderbox::sort_items(&mut its, by);
+        let order: Vec<ItemKey> = its.into_iter().map(|i| i.key.clone()).collect();
+        log::info!("sort box {id} by {by}: {} icon(s)", order.len());
+        self.change_layout(|l, _| {
+            if let Some(t) = l.boxes.iter_mut().find(|b| b.id == id).and_then(|b| b.tabs.get_mut(b.active_tab)) {
+                // Icons not on disk right now keep their places at the end.
+                let rest: Vec<ItemKey> = t.items.iter().filter(|k| !order.contains(k)).cloned().collect();
+                t.items = order.iter().cloned().chain(rest).collect();
+            }
+        });
+    }
+
     /// View > Large / Medium / Small icons: Explorer's desktop setting (so it stays the same
     /// without Deskboxes), then every icon again at the new size.
     fn set_icon_size(&mut self, dip: u32) {
@@ -3998,6 +4186,7 @@ impl App {
         self.icon_dip = dip as f32;
         self.icon_px = (dip as f32 * self.scale).round() as u32;
         self.seeded = false;
+        self.views.forget_icons();
         self.labels.clear();
         self.label_bmps.clear();
         log::info!("icon size -> {dip} DIP ({} px)", self.icon_px);
@@ -4141,24 +4330,26 @@ impl App {
         }
         let RenameTarget::Item(k) = target else { return };
         let Some(it) = self.items.get(&k) else { return };
-        let Some((_, cell, _)) = self.visible_cells().into_iter().find(|(x, _, _)| *x == k) else { return };
-        let (_, label) = self.item_parts(&k, cell, true);
+        let Some((_, cell, bx)) = self.visible_cells().into_iter().find(|(x, _, _)| *x == k) else { return };
+        let m = self.metrics_of(bx);
+        let (_, label) = self.item_parts(&k, cell, true, &m);
         let text = it.display_name.clone();
         // Explorer selects the name without the extension.
         let sel_end = match text.rfind('.') {
             Some(dot) if dot > 0 && !it.is_folder() => text[..dot].encode_utf16().count(),
             _ => text.encode_utf16().count(),
         };
-        // A little wider than the icon's cell, under the icon, kept on the screen.
-        let fw = cell.w + 16.0;
-        let fx = (cell.x - 8.0).clamp(0.0, (self.size_dip.0 - fw).max(0.0));
+        // A little wider than the icon's cell, under the icon, kept on the screen (a row view:
+        // over the name, to the row's end).
+        let fw = if m.row() { (cell.right() - label.x + 4.0).max(80.0) } else { cell.w + 16.0 };
+        let fx = (if m.row() { label.x - 4.0 } else { cell.x - 8.0 }).clamp(0.0, (self.size_dip.0 - fw).max(0.0));
         let (x, y) = self.to_screen(Pt { x: fx, y: label.y - 3.0 });
         let w = (fw * self.scale).round() as i32;
         let dark = !self.light;
         unsafe {
             let wt: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
             // Multi-line without horizontal scrolling: long names wrap, centred, as on Explorer's desktop.
-            let style = WS_POPUP | WS_BORDER | WINDOW_STYLE((ES_CENTER | ES_MULTILINE | ES_AUTOVSCROLL) as u32);
+            let style = WS_POPUP | WS_BORDER | WINDOW_STYLE((if m.row() { ES_LEFT } else { ES_CENTER } | ES_MULTILINE | ES_AUTOVSCROLL) as u32);
             let Ok(edit) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("EDIT"), PCWSTR(wt.as_ptr()), style, x, y, w, 20, Some(self.hwnd), None, None, None) else {
                 return;
             };
@@ -4642,7 +4833,14 @@ impl App {
             Drag::Resize { id, start, orig, l, t, r, b } => {
                 let (dx, dy) = (p.x - start.x, p.y - start.y);
                 let mut n = orig;
-                let (minw, minh) = (self.grid.cell_w + 2.0 * PAD, header_h() + 40.0);
+                // This box's own cells (a row view: rows, its width free).
+                let m = self.metrics_of(Some(id));
+                let (snap_w, cell_h, head) = match self.box_by_id(id) {
+                    Some(bx) => (!m.row(), m.cell_h, Self::content_rect(bx).y - bx.rect.y),
+                    None => (true, m.cell_h, header_h()),
+                };
+                let cell_w = if m.row() { self.grid.cell_w } else { m.cell_w };
+                let (minw, minh) = (cell_w + 2.0 * PAD, header_h() + 40.0);
                 if l {
                     let x = (orig.x + dx).min(orig.right() - minw);
                     n.w = orig.right() - x;
@@ -4661,9 +4859,10 @@ impl App {
                 }
                 // Whole icon columns and rows (Shift: free size).
                 if !key_down(VK_SHIFT) {
-                    let cols = ((n.w - 2.0 * PAD) / self.grid.cell_w).round().max(1.0);
-                    let rows = ((n.h - header_h() - 8.0) / self.grid.cell_h).round().max(1.0);
-                    let (w, h) = (cols * self.grid.cell_w + 2.0 * PAD, header_h() + rows * self.grid.cell_h + 8.0);
+                    let cols = ((n.w - 2.0 * PAD) / cell_w).round().max(1.0);
+                    let rows = ((n.h - head - 8.0) / cell_h).round().max(1.0);
+                    let w = if snap_w { cols * cell_w + 2.0 * PAD } else { n.w };
+                    let h = head + rows * cell_h + 8.0;
                     if l {
                         n.x = n.right() - w;
                     }
@@ -4763,6 +4962,13 @@ impl App {
     }
 
     fn set_cursor(&self, p: Pt) {
+        // A folder box's back arrow and the title buttons are buttons, not the title to move.
+        if self.folder_back_at(p).is_some() || self.title_btn_at(p).is_some() {
+            unsafe {
+                SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+            }
+            return;
+        }
         if (self.on_pill(p) && !(self.search_query().trim().len() > 0 && p.x > self.pill_rect().right() - 34.0))
             || self.box_search_field().map(|(_, f)| f.contains(p) && p.x < f.right() - 26.0).unwrap_or(false)
         {
@@ -4909,10 +5115,13 @@ impl App {
             }
             return;
         }
-        // Onto a folder box: the files move into its folder. Out of one, anywhere else: nothing
-        // (its files are not desktop icons).
+        // Onto a folder box: the files move into its folder (its own ones: they go where they
+        // were dropped, in the order you make). Out of one, anywhere else: nothing (its files
+        // are not desktop icons).
         if let Some(id) = self.drop_box(cur).filter(|id| self.is_folder_box(*id)) {
-            self.drop_into_folder_box(&keys, id, key_down(VK_CONTROL));
+            if !self.reorder_folder_box(&keys, id, cur) {
+                self.drop_into_folder_box(&keys, id, key_down(VK_CONTROL));
+            }
             return;
         }
         if keys.iter().any(|k| self.is_folder_item(k)) {
@@ -4954,6 +5163,15 @@ impl App {
                         layout::move_to_box(l, &keys, id, index);
                     }
                 });
+            }
+            None if self.grid_insert_at(cur, &keys).is_some() => {
+                // Onto another icon or the gap between two: in between them, in the order shown.
+                let at = self.grid_insert_at(cur, &keys).unwrap();
+                let order = self.order();
+                let mut ks = keys.clone();
+                ks.sort_by_key(|k| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
+                log::info!("insert {} icon(s) at {at:?}", ks.len());
+                self.change_layout(|l, g| layout::insert_in_grid(l, &ks, at, g));
             }
             None => {
                 // Loose grid: every item moves by the drag offset, so the group keeps its shape
@@ -5032,8 +5250,13 @@ impl App {
 
     fn on_wheel(&mut self, p: Pt, delta: i16, ctrl: bool) {
         self.hide_tip();
-        // Ctrl + wheel: icon size, a step per notch (small, medium, large).
+        // Ctrl + wheel over a box: that box's view and icon size, a step per notch (as in a File
+        // Explorer window). Elsewhere: the desktop's icon size (small, medium, large).
         if ctrl && self.settings.extras.ctrl_wheel_size && delta != 0 {
+            if let Some(id) = self.drop_box(p) {
+                self.wheel_box_view(id, delta);
+                return;
+            }
             const SIZES: [u32; 3] = [16, 32, 48];
             let cur = self.icon_dip.round() as u32;
             let i = SIZES.iter().enumerate().min_by_key(|(_, s)| s.abs_diff(cur)).map(|(i, _)| i).unwrap_or(1);
@@ -5045,7 +5268,10 @@ impl App {
             let Some(b) = self.box_by_id(id) else { return };
             let max = self.max_scroll(b);
             let s = self.scroll.get(&id).copied().unwrap_or(0.0);
-            self.scroll_to(id, (s - delta as f32 / 120.0 * self.grid.cell_h).clamp(0.0, max));
+            // A row a notch (three rows of a list), as Explorer scrolls.
+            let m = self.metrics(Some(b));
+            let step = if m.row() { m.cell_h * 3.0 } else { m.cell_h };
+            self.scroll_to(id, (s - delta as f32 / 120.0 * step).clamp(0.0, max));
             self.az_after_scroll(id);
         }
     }
@@ -5526,6 +5752,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         Ev::HostMsg(v) => app.on_host_msg(v),
                         Ev::InfoTip { key, text } => app.on_info_tip(key, text),
                         Ev::FileDone { op, undo } => app.on_file_done(op, undo),
+                        Ev::IconsAt { px, map, icons } => app.apply_sized_icons(px, map, icons),
                         Ev::Update => {
                             if app.host.is_some() && app.settings_sig() != app.settings_sent {
                                 app.send_settings(false, None);

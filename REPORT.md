@@ -594,3 +594,61 @@ UNVERIFIED:
 - Windows N editions, which have no video codecs; the pictures should simply stay still there.
 - A Windows user name with a space in it (the clip's path is escaped for that case).
 - The speed changes on a slow PC.
+
+## 20. Round 12 (2026-11-21): box views and sizes, folder-box tabs, sorting template, Settings clips
+
+- Each box has its own view: Extra large, Large, Medium or Small icons, List, Details or Tiles,
+  or "Same as the desktop" (box menu › View).
+  - Ctrl+wheel over a box steps through it as in a File Explorer window: details, list, then
+    icons at 32, 40, 48, 64, 80, 96, 128, 192 and 256. Elsewhere Ctrl+wheel still sizes the
+    desktop's icons.
+  - The desktop's View menu has "Icons in all boxes", which sets every box at once.
+  - Details shows name, date modified, type and size, as far as the box is wide; Tiles shows type
+    and size under the name. Icons at other sizes come from the worker (`Req::IconsAt`), per size.
+- Folder boxes have tabs. A new tab opens on the open tab's folder, and a folder's menu has
+  "Open in new tab". Each tab keeps its own folder and subfolder.
+  - Over the back button the cursor is an arrow, not the move cursor.
+  - Search and add-tab sit at the right of the header again (the hidden tab lock had left a gap).
+  - Dragging icons inside a folder box reorders them and keeps that order per folder; "Sort by"
+    clears it. No files move.
+- Dropping an icon between two icons puts it there and moves the others along, as in Explorer:
+  on the desktop, in boxes and in folder boxes. The zone that opens a folder is the middle of its
+  icon only, so the gaps are easy to hit, and boxes show a line where the icon goes.
+- A selection rectangle started on the desktop is drawn behind the boxes: it never selects in
+  them.
+- Default sorting template: on a fresh install (no settings yet) the first scan makes boxes for
+  Apps, Folders, Documents, Media, and Installers & archives, only for kinds the desktop has. It
+  adds a type rule for each and puts the remaining icons together at the top left. This is one
+  undo step. "Sort now" with no rules does the same. Its menu text says so ("Sort icons into new
+  boxes by type"), and the rule-based one reads "Sort icons into their boxes now". Fixture flag:
+  `--first-run-template`.
+- Settings clips:
+  - A clip fades in only once its frames are on screen (polled position), which removes the
+    black flash on hover.
+  - Each feature page shows its clip as wide as the page (up to 928 px), playing on its own in
+    a loop.
+  - Clips are 1280x720 (crf 26, about 100–370 KB each) and stills are 1280x720.
+- Pictures: headless Chrome without a GPU silently drops `backdrop-filter`, so no box in any
+  picture was blurred.
+  - Boxes now draw their own blurred copy of the wallpaper, lined up through the camera, as the
+    app fills them.
+  - Blended icons use the app's recolor: the luminance mapped onto `blend_ramp` of the wallpaper
+    color behind the icon at 78% (an SVG filter per color), with names tinted the same way.
+  - Saved layouts is a new scene. The boxes in place with the menu open, they get jumbled, a
+    saved layout is picked, and they glide back.
+
+VERIFIED on a fixture (window mode):
+- The template on a messy desktop: five boxes, with the odd file left loose.
+- Ctrl+wheel changes only the box under the pointer, from large icons through to Details.
+- A folder box in a subfolder: back arrow, title, the arrow cursor on back, search and add-tab
+  on the right, and its View entry in the menu.
+- Dropping into gaps on the desktop, in a box (with the line) and in a folder box (no files
+  moved).
+- The band behind boxes.
+- The autoplaying page-wide clip.
+- Rendered clip frames of blend and saved, in both themes.
+
+UNVERIFIED:
+- The hover fade on a slow PC.
+- List and Tiles in a narrow box at large DPI.
+- Adding a folder-box tab by its menu in the real shell (built, not driven).

@@ -1,6 +1,6 @@
 // Record art.html's scenes with headless Chrome (DevTools protocol, its own throwaway profile in %TEMP%):
 //   out\NAME_THEME.png      the still (frame 0) at full size, for export.py
-//   res\settings\NAME[_l].mp4  the clip (scenes with a duration), 640x360 H.264, played on hover in Settings
+//   res\settings\NAME[_l].mp4  the clip (scenes with a duration), 1280x720 H.264, played on hover in Settings and at the top of its page
 // node tools/art/render.mjs [scene ...] [--themes dark,light] [--no-clips] [--fps 30]
 // Needs Chrome and ffmpeg on PATH.
 import { spawn, execFileSync } from 'node:child_process';
@@ -18,7 +18,7 @@ const themes = opt('--themes', 'dark,light').split(',');
 const fps = +opt('--fps', '30');
 const noClips = args.includes('--no-clips') ? args.splice(args.indexOf('--no-clips'), 1) : false;
 const scenes = args.length ? args : ALL;
-const VW = 640, VH = 360;
+const VW = 1280, VH = 720;
 
 const chrome = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const prof = path.join(os.tmpdir(), 'deskboxes-art-chrome' + (process.env.ART_PORT || ''));
@@ -84,7 +84,7 @@ for (const s of scenes) {
     }
     const mp4 = path.join(RES, s + (th === 'light' ? '_l' : '') + '.mp4');
     execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-framerate', String(fps), '-i', path.join(dir, 'f%04d.png'), '-vf', `scale=${VW}:${VH}:flags=lanczos`,
-      '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '24', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-movflags', '+faststart', '-an', mp4]);
+      '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '26', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-movflags', '+faststart', '-an', mp4]);
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(s, th, n, 'frames', Math.round(fs.statSync(mp4).size / 1024), 'KB');
   }

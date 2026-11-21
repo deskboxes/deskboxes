@@ -123,7 +123,64 @@ pub struct Tab {
     /// The box's background while this tab is open; `None` = the box's own color.
     #[serde(default)]
     pub box_color: Option<Rgba>,
+    /// A folder box's tab: the folder it shows ("" = the box's `folder`, as before tabs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder: String,
+    /// The subfolder this tab is in now ("" = `folder` itself).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder_at: String,
 }
+
+impl Tab {
+    pub fn new(id: u32, title: &str) -> Tab {
+        Tab {
+            id,
+            title: title.to_string(),
+            items: vec![],
+            color: None,
+            box_color: None,
+            folder: String::new(),
+            folder_at: String::new(),
+        }
+    }
+}
+
+/// How a box shows its icons (Explorer's View menu).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// Icons in a grid, the name under each (at the box's icon size).
+    Icons,
+    /// Small icons with the name to the right, in columns.
+    List,
+    /// One row per item: name, date modified, type, size.
+    Details,
+    /// A bigger icon with the name, type and size to the right.
+    Tiles,
+}
+
+impl View {
+    pub fn parse(s: &str) -> View {
+        match s {
+            "list" => View::List,
+            "details" => View::Details,
+            "tiles" => View::Tiles,
+            _ => View::Icons,
+        }
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            View::Icons => "",
+            View::List => "list",
+            View::Details => "details",
+            View::Tiles => "tiles",
+        }
+    }
+}
+
+/// Explorer's icon sizes for a box (DIPs), smallest first: small, medium, large, extra large.
+pub const BOX_ICON_SIZES: [u32; 4] = [32, 48, 96, 256];
+/// The steps Ctrl + mouse wheel goes through in a box, as in a File Explorer window.
+pub const BOX_WHEEL_SIZES: [u32; 9] = [32, 40, 48, 64, 80, 96, 128, 192, 256];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoxModel {
@@ -156,9 +213,20 @@ pub struct BoxModel {
     /// normal box.
     #[serde(default)]
     pub folder: String,
-    /// The subfolder it is showing now ("" = `folder` itself).
+    /// The subfolder it is showing now ("" = `folder` itself). Before folder boxes had tabs;
+    /// each tab keeps its own now (`Tab::folder_at`).
     #[serde(default)]
     pub folder_at: String,
+    /// How it shows its icons: "" = icons, "list", "details" or "tiles" (`View`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view: String,
+    /// Icon size in DIPs for the icons view; 0 = the desktop's size.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub icon_size: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A box's locks: each stops one kind of change by hand (menus still work).
@@ -186,12 +254,56 @@ impl BoxModel {
     pub fn is_folder(&self) -> bool {
         !self.folder.is_empty()
     }
-    /// The folder a folder box is showing now.
+    pub fn view(&self) -> View {
+        View::parse(&self.view)
+    }
+    /// The folder tab `ti` of a folder box shows (its own, or the box's).
+    pub fn tab_root(&self, ti: usize) -> &str {
+        match self.tabs.get(ti) {
+            Some(t) if !t.folder.is_empty() => &t.folder,
+            _ => &self.folder,
+        }
+    }
+    /// The folder tab `ti` is in now (a subfolder of `tab_root`, or it).
+    pub fn tab_now(&self, ti: usize) -> &str {
+        match self.tabs.get(ti) {
+            Some(t) if !t.folder_at.is_empty() => &t.folder_at,
+            Some(t) if ti == 0 && t.folder.is_empty() && !self.folder_at.is_empty() => &self.folder_at,
+            _ => self.tab_root(ti),
+        }
+    }
+    /// Whether tab `ti` is in a subfolder (its back arrow shows).
+    pub fn tab_in_sub(&self, ti: usize) -> bool {
+        let (r, n) = (self.tab_root(ti), self.tab_now(ti));
+        !n.is_empty() && !n.trim_end_matches('\\').eq_ignore_ascii_case(r.trim_end_matches('\\'))
+    }
+    /// The folder the open tab of a folder box shows now.
     pub fn folder_now(&self) -> &str {
-        if self.folder_at.is_empty() {
-            &self.folder
-        } else {
-            &self.folder_at
+        self.tab_now(self.active_tab)
+    }
+    /// The open tab's own folder (where Back stops).
+    pub fn folder_root(&self) -> &str {
+        self.tab_root(self.active_tab)
+    }
+    /// Tab `ti` shows `root`, in its subfolder `at` ("" = root).
+    pub fn set_tab_folder(&mut self, ti: usize, root: &str, at: &str) {
+        if ti == 0 {
+            self.folder_at.clear();
+        }
+        if let Some(t) = self.tabs.get_mut(ti) {
+            t.folder = root.to_string();
+            t.folder_at = at.to_string();
+        }
+    }
+    /// Every tab of a folder box names its folder (older files kept it on the box).
+    pub fn own_folders(&mut self) {
+        if !self.is_folder() {
+            return;
+        }
+        for ti in 0..self.tabs.len() {
+            let (r, n) = (self.tab_root(ti).to_string(), self.tab_now(ti).to_string());
+            let at = if n.eq_ignore_ascii_case(&r) { String::new() } else { n };
+            self.set_tab_folder(ti, &r, &at);
         }
     }
     pub fn title(&self) -> &str {
@@ -238,6 +350,10 @@ pub struct MonitorLayout {
     /// box covers it (until the user moves them).
     #[serde(default)]
     pub homes: BTreeMap<ItemKey, Cell>,
+    /// Folder boxes: the order icons were dragged into (or sorted by), per folder (lowercase
+    /// path). A folder without one is shown folders first, then by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub folder_orders: BTreeMap<String, Vec<ItemKey>>,
 }
 
 /// A sorting rule: icons matching the condition go into tab `target` (a tab id).

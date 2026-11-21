@@ -30,6 +30,8 @@ pub enum Req {
     Folders(Vec<String>),
     /// Undo (`undo`) or redo a file operation.
     UndoFiles { op: FileOp, undo: bool },
+    /// Icons for boxes that show them at `px`: (desktop icon id, parsing name, attributes).
+    IconsAt { px: u32, items: Vec<(u32, String, u32)> },
 }
 
 fn pairs(d: &[fileops::Done]) -> Vec<(String, String)> {
@@ -417,6 +419,7 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
         shield: None,
         next: cfg.first_icon_id,
     };
+    let mut sized: HashMap<u32, IconCache> = HashMap::new();
     let mut first = true;
     let mut batch: Vec<Req> = Vec::new();
     loop {
@@ -555,9 +558,30 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                         next: ic.next,
                     };
                     cache.clear();
+                    sized.clear();
                     // The next scan replaces every icon (as a first scan does).
                     first = true;
                     batch.push(Req::Scan);
+                }
+                Req::IconsAt { px, items } => {
+                    // One cache per size; icon ids come from the one counter.
+                    let c = sized.entry(px).or_insert_with(|| IconCache {
+                        px,
+                        thumb_exts: HashMap::new(),
+                        by_sys: HashMap::new(),
+                        overlays: HashMap::new(),
+                        shield: None,
+                        next: ic.next,
+                    });
+                    c.next = c.next.max(ic.next);
+                    let mut fresh = Vec::new();
+                    let mut map = Vec::with_capacity(items.len());
+                    for (base, parsing, attrs) in items {
+                        let sys = icons::sys_index(&parsing);
+                        map.push((base, c.get_with(&parsing, attrs, sys, &mut fresh)));
+                    }
+                    ic.next = c.next;
+                    post(Ev::IconsAt { px, map, icons: fresh });
                 }
                 Req::InfoTip { key, path } => {
                     let text = icons::info_tip(&path).unwrap_or_default();

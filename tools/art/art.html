@@ -12,7 +12,8 @@ html,body{margin:0;background:#000;overflow:hidden}
 .ui{font-family:'Segoe UI Variable Text','Segoe UI',sans-serif}
 .gl{font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-style:normal;line-height:1}
 .box{position:absolute;border-radius:12px;overflow:hidden}
-.box>.bg{position:absolute;inset:0;backdrop-filter:blur(34px) saturate(1.35)}
+.box>.bg{position:absolute;inset:0;overflow:hidden}
+.wpc{position:absolute;background-repeat:no-repeat;filter:blur(30px) saturate(1.35)}
 .box>.bd{position:absolute;inset:0;border-radius:12px;pointer-events:none}
 .box>.hd{position:absolute;left:0;right:0;top:0;height:54px}
 .ttl{position:absolute;left:0;right:0;top:0;height:54px;display:flex;align-items:center;justify-content:center;font:600 22px 'Segoe UI Variable Display','Segoe UI';white-space:nowrap}
@@ -34,6 +35,8 @@ const SCENE = P.get('scene') || 'tabs', THEME = P.get('theme') || 'dark';
 const D = THEME === 'dark';
 const ACC = D ? '#4CC2FF' : '#0067C0', ACCR = D ? '76,194,255' : '0,103,192';
 const FG = D ? '#FFFFFF' : '#1B1B1B';
+// A soft vignette over the wallpaper.
+const SHADE = D ? 'radial-gradient(ellipse at 50% 45%,rgba(0,0,0,.05),rgba(0,0,0,.32))' : 'radial-gradient(ellipse at 50% 45%,rgba(255,255,255,0),rgba(255,255,255,.18))';
 
 // ---------- time ----------
 const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
@@ -82,17 +85,29 @@ function item(n, x, y, o = {}) {
   let ic = '';
   if (pv < 1) {
     ic += `<img src="${SRC(n)}" style="${pv || o.blend ? `opacity:${(1 - pv) * (1 - (o.blend || 0))};` : ''}">`;
-    if (o.blend) ic += `<img src="${SRC(n)}" style="filter:grayscale(1) contrast(.85) brightness(${D ? 1.25 : 1.05});mix-blend-mode:luminosity;opacity:${o.blend}">`;
+    // Blending in, as the app does it (iconfx.rs): a copy in shades of the wallpaper's color right
+    // behind it, see-through (GHOST_A); its filter is made once that color is known (blendFix).
+    if (o.blend) ic += `<img class="ghost" src="${SRC(n)}" style="opacity:${(1 - pv) * o.blend * .78}">`;
     if (o.tint) ic += `<div class="abs" style="inset:0;background:${o.tint};-webkit-mask:url('${SRC(n)}') center/contain no-repeat;mix-blend-mode:color"></div>`;
   }
   if (pv) ic += `<div class="abs" style="inset:8px;border-radius:14px;border:3px dashed ${o.wl || D ? 'rgba(255,255,255,.7)' : 'rgba(0,0,0,.4)'};opacity:${pv}"></div>`;
-  const label = pv < 1 ? `<div class="lb ${lc}" style="${lc ? '' : `color:${FG};`}${pv ? `opacity:${1 - pv};` : ''}">${NAME(n)}</div>` : '';
+  const label = pv < 1 ? `<div class="lb ${lc}"${o.blend ? ` data-b="${o.blend}" data-o="${1 - pv}"` : ''} style="${lc ? '' : `color:${FG};`}${pv ? `opacity:${1 - pv};` : ''}">${NAME(n)}</div>` : '';
   const dash = pv ? `<div class="abs" style="left:34px;right:34px;top:116px;height:7px;border-radius:4px;background:${o.wl || D ? 'rgba(255,255,255,.8)' : 'rgba(0,0,0,.45)'};opacity:${pv}"></div>` : '';
   return `<div class="it ui" style="left:${x}px;top:${y}px;${sel}${ring}${op !== 1 ? `opacity:${op};` : ''}${tr}"><div class="ic">${ic}</div>${label}${dash}</div>`;
 }
 // Icons in rows of `cols`; f(i) gives each one's options.
 function grid(names, cols, f = () => ({}), dx = 0, dy = 0) {
   return names.map((n, i) => item(n, PX + (i % cols) * CW + dx, PY + Math.floor(i / cols) * CH + dy, f(i, n))).join('');
+}
+// The wallpaper under a box at x, y, blurred, as the app fills a box (a copy of the picture's own
+// wallpaper and its shade, lined up with it through the camera; CSS backdrop-filter is lost when
+// Chrome renders without a GPU). M: margin, so the blur has no faded edge.
+let CAM = null;
+function wpCopy(x, y) {
+  const c = CAM, M = 120, l = -c.tx / c.k - x - M, t = -c.ty / c.k - y - M;
+  const pos = `left:${l}px;top:${t}px;width:${c.W / c.k + 2 * M}px;height:${c.H / c.k + 2 * M}px`;
+  return `<div class="wpc" style="${pos};background-image:url(wp_${THEME}.jpg);background-size:${c.sz / c.k}px auto;background-position:${c.px / c.k + M}px ${c.py / c.k + M}px"></div>` +
+    `<div class="abs" style="${pos};background:${SHADE}"></div>`;
 }
 // A box. o: x, y, w, h, title | tabs [{n, c, w}], active, tabHover, tint, op (glass), items, cols, f, body (html), roll (0..1),
 // left (title on the left), lead (glyph before the title), btns [glyphs on the right], btnColor, z, scale, alpha, ghost, style
@@ -124,7 +139,7 @@ function box(o) {
   const sh = o.shadow ?? 1;
   const tr = o.scale && o.scale !== 1 ? `transform:scale(${o.scale});transform-origin:${o.origin || 'center'};` : '';
   return `<div class="box ui" style="left:${o.x}px;top:${o.y}px;width:${o.w}px;height:${h}px;box-shadow:0 26px 64px rgba(0,0,0,${(D ? .4 : .2) * sh}),0 3px 10px rgba(0,0,0,${.14 * sh});${o.z ? 'z-index:' + o.z + ';' : ''}${o.alpha !== undefined ? 'opacity:' + o.alpha + ';' : ''}${tr}${o.style || ''}">
-   <div class="bg" style="background:${boxBg(o.tint, o.op ?? 1)}"></div>
+   <div class="bg">${wpCopy(o.x, o.y)}<div class="abs" style="inset:0;background:${boxBg(o.tint, o.op ?? 1)}"></div></div>
    <div class="hd" style="background:${head}"></div>${body}${hd}${o.extra || ''}
    <div class="bd" style="box-shadow:inset 0 0 0 ${o.lineW || 1.5}px ${line}"></div></div>`;
 }
@@ -381,21 +396,31 @@ S.hide = { dur: 4.6, wp: [1900, -240, -380], cam: [100, 110, 1400, 788], draw: t
     box({ x: 170, y: 600, w: bw(4), h: bh(1), title: 'Folders', items: FOLDERS.slice(5, 9) }) + `</div>` + p.html;
 } };
 
-S.saved = { dur: 4.6, wp: [1900, -300, -330], cam: [100, 110, 1440, 810], draw: t => {
-  // A saved layout brings the boxes back where they were (here after they were pushed together).
-  const home = [[160, 160], [820, 160], [160, 590]], mess = [[250, 210], [400, 290], [540, 380]];
-  const go = i => io(seg(t, .55 + i * .1, 1.35 + i * .1)), away = i => io(seg(t, 2.6 + i * .08, 3.2 + i * .08));
-  const pos = i => mix(mix(mess[i], home[i], go(i)), mess[i], away(i));
-  const back = kf(t, [[0, 0], [.55, 0], [1.55, 1], [2.6, 1], [3.3, 0]]);
-  const menuA = kf(t, [[0, 1], [.5, 1], [.8, 0], [3.4, 0], [3.8, 1]]);
-  const M = [1150, 560], row = [M[0] + 150, M[1] + 32];
-  const p = pointer(t, [[0, ...row], [.6, ...row], [1.2, 1260, 830], [3.3, 1260, 830], [4.0, ...row]], [.45]);
-  const rows = ['2026-11-20 12:40', '2026-11-19 17:15', '2026-11-18 09:30'].map((s, i) =>
-    `<div style="height:46px;margin:0 6px;border-radius:6px;display:flex;align-items:center;gap:14px;padding-left:14px;${i === 0 ? `background:${D ? 'rgba(255,255,255,.09)' : 'rgba(0,0,0,.05)'}` : ''}"><span class="gl" style="font-size:18px;opacity:.85"></span><span style="font:400 19px 'Segoe UI Variable Text'">${s}</span></div>`).join('');
-  const menu = card(M[0], M[1], 340, 158, `<div style="padding-top:6px">${rows}</div>`, `opacity:${menuA};border-radius:8px`);
-  const ghost = (x, y, w, h) => `<div class="abs" style="left:${x}px;top:${y}px;width:${w}px;height:${h}px;border-radius:12px;border:3px dashed rgba(${ACCR},.95);background:rgba(${ACCR},.10);box-sizing:border-box;opacity:${1 - back}"></div>`;
+S.saved = { dur: 6, wp: [1900, -300, -330], cam: [110, 120, 1300, 760], draw: t => {
+  // The boxes get jumbled; picking a saved layout in the menu brings them back where they were.
+  // Starts and ends as the still: the boxes in place, the menu open on the newest layout.
+  const home = [[160, 160], [820, 160], [160, 590]], mess = [[330, 250], [560, 330], [430, 470]];
+  const jumble = i => io(seg(t, 1.25 + i * .12, 2.05 + i * .12)), back = i => io(seg(t, 3.65 + i * .07, 4.45 + i * .07));
+  const pos = i => mix(mix(home[i], mess[i], jumble(i)), home[i], back(i));
+  const menuA = kf(t, [[0, 1], [.85, 1], [1.1, 0], [2.85, 0], [3.1, 1], [3.55, 1], [3.75, 0], [5.25, 0], [5.6, 1]]);
+  const M = [880, 560], RW = 440, RH = 56;
+  const rowY = i => M[1] + 8 + RH + RH + 11 + i * RH + RH / 2, row = [M[0] + 200, rowY(0) + 4];
+  const aside = [1280, 470];
+  const p = pointer(t, [[0, ...row], [.9, ...row], [1.4, ...aside], [2.6, ...aside], [3.15, ...row], [5.2, ...row]], [3.45]);
+  const hl = D ? 'rgba(255,255,255,.09)' : 'rgba(0,0,0,.055)';
+  const r = (g, s, on, extra = '') => `<div style="height:${RH}px;margin:0 6px;border-radius:6px;display:flex;align-items:center;gap:16px;padding-left:16px;${on ? `background:${hl};` : ''}${extra}"><span class="gl" style="font-size:20px;opacity:.85;width:22px">${g}</span><span style="font:400 21px 'Segoe UI Variable Text'">${s}</span></div>`;
+  const pick = t < 1.1 || t > 3.1;
+  const inner = `<div style="padding-top:8px">` +
+    `<div style="height:${RH}px;display:flex;align-items:center;gap:14px;padding-left:22px;font:600 22px 'Segoe UI Variable Display'"><span class="gl" style="font-size:20px;color:${ACC}">\uE81C</span>Saved layouts</div>` +
+    r('\uE74E', 'Save the layout now', false) +
+    `<div style="height:1px;margin:5px 0;background:${D ? 'rgba(255,255,255,.1)' : 'rgba(0,0,0,.08)'}"></div>` +
+    ['Today, 12:40', 'Yesterday, 17:15', 'Nov 18, 09:30'].map((s, i) => r('\uE823', s, i === 0 && pick)).join('') + `</div>`;
+  const menu = card(M[0], M[1], RW, 8 + 2 * RH + 11 + 3 * RH + 10, inner, `opacity:${menuA};border-radius:10px`);
+  // Where each box goes, while it goes there.
+  const gA = kf(t, [[0, 0], [3.4, 0], [3.6, 1], [4.4, 1], [4.85, 0]]);
+  const ghost = (x, y, w, h) => gA > 0 ? `<div class="abs" style="left:${x}px;top:${y}px;width:${w}px;height:${h}px;border-radius:12px;border:3px dashed rgba(${ACCR},.95);background:rgba(${ACCR},.12);box-sizing:border-box;opacity:${gA}"></div>` : '';
   const [a, b, c] = [0, 1, 2].map(pos);
-  return ghost(160, 160, bw(4), bh(2)) + ghost(820, 160, bw(3), bh(2)) + ghost(160, 590, bw(4), bh(1)) +
+  return glow(700, 450, 600, D ? .16 : .12) + ghost(160, 160, bw(4), bh(2)) + ghost(820, 160, bw(3), bh(2)) + ghost(160, 590, bw(4), bh(1)) +
     box({ x: a[0], y: a[1], w: bw(4), h: bh(2), title: 'Apps', items: APPS, z: 1 }) +
     box({ x: b[0], y: b[1], w: bw(3), h: bh(2), cols: 3, title: 'Documents', items: DOCS.slice(0, 6), z: 2 }) +
     box({ x: c[0], y: c[1], w: bw(4), h: bh(1), title: 'Folders', tint: 'amber', items: FOLDERS.slice(5, 9), z: 3 }) + `<div class="abs" style="left:0;top:0;z-index:20">${menu}</div>` + p.html;
@@ -452,7 +477,7 @@ const [ws, wx, wy] = sc.wp;
 wpEl.style.backgroundImage = `url(wp_${THEME}.jpg)`;
 wpEl.style.backgroundSize = ws + 'px auto';
 wpEl.style.backgroundPosition = `${wx}px ${wy}px`;
-document.getElementById('shade').style.background = D ? 'radial-gradient(ellipse at 50% 45%,rgba(0,0,0,.05),rgba(0,0,0,.32))' : 'radial-gradient(ellipse at 50% 45%,rgba(255,255,255,0),rgba(255,255,255,.18))';
+document.getElementById('shade').style.background = SHADE;
 const content = document.getElementById('content');
 content.style.width = W + 'px'; content.style.height = H + 'px';
 // The camera: the scene's `cam` fills the picture; the wallpaper moves a little with it.
@@ -462,7 +487,66 @@ content.style.transform = `translate(${W / 2 - (cx + cw / 2) * k}px,${H / 2 - (c
 const z = 1 + (k - 1) * .3;
 wpEl.style.backgroundSize = ws * z + 'px auto';
 wpEl.style.backgroundPosition = `${wx * z + (1 - z) * W / 2}px ${wy * z + (1 - z) * H / 2}px`;
+CAM = { k, tx: W / 2 - (cx + cw / 2) * k, ty: H / 2 - (cy + ch / 2) * k, sz: ws * z, px: wx * z + (1 - z) * W / 2, py: wy * z + (1 - z) * H / 2, W, H };
+
+// ---------- blending in (iconfx.rs) ----------
+// The wallpaper as shown, to read the color behind an icon from (the app's wall_color_at).
+let WALL = null;
+function wallAt(x, y) {
+  const R = 24, s = [0, 0, 0];
+  let n = 0;
+  for (let j = -R; j <= R; j += 8) for (let i = -R; i <= R; i += 8) {
+    const u = Math.round(clamp(x + i, 0, W - 1)), v = Math.round(clamp(y + j, 0, H - 1)), o = 4 * (v * W + u);
+    s[0] += WALL[o]; s[1] += WALL[o + 1]; s[2] += WALL[o + 2]; n++;
+  }
+  return s.map(c => c / n / 255);
+}
+const mixc = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t), WHITE = [1, 1, 1];
+// Lightness 0, .25, .5, .75, 1 → the wallpaper color, darker and lighter (blend_ramp).
+const blendRamp = c => [c.map(v => v * .62), c.map(v => v * .84), mixc(c, WHITE, .10), mixc(c, WHITE, .28), mixc(c, WHITE, .52)];
+const fxSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+fxSvg.setAttribute('style', 'position:absolute;width:0;height:0');
+document.body.appendChild(fxSvg);
+const made = new Set();
+function ghostFilter(c) {
+  const q = c.map(v => Math.round(v * 255 / 4) * 4);
+  const id = 'g' + q.map(v => Math.min(255, v).toString(16).padStart(2, '0')).join('');
+  if (!made.has(id)) {
+    made.add(id);
+    const r = blendRamp(q.map(v => Math.min(255, v) / 255));
+    const fn = ch => `<feFunc${'RGB'[ch]} type="table" tableValues="${r.map(x => x[ch].toFixed(4)).join(' ')}"/>`;
+    fxSvg.innerHTML += `<filter id="${id}" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values=".299 .587 .114 0 0 .299 .587 .114 0 0 .299 .587 .114 0 0 0 0 0 1 0"/><feComponentTransfer>${fn(0)}${fn(1)}${fn(2)}</feComponentTransfer></filter>`;
+  }
+  return id;
+}
+// The drawn frame's blended icons and names take the color behind them.
+function blendFix() {
+  for (const g of content.querySelectorAll('img.ghost')) {
+    const b = g.getBoundingClientRect();
+    g.style.filter = `url(#${ghostFilter(wallAt(b.x + b.width / 2, b.y + b.height / 2))})`;
+  }
+  for (const l of content.querySelectorAll('.lb[data-b]')) {
+    const t = +l.dataset.b, b = l.parentElement.querySelector('.ic').getBoundingClientRect();
+    const c = wallAt(b.x + b.width / 2, b.y + b.height / 2);
+    const white = l.classList.contains('wl');
+    const text = white ? WHITE : [27 / 255, 27 / 255, 27 / 255];
+    const m = mixc(text, white ? mixc(c, WHITE, .55) : c.map(v => v * .45), t).map(v => Math.round(v * 255));
+    l.style.color = `rgb(${m})`;
+    const s = 1 - .85 * t;
+    if (white) l.style.textShadow = `0 1px 2px rgba(0,0,0,${.8 * s}),0 0 6px rgba(0,0,0,${.35 * s})`;
+    l.style.opacity = +l.dataset.o * (1 - .3 * t);
+  }
+}
+
 window.META = { w: W, h: H, dur: sc.dur || 0 };
-window.frame = t => { content.innerHTML = sc.draw(t); return Promise.all([...content.querySelectorAll('img')].map(i => i.decode().catch(() => 0))); };
-window.ready = Promise.all([document.fonts.ready, new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = `wp_${THEME}.jpg`; })]).then(() => frame(+(P.get('t') || 0)));
+window.frame = t => { content.innerHTML = sc.draw(t); blendFix(); return Promise.all([...content.querySelectorAll('img')].map(i => i.decode().catch(() => 0))); };
+const wpImg = new Image();
+window.ready = Promise.all([document.fonts.ready, new Promise(r => { wpImg.onload = wpImg.onerror = r; wpImg.src = `wp_${THEME}.jpg`; })]).then(() => {
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  if (wpImg.naturalWidth) g.drawImage(wpImg, CAM.px, CAM.py, CAM.sz, CAM.sz * wpImg.naturalHeight / wpImg.naturalWidth);
+  try { WALL = g.getImageData(0, 0, W, H).data; } catch { WALL = new Uint8ClampedArray(W * H * 4).fill(96); }
+  return frame(+(P.get('t') || 0));
+});
 </script></body></html>

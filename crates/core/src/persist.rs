@@ -40,7 +40,12 @@ pub fn layout_path(dir: &Path, topology: &str) -> PathBuf {
 pub fn load_layout(dir: &Path, topology: &str) -> Option<MonitorLayout> {
     let b = std::fs::read(layout_path(dir, topology)).ok()?;
     let l: Layout = serde_json::from_slice(&b).ok()?;
-    (l.schema == LAYOUT_SCHEMA).then_some(l.monitor)
+    (l.schema == LAYOUT_SCHEMA).then_some(l.monitor).map(|mut m| {
+        for b in &mut m.boxes {
+            b.own_folders();
+        }
+        m
+    })
 }
 
 pub fn save_layout(dir: &Path, topology: &str, m: &MonitorLayout) -> std::io::Result<()> {

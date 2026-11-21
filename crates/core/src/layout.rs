@@ -4,7 +4,7 @@
 
 use crate::geom::{Cell, Grid, Rect};
 use crate::model::*;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub fn alloc_id(l: &mut MonitorLayout) -> u32 {
     l.next_id = l.next_id.max(1) + 1;
@@ -112,6 +112,43 @@ pub fn move_to_grid(l: &mut MonitorLayout, keys: &[ItemKey], target: Cell, g: &G
         cursor = g.index_of(c) + 1;
         taken.insert(c);
         l.loose.insert(k.clone(), c);
+    }
+}
+
+/// Put items into the loose grid at `at`, as Explorer inserts between icons: the icons from
+/// `at` on (column by column) move along to make room, up to the first free cells; cells under
+/// boxes are skipped.
+pub fn insert_in_grid(l: &mut MonitorLayout, keys: &[ItemKey], at: Cell, g: &Grid) {
+    remove_everywhere(l, keys);
+    let by_cell: HashMap<Cell, ItemKey> = l.loose.iter().map(|(k, c)| (*c, k.clone())).collect();
+    let mut queue: std::collections::VecDeque<ItemKey> = keys.iter().cloned().collect();
+    let total = g.cols * g.rows;
+    let mut n = g.index_of(Cell { col: at.col.clamp(0, g.cols - 1), row: at.row.clamp(0, g.rows - 1) });
+    while let Some(k) = queue.pop_front() {
+        // Past the last cell: whatever is left goes to free cells from the start.
+        if n >= total {
+            queue.push_front(k);
+            let rest: Vec<ItemKey> = queue.into_iter().collect();
+            let mut taken = occupied(l);
+            for k in rest {
+                let c = free_cell(l, g, 0, &taken).unwrap_or(Cell { col: g.cols - 1, row: g.rows - 1 });
+                taken.insert(c);
+                l.loose.insert(k, c);
+            }
+            return;
+        }
+        let c = g.nth(n);
+        n += 1;
+        if blocked_by_boxes(l, g, c) {
+            queue.push_front(k);
+            continue;
+        }
+        if let Some(o) = by_cell.get(&c) {
+            if !keys.contains(o) {
+                queue.push_back(o.clone());
+            }
+        }
+        l.loose.insert(k, c);
     }
 }
 
@@ -331,13 +368,8 @@ pub fn create_box(l: &mut MonitorLayout, rect: Rect, title: &str, style: BoxStyl
         id,
         rect,
         style,
-        tabs: vec![Tab {
-            id: tab,
-            title: title.to_string(),
-            items: vec![],
-            color: None,
-            box_color: None,
-        }],
+        tabs: vec![Tab::new(tab, title)],
+
         active_tab: 0,
         rolled_up: false,
         locks: Default::default(),
@@ -347,6 +379,8 @@ pub fn create_box(l: &mut MonitorLayout, rect: Rect, title: &str, style: BoxStyl
         stay_visible: false,
         folder: String::new(),
         folder_at: String::new(),
+        view: String::new(),
+        icon_size: 0,
     });
     id
 }
@@ -356,6 +390,7 @@ pub fn create_folder_box(l: &mut MonitorLayout, rect: Rect, title: &str, style: 
     let id = create_box(l, rect, title, style);
     if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id) {
         b.folder = folder.to_string();
+        b.set_tab_folder(0, folder, "");
     }
     id
 }
@@ -383,8 +418,11 @@ pub fn delete_box(l: &mut MonitorLayout, box_id: u32, g: &Grid) -> bool {
 
 /// Combine `src` into `dst` as tabs (a tab pair from two boxes). `src` disappears.
 pub fn combine(l: &mut MonitorLayout, src: u32, dst: u32) -> bool {
-    if src == dst || l.boxes.iter().any(|b| (b.id == src || b.id == dst) && b.is_folder()) {
+    if src == dst || !same_kind(l, src, dst) {
         return false;
+    }
+    for b in l.boxes.iter_mut().filter(|b| b.id == src || b.id == dst) {
+        b.own_folders();
     }
     let Some(si) = l.boxes.iter().position(|b| b.id == src) else { return false };
     if !l.boxes.iter().any(|b| b.id == dst) {
@@ -398,20 +436,41 @@ pub fn combine(l: &mut MonitorLayout, src: u32, dst: u32) -> bool {
     true
 }
 
-/// A new empty tab at the end of a box, made active. Returns its index.
+/// Both boxes are folder boxes, or neither is (their tabs can be put together).
+pub fn same_kind(l: &MonitorLayout, a: u32, b: u32) -> bool {
+    let kind = |id: u32| l.boxes.iter().find(|x| x.id == id).map(|x| x.is_folder());
+    matches!((kind(a), kind(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// A new empty tab at the end of a box, made active. Returns its index. In a folder box it shows
+/// the open tab's folder, as a new tab does in File Explorer.
 pub fn add_tab(l: &mut MonitorLayout, box_id: u32, title: &str) -> Option<usize> {
     l.boxes.iter().position(|b| b.id == box_id)?;
     let id = alloc_id(l);
     let b = l.boxes.iter_mut().find(|b| b.id == box_id)?;
-    b.tabs.push(Tab {
-        id,
-        title: title.to_string(),
-        items: vec![],
-        color: None,
-        box_color: None,
-    });
+    let folder = b.is_folder().then(|| b.folder_root().to_string());
+    b.own_folders();
+    b.tabs.push(Tab::new(id, title));
     b.active_tab = b.tabs.len() - 1;
+    if let Some(f) = folder {
+        let ti = b.active_tab;
+        b.set_tab_folder(ti, &f, "");
+    }
     Some(b.active_tab)
+}
+
+/// A folder box: a new tab showing `folder` (a folder in it), made active, after the open tab.
+pub fn open_in_new_tab(l: &mut MonitorLayout, box_id: u32, folder: &str) -> Option<usize> {
+    l.boxes.iter().position(|b| b.id == box_id && b.is_folder())?;
+    let id = alloc_id(l);
+    let b = l.boxes.iter_mut().find(|b| b.id == box_id)?;
+    b.own_folders();
+    let (root, title) = (b.folder_root().to_string(), b.title().to_string());
+    let at = (b.active_tab + 1).min(b.tabs.len());
+    b.tabs.insert(at, Tab::new(id, &title));
+    b.active_tab = at;
+    b.set_tab_folder(at, &root, folder);
+    Some(at)
 }
 
 /// Remove a tab; its items return to the grid (files are never touched). The last tab removes
@@ -424,10 +483,15 @@ pub fn remove_tab(l: &mut MonitorLayout, box_id: u32, tab_ix: usize, g: &Grid) -
     if tab_ix >= l.boxes[bi].tabs.len() {
         return false;
     }
+    l.boxes[bi].own_folders();
     let t = l.boxes[bi].tabs.remove(tab_ix);
     let b = &mut l.boxes[bi];
     if b.active_tab > tab_ix || b.active_tab >= b.tabs.len() {
         b.active_tab = b.active_tab.saturating_sub(1);
+    }
+    // A folder box's items are in its folders, not on the desktop.
+    if b.is_folder() {
+        return true;
     }
     let mut taken = occupied(l);
     let mut cursor = 0;
@@ -456,12 +520,16 @@ pub fn move_tab(l: &mut MonitorLayout, box_id: u32, from: usize, to: usize) -> b
 
 /// Move one tab of `src` into `dst` (at the end, made active). A box left without tabs goes.
 pub fn move_tab_to_box(l: &mut MonitorLayout, src: u32, tab_ix: usize, dst: u32) -> bool {
-    if src == dst || !l.boxes.iter().any(|b| b.id == dst) {
+    if src == dst || !l.boxes.iter().any(|b| b.id == dst) || !same_kind(l, src, dst) {
         return false;
     }
     let Some(si) = l.boxes.iter().position(|b| b.id == src) else { return false };
     if tab_ix >= l.boxes[si].tabs.len() {
         return false;
+    }
+    l.boxes[si].own_folders();
+    if let Some(d) = l.boxes.iter_mut().find(|b| b.id == dst) {
+        d.own_folders();
     }
     let t = l.boxes[si].tabs.remove(tab_ix);
     if l.boxes[si].tabs.is_empty() {
@@ -484,10 +552,14 @@ pub fn split_tab(l: &mut MonitorLayout, box_id: u32, tab_ix: usize, rect: Rect) 
     if l.boxes[bi].tabs.len() < 2 || tab_ix >= l.boxes[bi].tabs.len() {
         return None;
     }
+    l.boxes[bi].own_folders();
     let tab = l.boxes[bi].tabs.remove(tab_ix);
     let b = &mut l.boxes[bi];
     b.active_tab = b.active_tab.min(b.tabs.len() - 1);
     let style = b.style.clone();
+    // The new box is the same kind (a folder box's tab stays a folder box) and shows its icons
+    // the same way.
+    let (folder, view, icon_size) = (if b.is_folder() { tab.folder.clone() } else { String::new() }, b.view.clone(), b.icon_size);
     let id = alloc_id(l);
     l.boxes.push(BoxModel {
         id,
@@ -501,8 +573,10 @@ pub fn split_tab(l: &mut MonitorLayout, box_id: u32, tab_ix: usize, rect: Rect) 
         tint: String::new(),
         blend: String::new(),
         stay_visible: false,
-        folder: String::new(),
+        folder,
         folder_at: String::new(),
+        view,
+        icon_size,
     });
     Some(id)
 }
@@ -747,6 +821,28 @@ mod tests {
         create_box(&mut l, Rect::new(225.0, 200.0, 225.0, 100.0), "B", BoxStyle::default());
         assert!(settle(&mut l, &g));
         assert_eq!((l.loose[&k[0]], l.loose[&k[1]], l.loose[&k[2]]), (cell(3, 3), cell(4, 3), cell(5, 3)));
+    }
+
+    #[test]
+    fn insert_between_icons_moves_the_rest_along() {
+        let g = grid();
+        let mut l = MonitorLayout::default();
+        let k = keys(6);
+        // a column: k0..k2 at rows 0-2, row 3 free, k3 at row 4; k4 elsewhere; k5 dragged in
+        for (i, r) in [0, 1, 2, 4].iter().enumerate() {
+            l.loose.insert(k[i].clone(), Cell { col: 0, row: *r });
+        }
+        l.loose.insert(k[4].clone(), Cell { col: 3, row: 0 });
+        l.loose.insert(k[5].clone(), Cell { col: 5, row: 0 });
+        insert_in_grid(&mut l, &k[5..6], Cell { col: 0, row: 1 }, &g);
+        assert_eq!(l.loose[&k[0]], Cell { col: 0, row: 0 });
+        assert_eq!(l.loose[&k[5]], Cell { col: 0, row: 1 });
+        assert_eq!(l.loose[&k[1]], Cell { col: 0, row: 2 });
+        assert_eq!(l.loose[&k[2]], Cell { col: 0, row: 3 });
+        // the gap took the last one: the icon after it stays
+        assert_eq!(l.loose[&k[3]], Cell { col: 0, row: 4 });
+        assert_eq!(l.loose[&k[4]], Cell { col: 3, row: 0 });
+        assert_eq!(l.loose.len(), 6);
     }
 
     #[test]

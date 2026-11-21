@@ -75,6 +75,7 @@ impl App {
         for (k, cell, in_box) in &cells {
             self.prep_label(k, *cell, *in_box);
         }
+        self.request_sized_icons(&cells);
         if self.prep_gen != self.items_gen {
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 60, None);
@@ -84,19 +85,22 @@ impl App {
 
     /// A label's layout and its shadow bitmap, made once.
     fn prep_label(&mut self, k: &ItemKey, cell: Rect, in_box: Option<u32>) {
-        let full = self.is_full_label(k);
-        let _ = self.label_layout(k, cell.w - 4.0, full);
-        let _ = self.label_layout(k, cell.w - 4.0, false);
+        let m = self.metrics_of(in_box);
+        let (w, full, row) = self.label_spec(k, cell, &m);
+        let _ = self.label_for(k, w, full, row);
+        if !row {
+            let _ = self.label_layout(k, w, false);
+        }
         let light_box = in_box.and_then(|id| self.box_by_id(id)).map(|b| self.box_is_light(b)).unwrap_or(false);
         if light_box {
             return;
         }
         for f in [full, false] {
-            let key = (k.clone(), f, (cell.w - 4.0) as i32);
+            let key = App::lkey(k, w, f, row);
             if !self.label_bmps.contains_key(&key) {
                 if let Some(l) = self.labels.get(&key) {
                     let h = r::text_height(l);
-                    match self.gpu.shadowed_label(l, cell.w - 4.0, h, self.scale, Self::desktop_theme().text) {
+                    match self.gpu.shadowed_label(l, w, h, self.scale, Self::desktop_theme().text) {
                         Ok(b) => {
                             self.label_bmps.insert(key, b);
                         }
@@ -113,7 +117,9 @@ impl App {
         let t = Instant::now();
         let gen = self.items_gen;
         for (k, cell, in_box) in self.visible_cells() {
-            if self.labels.contains_key(&(k.clone(), false, (cell.w - 4.0) as i32)) {
+            let m = self.metrics_of(in_box);
+            let (w, _, row) = self.label_spec(&k, cell, &m);
+            if self.labels.contains_key(&App::lkey(&k, w, false, row)) {
                 continue;
             }
             self.prep_label(&k, cell, in_box);
@@ -176,17 +182,19 @@ impl App {
     fn paint_ghost(&self, dc: &Dc, keys: &[ItemKey], dx: f32, dy: f32, alpha: f32) -> r::R<()> {
         let ghost_text = Color { a: (1.25 * alpha).min(1.0), ..Self::desktop_theme().text };
         let set: std::collections::HashSet<&ItemKey> = keys.iter().collect();
-        for (k, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
-            let (icon, label) = self.item_parts(k, *cell, false);
+        for (k, cell, bx) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
+            let m = self.metrics_of(*bx);
+            let (icon, label) = self.item_parts(k, *cell, false, &m);
             if self.privacy_on() {
                 let name = self.items.get(k).map(|i| i.display_name.as_str()).unwrap_or("");
                 self.paint_private(dc, name, icon.offset(dx, dy), label.offset(dx, dy), cell.offset(dx, dy), &Self::desktop_theme(), true, alpha)?;
                 continue;
             }
-            if let Some(bmp) = self.items.get(k).and_then(|i| self.bitmaps.get(&i.icon)) {
+            if let Some((_, bmp)) = self.items.get(k).and_then(|i| self.icon_bitmap(i, &m)) {
                 r::draw_bitmap(dc, bmp, rf(fit_icon(bmp, icon).offset(dx, dy)), alpha);
             }
-            let lk = (k.clone(), false, (cell.w - 4.0) as i32);
+            let (lw, _, row) = self.label_spec(k, *cell, &m);
+            let lk = App::lkey(k, lw, false, row);
             if let (Some(b), Some(l)) = (self.label_bmps.get(&lk), self.labels.get(&lk)) {
                 let sz = unsafe { b.GetPixelSize() };
                 let m = r::LABEL_MARGIN;
@@ -251,10 +259,11 @@ impl App {
             return Ok(());
         }
         let dt = Self::desktop_theme();
+        let desk = self.metrics(None);
         for (k, c) in self.loose_view().iter() {
             if self.items.contains_key(k) {
                 let fx = self.icon_fx(None, k);
-                self.paint_item(dc, k, self.grid.cell_rect(*c), &dt, true, 1.0, fx)?;
+                self.paint_item(dc, k, self.grid.cell_rect(*c), &dt, true, 1.0, fx, &desk)?;
             }
         }
         Ok(())
@@ -278,19 +287,38 @@ impl App {
     fn paint_drop_feedback(&self, dc: &Dc, cells: &[(ItemKey, Rect, Option<u32>)], cur: Pt, onto: Option<ItemKey>, own: bool) -> r::R<()> {
         let (ar, ag, ab) = accent();
         if let Some(t) = onto {
-            if let Some((_, cell, _)) = cells.iter().find(|(k, _, _)| *k == t) {
-                let hr = self.hit_rect(&t, *cell);
+            if let Some((_, cell, bx)) = cells.iter().find(|(k, _, _)| *k == t) {
+                let hr = self.hit_rect(&t, *cell, &self.metrics_of(*bx));
                 r::fill_rect(dc, rf(hr), rgba(ar, ag, ab, 0.35))?;
                 r::stroke_round(dc, rf(hr.inflate(-0.5)), 0.0, rgba(ar, ag, ab, 0.9), 1.0)?;
             }
         } else if let Some(b) = self.drop_box(cur).and_then(|id| self.box_by_id(id)) {
             r::stroke_round(dc, rf(b.rect), radius(), rgba(ar, ag, ab, 0.9), 2.0)?;
-            if own && self.fully_open(b) && cur.y >= b.rect.y + header_h() && !b.az && !b.is_folder() {
+            // Where our icons go: a box's own order (a folder box's, for its own icons).
+            let ours = match &self.drag {
+                Drag::Items { keys, .. } => !b.is_folder() || self.folder_box_owns(b, keys),
+                _ => !b.is_folder(),
+            };
+            if own && ours && self.fully_open(b) && cur.y >= App::content_rect(b).y && !b.az {
                 let (_, at) = self.box_drop_slot(b, cur);
                 let c = App::content_rect(b);
+                let m = self.metrics(Some(b));
                 r::push_clip(dc, rf(c));
-                r::fill_round(dc, rf(Rect::new(at.x - 1.5, at.y + 6.0, 3.0, self.grid.cell_h - 14.0)), 1.5, rgba(ar, ag, ab, 1.0))?;
+                let line = if m.row() && self.box_cols(b) == 1 {
+                    Rect::new(at.x + 4.0, at.y - 1.5, m.cell_w - 8.0, 3.0)
+                } else if m.row() {
+                    Rect::new(at.x - 1.5, at.y + 3.0, 3.0, m.cell_h - 6.0)
+                } else {
+                    Rect::new(at.x - 1.5, at.y + 6.0, 3.0, m.cell_h - 14.0)
+                };
+                r::fill_round(dc, rf(line), 1.5, rgba(ar, ag, ab, 1.0))?;
                 r::pop_clip(dc);
+            }
+        } else if let (true, Drag::Items { keys, .. }) = (own, &self.drag) {
+            // In between icons on the desktop: a line where they go.
+            if let Some(at) = self.grid_insert_at(cur, keys) {
+                let r0 = self.grid.cell_rect(at);
+                r::fill_round(dc, rf(Rect::new(r0.x + 8.0, r0.y - 1.5, r0.w - 16.0, 3.0)), 1.5, rgba(ar, ag, ab, 1.0))?;
             }
         }
         Ok(())
@@ -327,6 +355,7 @@ impl App {
             // Loose items (where they settle while a box is dragged, gliding there). The selected
             // icon's whole name goes over the icons below it, always (Explorer's): drawn last.
             let mut last = None;
+            let desk = self.metrics(None);
             for (k, c) in self.loose_view().iter() {
                 if self.items.contains_key(k) {
                     let cell = self.glided(k, self.grid.cell_rect(*c));
@@ -335,17 +364,27 @@ impl App {
                         continue;
                     }
                     let fx = self.icon_fx(None, k);
-                    self.paint_item(dc, k, cell, &dt, true, 1.0, fx)?;
+                    self.paint_item(dc, k, cell, &dt, true, 1.0, fx, &desk)?;
                 }
             }
             if let Some((k, cell)) = last {
                 let fx = self.icon_fx(None, &k);
-                self.paint_item(dc, &k, cell, &dt, true, 1.0, fx)?;
+                self.paint_item(dc, &k, cell, &dt, true, 1.0, fx, &desk)?;
             }
             self.paint_vanishing(dc, None, &dt, true)?;
             if ta < 0.998 {
                 r::pop_layer(dc);
             }
+        }
+        // A selection band started on the desktop goes behind the boxes: it selects only loose
+        // icons, and this shows it.
+        let band_behind = match &self.drag {
+            Drag::Rubber { scope: None, .. } => true,
+            Drag::RightRubber { start, .. } => !self.layout.boxes.iter().any(|b| self.shown_rect(b).contains(*start)),
+            _ => false,
+        };
+        if band_behind {
+            self.paint_band(dc)?;
         }
         // Boxes, in z-order.
         for b in &self.layout.boxes {
@@ -405,29 +444,34 @@ impl App {
                     self.paint_header_target(dc, t)?;
                 }
             }
-            Drag::Rubber { start, cur, .. } | Drag::RightRubber { start, cur } => {
-                let band = Rect::from_points(*start, *cur);
-                let (ar, ag, ab) = accent();
-                // A band started in a box stays inside it (it selects only that box's icons).
-                let clip = match &self.drag {
-                    Drag::Rubber { scope: Some(id), .. } => self.box_by_id(*id).map(App::content_rect),
-                    _ => None,
-                };
-                if let Some(c) = clip {
-                    r::push_clip(dc, rf(c));
-                }
-                r::fill_rect(dc, rf(band), rgba(ar, ag, ab, 0.3))?;
-                r::stroke_round(dc, rf(band), 0.0, rgba(ar, ag, ab, 0.85), 1.0)?;
-                if clip.is_some() {
-                    r::pop_clip(dc);
-                }
-            }
+            Drag::Rubber { .. } | Drag::RightRubber { .. } if !band_behind => self.paint_band(dc)?,
             _ => {}
         }
         self.paint_search(dc)?;
         self.paint_tip(dc)?;
         if self.diag {
             self.paint_diagnostics(dc)?;
+        }
+        Ok(())
+    }
+
+    /// The selection band (Explorer's accent rectangle).
+    fn paint_band(&self, dc: &Dc) -> r::R<()> {
+        let (Drag::Rubber { start, cur, .. } | Drag::RightRubber { start, cur }) = &self.drag else { return Ok(()) };
+        let band = Rect::from_points(*start, *cur);
+        let (ar, ag, ab) = accent();
+        // A band started in a box stays inside it (it selects only that box's icons).
+        let clip = match &self.drag {
+            Drag::Rubber { scope: Some(id), .. } => self.box_by_id(*id).map(App::content_rect),
+            _ => None,
+        };
+        if let Some(c) = clip {
+            r::push_clip(dc, rf(c));
+        }
+        r::fill_rect(dc, rf(band), rgba(ar, ag, ab, 0.3))?;
+        r::stroke_round(dc, rf(band), 0.0, rgba(ar, ag, ab, 0.85), 1.0)?;
+        if clip.is_some() {
+            r::pop_clip(dc);
         }
         Ok(())
     }
@@ -512,14 +556,15 @@ impl App {
         Ok(())
     }
 
-    fn paint_item(&self, dc: &Dc, k: &ItemKey, cell: Rect, th: &Theme, shadow: bool, opacity: f32, fx: crate::iconfx::IconFx) -> r::R<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_item(&self, dc: &Dc, k: &ItemKey, cell: Rect, th: &Theme, shadow: bool, opacity: f32, fx: crate::iconfx::IconFx, m: &crate::views::Metrics) -> r::R<()> {
         let Some(it) = self.items.get(k) else { return Ok(()) };
         // Searching: what does not match fades.
         let opacity = opacity * self.search_alpha(k);
-        let full = self.is_full_label(k);
-        let (icon, label) = self.item_parts(k, cell, full);
+        let (lw, full, row) = self.label_spec(k, cell, m);
+        let (icon, label) = self.item_parts(k, cell, full, m);
         let sel = self.sel.is_selected(k);
-        let hit = self.hit_rect(k, cell);
+        let hit = self.hit_rect(k, cell, m);
         if sel {
             r::fill_rect(dc, rf(hit), th.sel_fill)?;
             r::stroke_round(dc, rf(hit.inflate(-0.5)), 0.0, th.sel_border, 1.0)?;
@@ -536,11 +581,11 @@ impl App {
         let a = opacity * cut_ghost;
         // Blending in: the wallpaper's color behind the icon.
         let wall_c = (fx.blend > 0.0).then(|| self.wall_color_at(Pt { x: icon.x + icon.w / 2.0, y: icon.y + icon.h / 2.0 }));
-        if let Some(b) = self.bitmaps.get(&it.icon) {
+        if let Some((bid, b)) = self.icon_bitmap(it, m) {
             let dst = rf(fit_icon(b, icon));
             let own = 1.0 - fx.blend;
             if own > 0.002 {
-                match fx.tint.and_then(|(c, s)| self.fx_bitmap(it.icon, b, c, 0).map(|t| (t, s))) {
+                match fx.tint.and_then(|(c, s)| self.fx_bitmap(bid, b, c, 0).map(|t| (t, s))) {
                     Some((t, s)) => {
                         // The icon's own colors under its tinted copy (strength = how much shows).
                         if s < 0.999 {
@@ -552,7 +597,7 @@ impl App {
                 }
             }
             if let Some(c) = wall_c {
-                if let Some(g) = self.fx_bitmap(it.icon, b, c, 1) {
+                if let Some(g) = self.fx_bitmap(bid, b, c, 1) {
                     r::draw_bitmap(dc, &g, dst, a * fx.blend * crate::iconfx::GHOST_A);
                 }
             }
@@ -567,7 +612,12 @@ impl App {
         if self.rename.as_ref().map(|r| &r.key) == Some(k) {
             return Ok(());
         }
-        let lk = (k.clone(), full, (cell.w - 4.0) as i32);
+        // Details and Tiles: the item's other texts, dimmer.
+        if matches!(m.view, deskboxes_core::model::View::Details | deskboxes_core::model::View::Tiles) {
+            let dim = Color { a: text_c.a * opacity * 0.72, ..text_c };
+            self.paint_item_texts(dc, k, cell, label, m, dim, shadow)?;
+        }
+        let lk = App::lkey(k, lw, full, row);
         match (shadow, self.label_bmps.get(&lk), self.labels.get(&lk)) {
             (true, Some(b), Some(l)) => {
                 // The shadow (cached), then the text with ClearType, as Explorer draws it.
@@ -886,8 +936,8 @@ impl App {
             }
             let tf = if active { &self.title_tf_bold } else { &self.title_tf };
             let center = n > 1 || self.settings.look.align != "left";
-            // A folder box in a subfolder says which.
-            let title = self.folder_title(b).filter(|_| n == 1).unwrap_or_else(|| tab.title.clone());
+            // A folder box's tab in a subfolder says which.
+            let title = self.tab_label(b, i);
             if let Ok(l) = self.gpu.label(tf, &title, (tr.w - 16.0).max(4.0), self.title_line_h, 1, center) {
                 let h = r::text_height(&l);
                 let base = match filled {
@@ -919,7 +969,7 @@ impl App {
         // A folder box: a folder at the left of its title, or the back arrow in a subfolder.
         if b.is_folder() && editing.is_none() && !searched_here {
             let g = Rect::new(rect.x + 6.0, rect.y + 4.0, 26.0, header_h() - 8.0);
-            let back = !b.folder_at.is_empty();
+            let back = b.tab_in_sub(b.active_tab);
             let hv = back && self.folder_back_hover == Some(b.id) && matches!(self.drag, Drag::None);
             if hv {
                 r::fill_round(dc, rf(g), 5.0, hover_fill)?;
@@ -1021,16 +1071,17 @@ impl App {
         let a = ta.map(|(_, t)| t).unwrap_or(1.0) * fade;
         // The selected icon's whole name over the icons below it: drawn last.
         let mut last = None;
+        let m = self.metrics(Some(b));
         for (i, k, cell) in self.box_cells_in(b, vis.y - dy, vis.bottom() - dy) {
             let cell = cell.offset(0.0, dy);
             if cell.bottom() < vis.y || cell.y > vis.bottom() {
                 continue;
             }
-            if self.is_full_label(&k) {
+            if self.is_full_label(&k) && !m.row() {
                 last = Some((k.clone(), cell));
             } else {
                 let fx = self.icon_fx(Some(b), &k);
-                self.paint_item(dc, &k, cell, &th, !light, a, fx)?;
+                self.paint_item(dc, &k, cell, &th, !light, a, fx, &m)?;
             }
             if let Some((_, c)) = tagged.iter().find(|t| t.0 == i) {
                 if !self.privacy_on() {
@@ -1040,10 +1091,13 @@ impl App {
         }
         if let Some((k, cell)) = last {
             let fx = self.icon_fx(Some(b), &k);
-            self.paint_item(dc, &k, cell, &th, !light, a, fx)?;
+            self.paint_item(dc, &k, cell, &th, !light, a, fx, &m)?;
         }
         self.paint_vanishing(dc, Some(b.id), &th, !light)?;
         r::pop_clip(dc);
+        if m.view == deskboxes_core::model::View::Details {
+            self.paint_details_head(dc, b, &m, th.text, dy, a)?;
+        }
         if !open {
             return Ok(());
         }

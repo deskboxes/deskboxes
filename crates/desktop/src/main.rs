@@ -42,6 +42,8 @@ mod update;
 mod search;
 mod textedit;
 mod tuck;
+mod template;
+mod views;
 mod worker;
 
 use deskboxes_shell::hide;
@@ -72,6 +74,9 @@ pub struct Args {
     pub install_autostart: bool,
     pub diagnostics: bool,
     pub enable: bool,
+    /// Sort the icons into the default boxes after the first scan, as a fresh install does
+    /// (for fixture tests).
+    pub first_run_template: bool,
 }
 
 fn parse_args() -> Args {
@@ -101,6 +106,7 @@ fn parse_args() -> Args {
             "--install-autostart" => a.install_autostart = true,
             "--diagnostics" => a.diagnostics = true,
             "--enable" => a.enable = true,
+            "--first-run-template" => a.first_run_template = true,
             other => eprintln!("unknown argument {other}"),
         }
         i += 1;

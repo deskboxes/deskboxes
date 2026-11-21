@@ -437,8 +437,9 @@ namespace dbx
             auto so = g.data.GetNamedObject(L"sorting", JsonObject());
             bool anyTarget = g.data.GetNamedArray(L"targets", JsonArray()).Size() > 0;
             std::wstring x;
-            if (!anyTarget) x += Note(Str(L"noBoxesRules"));
-            x += Card(L"&#xE8CB;", Str(L"sortNow"), Str(L"sortNowDesc"), L"<Button x:Name=\"SortNow\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(L"sortNowButton") + L"\" MinWidth=\"120\"/>");
+            // Without rules, Sort now makes boxes by type (with a rule for each) instead of doing nothing.
+            bool none = so.GetNamedArray(L"rules", JsonArray()).Size() == 0;
+            x += Card(L"&#xE8CB;", Str(none ? L"sortTemplate" : L"sortNow"), Str(none ? L"sortTemplateDesc" : L"sortNowDesc"), L"<Button x:Name=\"SortNow\" Style=\"{StaticResource AccentButtonStyle}\" Content=\"" + Str(none ? L"sortTemplateButton" : L"sortNowButton") + L"\" MinWidth=\"120\"/>");
             x += Card(L"&#xE72E;", Str(L"keepSorted"), Str(L"keepSortedDesc"), Toggle(L"KeepSorted", so.GetNamedBoolean(L"keep", false)));
             x += Card(L"&#xE8F4;", Str(L"newTo"), Str(L"newToDesc"), TargetBox(L"NewTo", so.GetNamedNumber(L"newTo", 0), Str(L"newToNone")));
             x += Section(Str(L"rulesList"));
@@ -911,7 +912,7 @@ namespace dbx
                 return std::wstring(L"<Button x:Name=\"") + name + L"\"" + (accent ? L" Style=\"{StaticResource AccentButtonStyle}\"" : L"") +
                        L" Padding=\"14,8\"><StackPanel Orientation=\"Horizontal\" Spacing=\"8\"><FontIcon Glyph=\"" + glyph + L"\" FontSize=\"14\"/><TextBlock Text=\"" + Str(text) + L"\"/></StackPanel></Button>";
             };
-            x += L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\" Margin=\"0,4,0,0\">" + action(L"HomeSort", L"&#xE8CB;", L"sortNowButtonLong", true) +
+            x += L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\" Margin=\"0,4,0,0\">" + action(L"HomeSort", L"&#xE8CB;", g.data.GetNamedObject(L"sorting", JsonObject()).GetNamedArray(L"rules", JsonArray()).Size() ? L"sortNowButtonLong" : L"sortTemplateButtonLong", true) +
                  action(L"HomeSave", L"&#xE74E;", L"saveNow", false) + action(L"HomeRules", L"&#xE71C;", L"pageRules", false) + L"</StackPanel>";
             // Features.
             x += Section(Str(L"navFeatures"));
@@ -1015,10 +1016,13 @@ namespace dbx
         {
             if (!p->pic)
                 return L"<TextBlock Text=\"" + Str(p->hero) + L"\" TextWrapping=\"Wrap\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" Margin=\"0,0,0,16\"/>";
-            return L"<Grid ColumnSpacing=\"24\" Margin=\"0,0,0,20\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>" +
-                   Pic(p->pic, L"Width=\"336\" Height=\"189\"", L"8", p->pic, L"hero") +
-                   L"<StackPanel Grid.Column=\"1\" VerticalAlignment=\"Center\" Spacing=\"6\"><FontIcon Glyph=\"" + std::wstring(p->glyph) + L"\" FontSize=\"24\" HorizontalAlignment=\"Left\" Foreground=\"{ThemeResource AccentTextFillColorPrimaryBrush}\"/>"
-                   L"<TextBlock Text=\"" + Str(p->hero) + L"\" TextWrapping=\"Wrap\" Style=\"{StaticResource BodyTextBlockStyle}\"/></StackPanel></Grid>";
+            // The picture as wide as the page (its clip playing; see WireClip), scaled down with
+            // the window, and what the feature does under it.
+            return L"<StackPanel Spacing=\"14\" Margin=\"0,0,0,20\"><Viewbox StretchDirection=\"DownOnly\" HorizontalAlignment=\"Left\" MaxWidth=\"928\">" +
+                   Pic(p->pic, L"Width=\"928\" Height=\"522\"", L"8", p->pic, L"hero") +
+                   L"</Viewbox><Grid ColumnSpacing=\"14\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>"
+                   L"<FontIcon Glyph=\"" + std::wstring(p->glyph) + L"\" FontSize=\"24\" VerticalAlignment=\"Top\" Margin=\"0,2,0,0\" Foreground=\"{ThemeResource AccentTextFillColorPrimaryBrush}\"/>"
+                   L"<TextBlock Grid.Column=\"1\" Text=\"" + Str(p->hero) + L"\" TextWrapping=\"Wrap\" Style=\"{StaticResource BodyTextBlockStyle}\"/></Grid></StackPanel>";
         }
 
         const Page* CurrentPage()
@@ -1240,11 +1244,91 @@ namespace dbx
             g.window.DispatcherQueue().TryEnqueue([] { Build(); });
         }
 
-        // A feature's clip (see Pic): while the pointer is on `hover` it plays, muted and looping,
-        // over the picture, which is its first frame; it fades in once it runs and goes when the
-        // pointer leaves. Nothing plays when Windows' animation effects are off. The player is made
-        // on the first hover and kept out of the system's media controls.
-        void WireClip(mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el)
+        // A clip's file as a file:/// URI, anything but letters, digits and -._~: escaped (a space
+        // in the user's name).
+        std::wstring FileUri(const std::wstring& file)
+        {
+            std::wstring u = L"file:///";
+            for (wchar_t ch : file)
+            {
+                if (ch == L'\\') u += L'/';
+                else if ((ch < 128 && iswalnum(ch)) || wcschr(L"-._~:", ch)) u += ch;
+                else
+                {
+                    char utf8[8]{};
+                    int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, sizeof utf8, nullptr, nullptr);
+                    for (int i = 0; i < n; i++) { wchar_t h[4]; swprintf_s(h, L"%%%02X", (unsigned char)utf8[i]); u += h; }
+                }
+            }
+            return u;
+        }
+
+        // Show a clip that was just started from its beginning, once real frames are on screen: the
+        // player reports "playing" before its first frame is drawn, and the element is black until
+        // then (the flash on hover). Polled, for it says nothing when a frame arrives; `want` going
+        // false (the pointer left) stops it.
+        void RevealClip(winrt::weak_ref<muxc::MediaPlayerElement> weak, std::shared_ptr<bool> want)
+        {
+            namespace wmp = winrt::Windows::Media::Playback;
+            auto timer = g.window.DispatcherQueue().CreateTimer();
+            timer.Interval(std::chrono::milliseconds(30));
+            auto ticks = std::make_shared<int>(0);
+            timer.Tick([weak, want, ticks](winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& t, auto&&)
+                {
+                    auto e = weak.get();
+                    if (!e || !*want || ++*ticks > 200) { t.Stop(); return; }
+                    auto mp = e.MediaPlayer();
+                    if (!mp) return;
+                    auto s = mp.PlaybackSession();
+                    if (s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(120))
+                    {
+                        e.Opacity(1);
+                        t.Stop();
+                    }
+                });
+            timer.Start();
+        }
+
+        // Start (or restart from the beginning) a feature's clip on its element; see WireClip.
+        void StartClip(muxc::MediaPlayerElement const& e, const std::wstring& clip, std::shared_ptr<bool> want)
+        {
+            namespace wmp = winrt::Windows::Media::Playback;
+            if (!winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) return;
+            *want = true;
+            // The element comes with an empty player of its own: ours is the one with a source.
+            auto had = e.MediaPlayer();
+            if (had && had.Source())
+            {
+                e.Opacity(0);
+                had.PlaybackSession().Position(std::chrono::seconds(0));
+                had.Play();
+                RevealClip(e, want);
+                return;
+            }
+            std::wstring file = ExeDir() + L"\\settings\\" + clip + (e.ActualTheme() == mux::ElementTheme::Light ? L"_l" : L"") + L".mp4";
+            if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+            try
+            {
+                wmp::MediaPlayer mp;
+                mp.CommandManager().IsEnabled(false);
+                mp.IsMuted(true);
+                mp.IsLoopingEnabled(true);
+                mp.AutoPlay(false);
+                mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f) { Log(L"settings: clip %s failed: %s", clip.c_str(), f.ErrorMessage().c_str()); });
+                e.SetMediaPlayer(mp);
+                mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(FileUri(file))));
+                mp.Play();
+                RevealClip(e, want);
+            }
+            catch (winrt::hresult_error const& x) { Log(L"settings: clip %s: %s", clip.c_str(), x.message().c_str()); }
+        }
+
+        // A feature's clip (see Pic), muted and looping over the picture, which is its first frame.
+        // On a tile it plays while the pointer is on `hover` and goes when it leaves; at the top of
+        // a feature's own page (`autoplay`) it plays from the start for as long as the page shows.
+        // It fades in only once its frames are drawn. Nothing plays when Windows' animation effects
+        // are off. The player is made when it first plays and kept out of the system's media controls.
+        void WireClip(mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el, bool autoplay = false)
         {
             if (!hover || !el) return;
             std::wstring tag = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
@@ -1265,78 +1349,45 @@ namespace dbx
                     vis.Clip(vis.Compositor().CreateRectangleClip(0, 0, (float)e.ActualWidth(), (float)e.ActualHeight(), { rt, rt }, { rt, rt }, { rb, rb }, { rb, rb }));
                 });
             mux::ScalarTransition fade;
-            fade.Duration(std::chrono::milliseconds(160));
+            fade.Duration(std::chrono::milliseconds(autoplay ? 260 : 160));
             el.OpacityTransition(fade);
-            // The tile's button marks pointer events handled, so these listen to handled ones too.
-            auto play = [weak, clip](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
-                {
-                    auto e = weak.get();
-                    if (!e || !winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) return;
-                    // The element comes with an empty player of its own: ours is the one with a source.
-                    auto had = e.MediaPlayer();
-                    if (had && had.Source())
-                    {
-                        had.PlaybackSession().Position(std::chrono::seconds(0));
-                        had.Play();
-                        return;
-                    }
-                    std::wstring file = ExeDir() + L"\\settings\\" + clip + (e.ActualTheme() == mux::ElementTheme::Light ? L"_l" : L"") + L".mp4";
-                    if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) return;
-                    namespace wmp = winrt::Windows::Media::Playback;
-                    try
-                    {
-                        wmp::MediaPlayer mp;
-                        mp.CommandManager().IsEnabled(false);
-                        mp.IsMuted(true);
-                        mp.IsLoopingEnabled(true);
-                        mp.AutoPlay(false);
-                        mp.PlaybackSession().PlaybackStateChanged([weak](wmp::MediaPlaybackSession const& s, auto&&)
-                            {
-                                if (s.PlaybackState() != wmp::MediaPlaybackState::Playing) return;
-                                g.window.DispatcherQueue().TryEnqueue([weak]
-                                    {
-                                        // Still playing (the pointer may have left meanwhile): show it.
-                                        auto e = weak.get();
-                                        if (e && e.MediaPlayer() && e.MediaPlayer().PlaybackSession().PlaybackState() == wmp::MediaPlaybackState::Playing) e.Opacity(1);
-                                    });
-                            });
-                        mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f) { Log(L"settings: clip %s failed: %s", clip.c_str(), f.ErrorMessage().c_str()); });
-                        e.SetMediaPlayer(mp);
-                        // file:///C:/... with anything but letters, digits and -._~: escaped (a space in the user's name).
-                        std::wstring u = L"file:///";
-                        for (wchar_t ch : file)
-                        {
-                            if (ch == L'\\') u += L'/';
-                            else if ((ch < 128 && iswalnum(ch)) || wcschr(L"-._~:", ch)) u += ch;
-                            else
-                            {
-                                char utf8[8]{};
-                                int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, sizeof utf8, nullptr, nullptr);
-                                for (int i = 0; i < n; i++) { wchar_t h[4]; swprintf_s(h, L"%%%02X", (unsigned char)utf8[i]); u += h; }
-                            }
-                        }
-                        mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(u)));
-                        mp.Play();
-                    }
-                    catch (winrt::hresult_error const& x) { Log(L"settings: clip %s: %s", clip.c_str(), x.message().c_str()); }
-                };
-            auto stop = [weak](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
+            auto want = std::make_shared<bool>(false);
+            auto stop = [weak, want]
             {
+                *want = false;
                 auto e = weak.get();
                 if (!e) return;
                 e.Opacity(0);
                 if (auto mp = e.MediaPlayer()) mp.Pause();
             };
+            if (autoplay)
+            {
+                el.Loaded([weak, clip, want](auto&&, auto&&) { if (auto e = weak.get()) StartClip(e, clip, want); });
+                // The page went (another one was picked, or the window closed): let the file go.
+                el.Unloaded([weak, stop](auto&&, auto&&)
+                    {
+                        stop();
+                        if (auto e = weak.get())
+                            if (auto mp = e.MediaPlayer()) mp.Source(nullptr);
+                    });
+                return;
+            }
+            // The tile's button marks pointer events handled, so these listen to handled ones too.
+            auto play = [weak, clip, want](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
+                {
+                    if (auto e = weak.get()) StartClip(e, clip, want);
+                };
             hover.AddHandler(mux::UIElement::PointerEnteredEvent(), winrt::box_value(mux::Input::PointerEventHandler(play)), true);
+            auto leave = [stop](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&) { stop(); };
             for (auto ev : { mux::UIElement::PointerExitedEvent(), mux::UIElement::PointerCanceledEvent(), mux::UIElement::PointerCaptureLostEvent() })
-                hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(stop)), true);
+                hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(leave)), true);
         }
 
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
                 WireClip(Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<muxc::MediaPlayerElement>(root, L"Clip_t_" + std::wstring(t.page)));
-            WireClip(Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"));
+            WireClip(Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"), true);
             if (auto nav = Find<muxc::NavigationView>(root, L"Nav"))
                 nav.SelectionChanged([](auto&&, muxc::NavigationViewSelectionChangedEventArgs const& e)
                 {

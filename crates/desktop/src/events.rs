@@ -88,6 +88,12 @@ pub enum Ev {
         op: deskboxes_core::layout::FileOp,
         undo: Option<bool>,
     },
+    /// Icons made at another size for boxes (see `views`): (desktop icon id, its id at `px`).
+    IconsAt {
+        px: u32,
+        map: Vec<(u32, u32)>,
+        icons: Vec<(u32, IconImage)>,
+    },
 }
 
 static QUEUE: Mutex<Vec<Ev>> = Mutex::new(Vec::new());

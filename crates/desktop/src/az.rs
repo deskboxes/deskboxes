@@ -157,7 +157,7 @@ impl App {
         let Some((c, ix, _)) = letters.iter().min_by(|a, b| (a.2.x + a.2.w / 2.0 - x).abs().total_cmp(&(b.2.x + b.2.w / 2.0 - x).abs())).copied() else { return };
         let cols = self.box_cols(b);
         let max = self.max_scroll(b);
-        let s = ((ix / cols) as f32 * self.grid.cell_h).clamp(0.0, max);
+        let s = ((ix / cols) as f32 * self.metrics(Some(b)).cell_h).clamp(0.0, max);
         self.scroll_to(id, s);
         self.set_az_letter(id, c);
         self.invalidate();
@@ -188,7 +188,8 @@ impl App {
         let b = self.box_by_id(id)?;
         let tab = b.active()?;
         let s = self.scroll.get(&id).copied().unwrap_or(0.0);
-        let row = ((s + self.grid.cell_h * 0.5) / self.grid.cell_h).floor() as usize;
+        let ch = self.metrics(Some(b)).cell_h.max(1.0);
+        let row = ((s + ch * 0.5) / ch).floor() as usize;
         let items = self.shown_items(b, tab);
         items.get((row * self.box_cols(b)).min(items.len().saturating_sub(1))).map(|k| initial(&self.items[k].display_name))
     }
@@ -258,6 +259,7 @@ impl App {
 
     /// A letter tag: the letter at the top left of its icon's cell, small and dim.
     pub fn paint_az_tag(&self, dc: &Dc, c: char, cell: Rect, text: Color, shadow: bool, alpha: f32) -> r::R<()> {
+        // (Beside the icon; in a row view, at the row's left end.)
         let icon = Rect::new(cell.x + (cell.w - self.icon_dip) / 2.0, cell.y + 7.0, self.icon_dip, self.icon_dip);
         let w = (icon.x - cell.x - 2.0).max(12.0);
         let Ok(l) = self.gpu.label(&self.az_tf, &c.to_string(), w, 14.0, 1, true) else { return Ok(()) };
