@@ -473,8 +473,8 @@ pub struct App {
     /// (they step aside live, and back).
     pub preview_loose: Option<std::collections::BTreeMap<ItemKey, Cell>>,
     /// Our icons dragged in between two loose ones: the dragged icons, where they would go in
-    /// and whether along a row (the icons there make room, shown in `preview_loose`).
-    pub room: Option<(Vec<ItemKey>, Cell, bool)>,
+    /// and which way the icons there move to make room (shown in `preview_loose`).
+    pub room: Option<(Vec<ItemKey>, Cell, (i32, i32))>,
     /// Loose icons gliding to a new cell: (where it started, when).
     pub glide: HashMap<ItemKey, (Pt, Instant)>,
     /// Each loose icon's cell position as last drawn (a change starts a glide).
@@ -554,6 +554,38 @@ pub enum After {
 
 pub fn with<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
+}
+
+thread_local! {
+    static DRAG_WHEEL: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// While something is dragged over us: a low-level mouse hook that hands the wheel to
+/// `App::drag_wheel` (Windows' drag and drop holds the mouse, so the wheel never reaches our
+/// window). Off again when the drag leaves or ends.
+pub fn drag_wheel_hook(on: bool) {
+    unsafe extern "system" fn proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 && w.0 as u32 == WM_MOUSEWHEEL {
+            let m = &*(l.0 as *const MSLLHOOKSTRUCT);
+            let delta = ((m.mouseData >> 16) & 0xffff) as i16;
+            if with(|app| app.drag_wheel(m.pt.x, m.pt.y, delta)).unwrap_or(false) {
+                return LRESULT(1);
+            }
+        }
+        CallNextHookEx(None, code, w, l)
+    }
+    DRAG_WHEEL.with(|h| unsafe {
+        if on && h.get() == 0 {
+            let module = GetModuleHandleW(None).ok().map(|m| HINSTANCE(m.0));
+            match SetWindowsHookExW(WH_MOUSE_LL, Some(proc), module, 0) {
+                Ok(hk) => h.set(hk.0 as isize),
+                Err(e) => log::warn!("drag wheel hook: {e}"),
+            }
+        } else if !on && h.get() != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(h.get() as *mut _));
+            h.set(0);
+        }
+    });
 }
 
 fn lparam_pt(l: LPARAM) -> (i32, i32) {
@@ -1326,7 +1358,7 @@ impl App {
     /// half after, and the row moves to the right. Otherwise in a column: upper half before,
     /// lower half after, and the column moves down. Returns the cell and whether it is a row.
     /// None: an ordinary move.
-    pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<(Cell, bool)> {
+    pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<(Cell, (i32, i32))> {
         if self.drop_box(p).is_some() {
             return None;
         }
@@ -1343,11 +1375,19 @@ impl App {
         }
         let all: std::collections::HashSet<Cell> = self.layout.loose.iter().filter(|(k, _)| self.items.contains_key(*k)).map(|(_, c)| *c).collect();
         let near = |dc: i32, dr: i32| all.contains(&Cell { col: under.col + dc, row: under.row + dr });
-        if (near(-1, 0) || near(1, 0)) && !near(0, -1) && !near(0, 1) {
-            let col = fx.round() as i32;
-            return (col < g.cols).then_some((Cell { col, row: under.row }, true));
+        let along = (near(-1, 0) || near(1, 0)) && !near(0, -1) && !near(0, 1);
+        // The line between two icons the pointer is nearest to.
+        let b = if along { fx.round() as i32 } else { fy.round() as i32 };
+        // Moved along its own line, toward the end: the icons it passes move back into the cell
+        // it left, the same as when it moves toward the start (they moved on past it, leaving
+        // its cell empty, round 13). Otherwise the icons from the line on move on.
+        let back = keys.iter().filter_map(|k| self.layout.loose.get(k)).any(|o| if along { o.row == under.row && o.col < b } else { o.col == under.col && o.row < b });
+        match (along, back) {
+            (true, true) => Some((Cell { col: b - 1, row: under.row }, (-1, 0))),
+            (true, false) => (b < g.cols).then_some((Cell { col: b, row: under.row }, (1, 0))),
+            (false, true) => Some((Cell { col: under.col, row: (b - 1).clamp(0, g.rows - 1) }, (0, -1))),
+            (false, false) => Some((Cell { col: under.col, row: b.clamp(0, g.rows - 1) }, (0, 1))),
         }
-        Some((Cell { col: under.col, row: (fy.round() as i32).clamp(0, g.rows - 1) }, false))
     }
 
     /// Our icons dragged to `p` (None: the drag left or ended): in between two loose icons,
@@ -1360,8 +1400,8 @@ impl App {
             return;
         }
         match at {
-            Some((c, row)) => {
-                self.room = Some((keys.to_vec(), c, row));
+            Some((c, dir)) => {
+                self.room = Some((keys.to_vec(), c, dir));
                 unsafe {
                     SetTimer(Some(self.msg_hwnd), T_ROOM, 140, None);
                 }
@@ -1377,13 +1417,13 @@ impl App {
 
     /// The pointer stayed where the dragged icons would go in: the icons there move aside.
     fn room_due(&mut self) {
-        let Some((keys, at, row)) = self.room.clone() else { return };
+        let Some((keys, at, dir)) = self.room.clone() else { return };
         if self.own_drag.is_none() && !matches!(self.drag, Drag::Items { .. }) {
             self.room = None;
             return;
         }
         let mut l = self.layout.clone();
-        layout::insert_along(&mut l, &keys, at, if row { (1, 0) } else { (0, 1) }, &self.grid);
+        layout::insert_along(&mut l, &keys, at, dir, &self.grid);
         layout::settle(&mut l, &self.grid);
         // The gap stays empty: the dragged icons go there only when dropped (they are with the
         // pointer). They stay where they were, unless an icon making room moved in there.
@@ -2014,6 +2054,31 @@ impl App {
             Some(keys) if p.is_some() => self.make_room(p, &keys),
             _ => self.make_room(None, &[]),
         }
+        drag_wheel_hook(p.is_some());
+    }
+
+    /// The wheel turned while something is dragged over us (Windows' drag holds the mouse, so
+    /// the wheel never reaches our window; see `drag_wheel_hook`): a box under the pointer
+    /// scrolls. The drag image is Windows', on the pointer, so it stays there; the insertion
+    /// marker and the icon that takes the drop follow the scrolled icons. True: handled.
+    pub fn drag_wheel(&mut self, x: i32, y: i32, delta: i16) -> bool {
+        if self.drop_at.is_none() {
+            return false;
+        }
+        let p = self.screen_to_dip(x, y);
+        if self.drop_box(p).is_none() {
+            return false;
+        }
+        self.on_wheel(p, delta, false);
+        self.drop_slot = None;
+        self.invalidate();
+        // Windows asks the drop target again on a mouse move: a move of nothing, so the icon now
+        // under the pointer is the one that takes the drop.
+        unsafe {
+            let i = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: MOUSEEVENTF_MOVE, ..Default::default() } } };
+            SendInput(&[i], std::mem::size_of::<INPUT>() as i32);
+        }
+        true
     }
 
     /// The window under the pointer is our surface (or the desktop it sits on).
@@ -5255,12 +5320,12 @@ impl App {
             None if self.grid_insert_at(cur, &keys).is_some() => {
                 // Onto another icon or the gap between two: in between them, in the order shown
                 // (where they made room while dragged).
-                let (at, row) = self.grid_insert_at(cur, &keys).unwrap();
+                let (at, dir) = self.grid_insert_at(cur, &keys).unwrap();
                 let order = self.order();
                 let mut ks = keys.clone();
                 ks.sort_by_key(|k| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
-                log::info!("insert {} icon(s) at {at:?}{}", ks.len(), if row { " in a row" } else { "" });
-                self.change_layout(|l, g| layout::insert_along(l, &ks, at, if row { (1, 0) } else { (0, 1) }, g));
+                log::info!("insert {} icon(s) at {at:?}, the others moving {dir:?}", ks.len());
+                self.change_layout(|l, g| layout::insert_along(l, &ks, at, dir, g));
             }
             None => {
                 // Loose grid: every item moves by the drag offset, so the group keeps its shape
