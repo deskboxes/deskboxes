@@ -1321,10 +1321,11 @@ impl App {
 
     /// A drop on the loose grid at `p` that goes in between icons: the cell under the pointer
     /// has another icon, so the dropped ones go before it or after it and the icons after move
-    /// along. In a column (Explorer's order): before it in its upper half, after it in its lower
-    /// half. In a row of icons (neighbours left or right, none above or below): left half
-    /// before, right half after, and the row moves along to the right. Returns the cell and
-    /// whether it is a row. None: an ordinary move.
+    /// along their line (never to another one). In a row of icons (neighbours left or right,
+    /// none above or below; the dragged icons count, where they were): left half before, right
+    /// half after, and the row moves to the right. Otherwise in a column: upper half before,
+    /// lower half after, and the column moves down. Returns the cell and whether it is a row.
+    /// None: an ordinary move.
     pub fn grid_insert_at(&self, p: Pt, keys: &[ItemKey]) -> Option<(Cell, bool)> {
         if self.drop_box(p).is_some() {
             return None;
@@ -1340,7 +1341,8 @@ impl App {
         if !others.contains(&under) {
             return None;
         }
-        let near = |dc: i32, dr: i32| others.contains(&Cell { col: under.col + dc, row: under.row + dr });
+        let all: std::collections::HashSet<Cell> = self.layout.loose.iter().filter(|(k, _)| self.items.contains_key(*k)).map(|(_, c)| *c).collect();
+        let near = |dc: i32, dr: i32| all.contains(&Cell { col: under.col + dc, row: under.row + dr });
         if (near(-1, 0) || near(1, 0)) && !near(0, -1) && !near(0, 1) {
             let col = fx.round() as i32;
             return (col < g.cols).then_some((Cell { col, row: under.row }, true));
@@ -1381,11 +1383,7 @@ impl App {
             return;
         }
         let mut l = self.layout.clone();
-        if row {
-            layout::insert_in_row(&mut l, &keys, at, &self.grid);
-        } else {
-            layout::insert_in_grid(&mut l, &keys, at, &self.grid);
-        }
+        layout::insert_along(&mut l, &keys, at, if row { (1, 0) } else { (0, 1) }, &self.grid);
         layout::settle(&mut l, &self.grid);
         // The gap stays empty: the dragged icons go there only when dropped (they are with the
         // pointer). They stay where they were, unless an icon making room moved in there.
@@ -5262,7 +5260,7 @@ impl App {
                 let mut ks = keys.clone();
                 ks.sort_by_key(|k| order.iter().position(|o| o == k).unwrap_or(usize::MAX));
                 log::info!("insert {} icon(s) at {at:?}{}", ks.len(), if row { " in a row" } else { "" });
-                self.change_layout(|l, g| if row { layout::insert_in_row(l, &ks, at, g) } else { layout::insert_in_grid(l, &ks, at, g) });
+                self.change_layout(|l, g| layout::insert_along(l, &ks, at, if row { (1, 0) } else { (0, 1) }, g));
             }
             None => {
                 // Loose grid: every item moves by the drag offset, so the group keeps its shape

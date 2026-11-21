@@ -337,14 +337,15 @@ fn push_line(l: &MonitorLayout, g: &Grid, at: &mut HashMap<Cell, ItemKey>, start
     (out, vec![])
 }
 
-/// Put items into a row of the loose grid at `at`: the icons from `at` on to the right move
-/// along to make room, up to the first free cell (an icon in a row of icons, dropped between
-/// two of them). What runs off the grid goes to the nearest free cells.
-pub fn insert_in_row(l: &mut MonitorLayout, keys: &[ItemKey], at: Cell, g: &Grid) {
+/// Put items into the loose grid at `at`, in a row (`dir` (1, 0)) or a column ((0, 1)): the
+/// icons from `at` on move along that line to make room, up to the first free cell, and never
+/// jump to another line (Explorer's order carried the last icon of a column to the top of the
+/// next one, round 13). What runs off the grid goes to the nearest free cells.
+pub fn insert_along(l: &mut MonitorLayout, keys: &[ItemKey], at: Cell, dir: (i32, i32), g: &Grid) {
     remove_everywhere(l, keys);
     let mut by_cell: HashMap<Cell, ItemKey> = l.loose.iter().map(|(k, c)| (*c, k.clone())).collect();
     let at = Cell { col: at.col.clamp(0, g.cols - 1), row: at.row.clamp(0, g.rows - 1) };
-    let (moved, stray) = push_line(l, g, &mut by_cell, at, (1, 0), keys.iter().map(|k| (k.clone(), at)).collect());
+    let (moved, stray) = push_line(l, g, &mut by_cell, at, dir, keys.iter().map(|k| (k.clone(), at)).collect());
     for (k, _, c) in moved {
         l.loose.insert(k, c);
     }
@@ -907,9 +908,19 @@ mod tests {
             l.loose.insert(k[i].clone(), cell(i as i32, 4));
         }
         l.loose.insert(k[4].clone(), cell(7, 0));
-        insert_in_row(&mut l, &k[4..5], cell(2, 4), &g);
+        insert_along(&mut l, &k[4..5], cell(2, 4), (1, 0), &g);
         let got: Vec<Cell> = k.iter().map(|x| l.loose[x]).collect();
         assert_eq!(got, vec![cell(0, 4), cell(1, 4), cell(3, 4), cell(4, 4), cell(2, 4)]);
+        // In a column, at the bottom of the grid: the icon there does not wrap to the top of the
+        // next column; it takes the nearest free cell.
+        let mut l = MonitorLayout::default();
+        l.loose.insert(k[0].clone(), cell(3, 3));
+        l.loose.insert(k[1].clone(), cell(3, 4));
+        insert_along(&mut l, &k[2..3], cell(3, 4), (0, 1), &g);
+        assert_eq!(l.loose[&k[2]], cell(3, 4));
+        assert_eq!(l.loose[&k[0]], cell(3, 3));
+        let c = l.loose[&k[1]];
+        assert!((c.col - 3).abs() <= 1 && c.row >= 3, "{c:?}");
     }
 
     #[test]
