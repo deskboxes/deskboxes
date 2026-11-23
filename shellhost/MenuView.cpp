@@ -343,8 +343,31 @@ namespace dbx
         std::vector<OpenWithEntry> openWith;
         int iconPx = 16;
         std::map<const MenuEntry*, std::wstring> keys; // access keys after de-duplication
+        bool opened = false;    // the flyout opened (Opened fired)
+        bool aborted = false;   // given up on before it opened (see AbortView)
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer openCheck{ nullptr };
     };
     static std::shared_ptr<View> g_view;
+    static void WatchDismiss(bool on);
+
+    // A menu that never opened (its flyout failed to show, or ShowAt threw): without this its
+    // `done` never came, the host thought a menu was still open and parked every later "show"
+    // until the process was replaced (menus dead after turning Deskboxes off and on; 2026-11-23).
+    static void AbortView(std::shared_ptr<View> const& v, const wchar_t* why)
+    {
+        if (!v || v->aborted || v->opened) return;
+        v->aborted = true;
+        Log(L"menu view: %s; giving it up", why);
+        WatchDismiss(false);
+        auto done = v->ev.done;
+        v->ev = {};
+        try { if (v->flyout) v->flyout.Hide(); } catch (...) {}
+        try { if (v->window) v->window.Close(); } catch (...) {}
+        v->flyout = nullptr;
+        v->window = nullptr;
+        if (g_view == v) g_view.reset();
+        if (done) done(L"");
+    }
 
     // ---- dismissal ---------------------------------------------------------------------
     // The flyout closes by itself when its window loses the activation. A menu that never got
@@ -404,6 +427,8 @@ namespace dbx
 
     void HideMenuView()
     {
+        // One that never opened has no flyout to close (its Closed would never come).
+        if (g_view && !g_view->opened) { AbortView(g_view, L"closed before it opened"); return; }
         DismissSoon();
     }
 
@@ -798,7 +823,8 @@ namespace dbx
         v->flyout.Opened([wv, t0](auto&&, auto&&)
         {
             auto v = wv.lock();
-            if (!v) return;
+            if (!v || v->aborted) return;
+            v->opened = true;
             double ms = NowMs() - t0;
             Log(L"menu view opened in %.1f ms (model %.1f ms)", ms, v->m->msTotal);
             if (v->ev.opened) v->ev.opened(ms);
@@ -815,7 +841,7 @@ namespace dbx
         v->flyout.Closed([wv](auto&&, auto&&)
         {
             auto v = wv.lock();
-            if (!v) return;
+            if (!v || v->aborted) return;
             WatchDismiss(false);
             if (v->pending) v->pending();
             auto id = v->invoked;
@@ -857,15 +883,31 @@ namespace dbx
         root.Loaded([wv, shown, anchor, place](auto&&, auto&&) mutable
         {
             auto v = wv.lock();
-            if (shown || !v) return;
+            if (shown || !v || v->aborted) return;
             shown = true;
             mux::Controls::Primitives::FlyoutShowOptions o;
             o.Placement(place);
             o.ShowMode(mux::Controls::Primitives::FlyoutShowMode::Standard);
-            v->flyout.ShowAt(anchor, o);
+            try { v->flyout.ShowAt(anchor, o); }
+            catch (winrt::hresult_error const& e)
+            {
+                Log(L"menu view: ShowAt failed 0x%08X %s", (unsigned)e.code().value, e.message().c_str());
+                AbortView(v, L"ShowAt failed");
+            }
         });
         v->window.Activate();
         SetForegroundWindow(v->hwnd);
         WatchDismiss(true);
+        // Not open 2 s after this (the model is built already, so it only has to draw): give up
+        // on it, so the next right-click gets a menu.
+        v->openCheck = v->window.DispatcherQueue().CreateTimer();
+        v->openCheck.Interval(std::chrono::milliseconds(2000));
+        v->openCheck.IsRepeating(false);
+        v->openCheck.Tick([wv](auto&&, auto&&)
+        {
+            auto v = wv.lock();
+            if (v && !v->opened && !v->aborted) AbortView(v, L"not open after 2 s");
+        });
+        v->openCheck.Start();
     }
 }

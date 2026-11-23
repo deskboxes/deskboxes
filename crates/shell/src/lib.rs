@@ -8,6 +8,7 @@ pub mod fileops;
 pub mod hide;
 pub mod icons;
 pub mod items;
+pub mod launch;
 pub mod reg;
 pub mod turnon;
 pub mod view;

@@ -113,6 +113,7 @@ namespace dbx
         {
             MenuRequest r;
             r.background = Str(o, L"kind") == L"background";
+            r.ownOnly = Str(o, L"kind") == L"own";
             r.folder = Str(o, L"folder");
             if (o.HasKey(L"items")) for (auto const& x : o.GetNamedArray(L"items")) r.items.push_back(x.GetString().c_str());
             r.shift = Bool(o, L"shift");
@@ -176,7 +177,7 @@ namespace dbx
                 std::shared_ptr<BuiltMenu> m;
                 // A prefetched model is reused when it was built for the same items and extras (the
                 // background menu's own entries change per show, so it is always built at show).
-                if (g_prefetched && g_prefetchKey == Key(r) && r.ownChildren.empty() && !r.desktop)
+                if (g_prefetched && g_prefetchKey == Key(r) && r.ownChildren.empty() && !r.desktop && !r.ownOnly)
                 {
                     m = g_prefetched;
                     POINT pt = r.pt; bool kb = r.keyboard;
@@ -197,6 +198,7 @@ namespace dbx
                     Send(c);
                     return;
                 }
+                Log(L"show %.0f: opening the menu view", id);
                 g_menuOpen = true;
                 MenuViewEvents ev;
                 ev.opened = [id, t0](double) {
@@ -223,7 +225,16 @@ namespace dbx
                         g_ui.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [next] { try { Handle(next); } catch (...) {} });
                     }
                 };
-                ShowMenuView(m, std::move(ev));
+                try { ShowMenuView(m, std::move(ev)); }
+                catch (winrt::hresult_error const& e)
+                {
+                    // Never left thinking a menu is open (every later "show" would wait for it).
+                    Log(L"show %.0f: menu view failed 0x%08X %s", id, (unsigned)e.code().value, e.message().c_str());
+                    g_menuOpen = false;
+                    auto c = Msg(L"closed", id); c.SetNamedValue(L"invoked", JsonValue::CreateNullValue());
+                    c.SetNamedValue(L"error", JsonValue::CreateStringValue(L"menu view failed"));
+                    Send(c);
+                }
             }
             else if (t == L"settings")
             {
@@ -237,6 +248,15 @@ namespace dbx
             else if (t == L"colorpicker")
             {
                 ShowColorPicker(o, [](JsonObject m)
+                {
+                    m.SetNamedValue(L"t", JsonValue::CreateStringValue(L"setting"));
+                    m.SetNamedValue(L"id", JsonValue::CreateNumberValue(0));
+                    Send(m);
+                });
+            }
+            else if (t == L"dialog")
+            {
+                ShowDialog(o, [](JsonObject m)
                 {
                     m.SetNamedValue(L"t", JsonValue::CreateStringValue(L"setting"));
                     m.SetNamedValue(L"id", JsonValue::CreateNumberValue(0));

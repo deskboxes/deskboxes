@@ -4,6 +4,7 @@
 pub mod geom;
 pub mod model;
 pub mod layout;
+pub mod pages;
 pub mod selection;
 pub mod snapshot;
 pub mod persist;

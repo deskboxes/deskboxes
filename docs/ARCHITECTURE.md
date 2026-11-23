@@ -459,7 +459,7 @@ owned by a host window, forwarding `WM_INITMENUPOPUP`, `WM_DRAWITEM`, `WM_MEASUR
 | View / Sort by / Undo / New in the background menu | host shows them; View/Sort/Undo are `command` messages to the core; New is Windows' ShellNew submenu from the background `IContextMenu` |
 
 **Explicitly out of scope:** wallpaper-adaptive colors, folder-mirroring boxes, the "bring desktop to front" peek,
-double-click-to-hide-all, multiple swipeable pages, Linux.
+double-click-to-hide-all, Linux. (Desktop pages came in round 13: the page shown lives in the layout's usual fields, the others in `MonitorLayout.parked`; `core::pages` for the model, `desktop/src/pages.rs` for the slide, the name pill, gestures and drags across pages.)
 
 ---
 

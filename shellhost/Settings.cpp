@@ -8,6 +8,8 @@
 #include "Log.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <dwmapi.h>
 
 namespace mux = winrt::Microsoft::UI::Xaml;
 namespace muxc = winrt::Microsoft::UI::Xaml::Controls;
@@ -769,6 +771,53 @@ namespace dbx
             return x;
         }
 
+        // Desktop pages: on or off, the pages themselves, how to go from page to page, the slide.
+        std::wstring PagePages()
+        {
+            auto p = g.data.GetNamedObject(L"pages", JsonObject());
+            auto on = [&](const wchar_t* k) { return p.GetNamedBoolean(k, true); };
+            std::wstring x = Card(L"&#xE7C4;", Str(L"pagesOn"), Str(L"pagesOnDesc"), Toggle(L"PgOn", on(L"enabled")));
+            // The pages, in order: show, rename, move, delete; and a new one.
+            x += Section(Str(L"pagesList"));
+            auto list = p.GetNamedArray(L"list", JsonArray());
+            double cur = p.GetNamedNumber(L"current", 0);
+            uint32_t n = list.Size();
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                auto o = list.GetObjectAt(i);
+                double id = o.GetNamedNumber(L"id");
+                std::wstring s = std::to_wstring((long long)id);
+                std::wstring desc = Fill(Fill(Str(L"pagesCount"), L"{b}", std::to_wstring((long long)o.GetNamedNumber(L"boxes"))), L"{i}", std::to_wstring((long long)o.GetNamedNumber(L"icons")));
+                if (id == cur) desc = Str(L"pagesCurrent") + L"  \x00B7  " + desc;
+                std::wstring ctl = L"<StackPanel Orientation=\"Horizontal\" Spacing=\"4\">";
+                ctl += id == cur ? L"<Border Width=\"80\"/>" : L"<Button x:Name=\"PgGo" + s + L"\" Content=\"" + Str(L"pagesGo") + L"\" MinWidth=\"80\"/>";
+                ctl += IconButton(L"PgRen" + s, L"&#xE8AC;", Str(L"pagesRename"), true);
+                ctl += IconButton(L"PgUp" + s, L"&#xE70E;", Str(L"pagesUp"), i > 0);
+                ctl += IconButton(L"PgDown" + s, L"&#xE70D;", Str(L"pagesDown"), i + 1 < n);
+                ctl += IconButton(L"PgDel" + s, L"&#xE74D;", Str(L"pagesDelete"), n > 1);
+                ctl += L"</StackPanel>";
+                x += Card(id == cur ? L"&#xE7C4;" : L"&#xE737;", std::to_wstring(i + 1) + L".  " + Esc(std::wstring(o.GetNamedString(L"name", L"").c_str())), desc, ctl);
+            }
+            x += L"<Button x:Name=\"PgNew\" Margin=\"0,4,0,0\" Padding=\"14,8\"><StackPanel Orientation=\"Horizontal\" Spacing=\"8\"><FontIcon Glyph=\"&#xE710;\" FontSize=\"14\"/><TextBlock Text=\"" + Str(L"pagesNew") + L"\"/></StackPanel></Button>";
+            std::wstring nf = p.GetNamedString(L"newFiles", L"current").c_str();
+            x += Card(L"&#xE8E5;", Str(L"pagesNewFiles"), Str(L"pagesNewFilesDesc"),
+                      L"<ComboBox x:Name=\"PgNewFiles\" MinWidth=\"220\">" + Opt(L"current", Str(L"pagesNewCurrent"), nf != L"first") + Opt(L"first", Str(L"pagesNewFirst"), nf == L"first") + L"</ComboBox>");
+            // Going from page to page.
+            x += Section(Str(L"pagesSwitch"));
+            x += Card(L"&#xE765;", Str(L"pagesAltKeys"), Str(L"pagesAltKeysDesc"), Toggle(L"PgAlt", on(L"altKeys")));
+            x += Card(L"&#xE7C9;", Str(L"pagesSwipe"), Str(L"pagesSwipeDesc"), Toggle(L"PgSwipe", on(L"swipe")));
+            x += Card(L"&#xE962;", Str(L"pagesMiddle"), L"", Toggle(L"PgMiddle", on(L"middleDrag")));
+            x += Card(L"&#xE962;", Str(L"pagesBoth"), L"", Toggle(L"PgBoth", on(L"bothDrag")));
+            x += Card(L"&#xE8A0;", Str(L"pagesEdgePull"), L"", Toggle(L"PgEdgePull", on(L"edgePull")));
+            x += Card(L"&#xE8AB;", Str(L"pagesEdgeDrag"), Str(L"pagesEdgeDragDesc"), Toggle(L"PgEdgeDrag", on(L"edgeDrag")));
+            // The slide.
+            x += Section(Str(L"pagesLook"));
+            x += Card(L"&#xE916;", Str(L"pagesAnimate"), Str(L"pagesAnimateDesc"), Toggle(L"PgAnimate", on(L"animate")));
+            x += Card(L"&#xE945;", Str(L"pagesBounce"), L"", Toggle(L"PgBounce", on(L"bounce")));
+            x += Card(L"&#xE8EC;", Str(L"pagesShowName"), Str(L"pagesShowNameDesc"), Toggle(L"PgShowName", on(L"showName")));
+            return x;
+        }
+
         std::wstring PageSaved()
         {
             auto sv = g.data.GetNamedObject(L"saved", JsonObject());
@@ -878,6 +927,7 @@ namespace dbx
             { L"above", L"above", L"pageAbove", L"tileAbove", nullptr, nullptr },
             { L"hide", L"hide", L"pageHide", L"tileHide", L"hide", L"doubleClick" },
             { L"saved", L"saved", L"pageSaved", L"tileSaved", nullptr, nullptr },
+            { L"pages", L"pages", L"pagePages", L"tilePages", L"pages", L"enabled" },
             { L"search", L"search", L"pageSearch", L"tileSearch", L"search", L"field" },
             { L"locks", L"locks", L"pageLocks", L"tileLocks", L"app", L"lockAll" },
             { L"privacy", L"privacy", L"pagePrivacy", L"tilePrivacy", L"app", L"privacy" },
@@ -888,7 +938,7 @@ namespace dbx
             if (!t.scope) return false;
             std::wstring sc = t.scope, k = t.key;
             if (sc == L"app") return g.data.GetNamedObject(L"app", JsonObject()).GetNamedBoolean(k == L"lockAll" ? L"lockAll" : L"privacy", k != L"lockAll");
-            bool def = sc == L"search";
+            bool def = sc == L"search" || sc == L"pages";
             return g.data.GetNamedObject(t.scope, JsonObject()).GetNamedBoolean(t.key, def);
         }
 
@@ -988,6 +1038,8 @@ namespace dbx
                     rows += row(Str(L"scAbove"), caps);
                 }
             }
+            if (g.data.GetNamedObject(L"pages", JsonObject()).GetNamedBoolean(L"enabled", true) && g.data.GetNamedObject(L"pages", JsonObject()).GetNamedBoolean(L"altKeys", true))
+                rows += row(Str(L"scPages"), Key(L"Alt") + Key(L"&#x2190;") + Key(L"&#x2192;"));
             rows += row(Str(L"scBoxMenu"), words(L"scBoxMenuHow"));
             x += L"<Border Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"0,4\"><StackPanel>" + rows + L"</StackPanel></Border>";
             return x;
@@ -1014,6 +1066,7 @@ namespace dbx
             { L"above", L"pageAbove", L"&#xE8A0;", PageAbove, false, true, L"heroAbove", L"above" },
             { L"hide", L"pageHide", L"&#xE91B;", PageHide, false, true, L"heroHide", L"hide" },
             { L"saved", L"pageSaved", L"&#xE81C;", PageSaved, false, true, L"heroSaved", L"saved" },
+            { L"pages", L"pagePages", L"&#xE7C4;", PagePages, false, true, L"heroPages", L"pages" },
             { L"search", L"pageSearch", L"&#xE721;", PageSearch, false, true, L"heroSearch", L"search" },
             { L"locks", L"pageLocks", L"&#xE72E;", PageLocks, false, true, L"heroLocks", L"locks" },
             { L"privacy", L"pagePrivacy", L"&#xED1A;", PagePrivacy, false, true, L"heroPrivacy", L"privacy" },
@@ -1575,6 +1628,28 @@ namespace dbx
                     AllowSetForegroundWindow(ASFW_ANY);
                     Send(L"above", 0, L"now", JsonValue::CreateBooleanValue(true));
                 });
+            // Desktop pages
+            OnToggle(root, L"PgOn", L"pages", L"enabled");
+            OnToggle(root, L"PgAlt", L"pages", L"altKeys");
+            OnToggle(root, L"PgSwipe", L"pages", L"swipe");
+            OnToggle(root, L"PgMiddle", L"pages", L"middleDrag");
+            OnToggle(root, L"PgBoth", L"pages", L"bothDrag");
+            OnToggle(root, L"PgEdgePull", L"pages", L"edgePull");
+            OnToggle(root, L"PgEdgeDrag", L"pages", L"edgeDrag");
+            OnToggle(root, L"PgAnimate", L"pages", L"animate");
+            OnToggle(root, L"PgBounce", L"pages", L"bounce");
+            OnToggle(root, L"PgShowName", L"pages", L"showName");
+            OnCombo(root, L"PgNewFiles", [](std::wstring v) { Send(L"pages", 0, L"newFiles", JsonValue::CreateStringValue(v)); });
+            OnClick(root, L"PgNew", L"pages", 0, L"new");
+            for (auto const& e : g.data.GetNamedObject(L"pages", JsonObject()).GetNamedArray(L"list", JsonArray()))
+            {
+                double id = e.GetObject().GetNamedNumber(L"id");
+                std::wstring s = std::to_wstring((long long)id);
+                using P = std::pair<const wchar_t*, const wchar_t*>;
+                for (auto [name, key] : { P{ L"PgGo", L"go" }, P{ L"PgRen", L"rename" }, P{ L"PgUp", L"up" }, P{ L"PgDown", L"down" }, P{ L"PgDel", L"delete" } })
+                    if (auto b = Find<muxc::Button>(root, name + s))
+                        b.Click([key = key, id](auto&&, auto&&) { Send(L"pages", 0, key, JsonValue::CreateNumberValue(id)); });
+            }
             // Saved layouts
             OnClick(root, L"SaveNow", L"saved", 0, L"now");
             OnToggle(root, L"SavedMenu", L"saved", L"inMenu");
@@ -1841,6 +1916,155 @@ namespace dbx
         gp.window.Activate();
         SetForegroundWindow(hwnd);
         Log(L"color picker opened for %s (box %g)", gp.key.c_str(), gp.box);
+    }
+
+    namespace
+    {
+        struct Dialog
+        {
+            mux::Window window{ nullptr };
+            std::function<void(JsonObject)> send;
+            double id = 0;
+            bool text = false;
+            bool done = false;
+        };
+        Dialog gd;
+
+        void DialogSend(bool ok, const std::wstring& value)
+        {
+            if (gd.done || !gd.send) return;
+            gd.done = true;
+            JsonObject o;
+            o.SetNamedValue(L"scope", JsonValue::CreateStringValue(L"dialog"));
+            o.SetNamedValue(L"dialog", JsonValue::CreateNumberValue(gd.id));
+            o.SetNamedValue(L"ok", JsonValue::CreateBooleanValue(ok));
+            o.SetNamedValue(L"value", JsonValue::CreateStringValue(value));
+            gd.send(o);
+        }
+
+        std::wstring Trimmed(std::wstring s)
+        {
+            while (!s.empty() && iswspace(s.back())) s.pop_back();
+            size_t a = 0;
+            while (a < s.size() && iswspace(s[a])) ++a;
+            return s.substr(a);
+        }
+
+        // OK (a name field must not be empty) or Cancel: answered, closed.
+        void DialogEnd(mux::FrameworkElement const& root, bool ok)
+        {
+            std::wstring v;
+            if (auto f = Find<muxc::TextBox>(root, L"Field")) v = Trimmed(f.Text().c_str());
+            if (ok && gd.text && v.empty()) return;
+            DialogSend(ok, v);
+            if (gd.window) gd.window.Close();
+        }
+    }
+
+    void ShowDialog(JsonObject const& data, std::function<void(JsonObject)> send)
+    {
+        if (gd.window && !gd.done) { DialogSend(false, L""); gd.window.Close(); }
+        gd = Dialog{};
+        gd.send = std::move(send);
+        gd.id = data.GetNamedNumber(L"dialog", 0);
+        gd.text = data.GetNamedString(L"kind", L"confirm") == L"text";
+        auto s = [&](const wchar_t* k) { return Esc(std::wstring(data.GetNamedString(k, L"").c_str())); };
+        std::wstring body = s(L"body");
+        // ContentDialog's look: the title (Subtitle), the text, the field; the buttons in a band
+        // at the bottom. It comes in as ContentDialog does: fading in, from 1.05 times its size.
+        std::wstring x = LR"(<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Name="Root" Opacity="0" RenderTransformOrigin="0.5,0.5">
+<Grid.RenderTransform><ScaleTransform x:Name="Sc" ScaleX="1.05" ScaleY="1.05"/></Grid.RenderTransform>
+<Grid.Triggers><EventTrigger RoutedEvent="FrameworkElement.Loaded"><BeginStoryboard><Storyboard>
+<DoubleAnimation Storyboard.TargetName="Root" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.167"/>
+<DoubleAnimation Storyboard.TargetName="Sc" Storyboard.TargetProperty="ScaleX" To="1" Duration="0:0:0.35"><DoubleAnimation.EasingFunction><ExponentialEase EasingMode="EaseOut" Exponent="6"/></DoubleAnimation.EasingFunction></DoubleAnimation>
+<DoubleAnimation Storyboard.TargetName="Sc" Storyboard.TargetProperty="ScaleY" To="1" Duration="0:0:0.35"><DoubleAnimation.EasingFunction><ExponentialEase EasingMode="EaseOut" Exponent="6"/></DoubleAnimation.EasingFunction></DoubleAnimation>
+</Storyboard></BeginStoryboard></EventTrigger></Grid.Triggers>
+<Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+<StackPanel x:Name="Content" Padding="24,24,24,24" Spacing="12">
+<TextBlock Text=")" + s(L"title") + LR"(" Style="{StaticResource SubtitleTextBlockStyle}" TextWrapping="Wrap"/>)";
+        if (!body.empty()) x += L"<TextBlock Text=\"" + body + L"\" TextWrapping=\"Wrap\"/>";
+        if (gd.text) x += L"<TextBox x:Name=\"Field\" Text=\"" + s(L"value") + L"\" PlaceholderText=\"" + s(L"placeholder") + L"\" MaxLength=\"60\" Margin=\"0,4,0,0\"/>";
+        x += LR"(</StackPanel>
+<Grid x:Name="Band" Grid.Row="1" Padding="24" ColumnSpacing="8" Background="{ThemeResource LayerOnMicaBaseAltFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
+<Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+<Button x:Name="Ok" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Stretch" Content=")" + s(L"ok") + LR"("/>
+<Button x:Name="Cancel" Grid.Column="1" HorizontalAlignment="Stretch" Content=")" + s(L"cancel") + LR"("/>
+</Grid></Grid>)";
+        mux::FrameworkElement root{ nullptr };
+        try { root = mux::Markup::XamlReader::Load(x).as<mux::FrameworkElement>(); }
+        catch (winrt::hresult_error const& e) { Log(L"dialog: XAML failed: %s", e.message().c_str()); DialogSend(false, L""); return; }
+        gd.window = mux::Window();
+        gd.window.SystemBackdrop(mux::Media::MicaBackdrop());
+        gd.window.Title(data.GetNamedString(L"title", L"Deskboxes"));
+        gd.window.Content(root);
+        auto aw = gd.window.AppWindow();
+        HWND hwnd = winrt::Microsoft::UI::GetWindowFromWindowId(aw.Id());
+        if (HICON ico = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE))
+            aw.SetIcon(winrt::Microsoft::UI::GetIconIdFromIcon(ico));
+        if (auto op = aw.Presenter().try_as<winrt::Microsoft::UI::Windowing::OverlappedPresenter>())
+        {
+            op.IsResizable(false);
+            op.IsMaximizable(false);
+            op.IsMinimizable(false);
+            op.IsAlwaysOnTop(true);
+            // No title bar, as a ContentDialog (the border and rounded corners stay).
+            op.SetBorderAndTitleBar(true, false);
+        }
+        // (Without a caption Windows leaves the corners square: rounded, as a dialog's.)
+        DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+        // Centered on the pointer's monitor (where the menu was), as wide as a ContentDialog.
+        POINT pt{}; GetCursorPos(&pt);
+        HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi{ sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+        UINT dpi = GetDpiForWindow(hwnd); if (!dpi) dpi = 96;
+        auto& wa = mi.rcWork;
+        auto place = [hwnd, wa, dpi](double hDip)
+        {
+            int w = MulDiv(440, dpi, 96), h = (int)std::ceil(hDip * dpi / 96.0);
+            if (auto win = gd.window) win.AppWindow().MoveAndResize({ wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h });
+        };
+        place(gd.text ? 216 : (body.empty() ? 160 : 196));
+        // Its real height once laid out (the text wraps).
+        root.Loaded([root, place](auto&&, auto&&)
+        {
+            root.Measure({ 440, std::numeric_limits<float>::infinity() });
+            double h = root.DesiredSize().Height;
+            if (h > 60) place(h);
+            if (auto f = Find<muxc::TextBox>(root, L"Field"))
+            {
+                f.Focus(mux::FocusState::Programmatic);
+                f.SelectAll();
+            }
+            else if (auto b = Find<muxc::Button>(root, L"Ok")) b.Focus(mux::FocusState::Programmatic);
+        });
+        auto ok = Find<muxc::Button>(root, L"Ok");
+        if (auto f = Find<muxc::TextBox>(root, L"Field"))
+            f.TextChanged([ok](auto&& s, auto&&) { auto t = s.template as<muxc::TextBox>(); if (ok && t) ok.IsEnabled(!Trimmed(t.Text().c_str()).empty()); });
+        if (ok) ok.Click([root](auto&&, auto&&) { DialogEnd(root, true); });
+        if (auto b = Find<muxc::Button>(root, L"Cancel"))
+            b.Click([root](auto&&, auto&&) { DialogEnd(root, false); });
+        root.KeyDown([root](auto&&, mux::Input::KeyRoutedEventArgs const& e)
+        {
+            if (e.Key() == winrt::Windows::System::VirtualKey::Escape) { e.Handled(true); DialogEnd(root, false); }
+            else if (e.Key() == winrt::Windows::System::VirtualKey::Enter)
+            {
+                // (Enter on Cancel is Cancel's own click.)
+                auto focused = mux::Input::FocusManager::GetFocusedElement(root.XamlRoot()).try_as<muxc::Button>();
+                if (focused && focused.Name() == L"Cancel") return;
+                e.Handled(true);
+                DialogEnd(root, true);
+            }
+        });
+        gd.window.Closed([](auto&&, auto&&)
+        {
+            DialogSend(false, L"");
+            gd.window = nullptr;
+            TrimMemorySoon();
+        });
+        gd.window.Activate();
+        SetForegroundWindow(hwnd);
+        Log(L"dialog %g opened", gd.id);
     }
 
     void ShowSettings(JsonObject const& data, bool open, std::function<void(JsonObject)> send)

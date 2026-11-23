@@ -7,7 +7,7 @@ from PIL import Image
 
 A = os.path.dirname(os.path.abspath(__file__))
 O = os.path.normpath(os.path.join(A, '..', '..', 'res', 'settings'))
-TILES = {'tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy'}
+TILES = {'tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy', 'pages'}
 
 
 def save(im, size, name):

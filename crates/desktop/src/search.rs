@@ -285,6 +285,20 @@ impl App {
                 out.extend(b.tabs[ti].items.iter().filter(|k| self.items.contains_key(*k) && name_ok(k)).cloned());
             }
         }
+        // Then the other desktop pages', in their order (going to one shows its page).
+        if self.search.scope.is_none() && self.pages_on() {
+            for p in deskboxes_core::pages::ids(&self.layout).into_iter().filter(|p| *p != self.layout.page) {
+                let Some(c) = self.layout.parked.get(&p) else { continue };
+                let mut loose: Vec<(&ItemKey, &Cell)> = c.loose.iter().filter(|(k, _)| self.items.contains_key(*k)).collect();
+                loose.sort_by_key(|(_, c)| self.grid.index_of(**c));
+                out.extend(loose.into_iter().map(|(k, _)| k.clone()).filter(|k| name_ok(k)));
+                for b in c.boxes.iter() {
+                    for tab in &b.tabs {
+                        out.extend(tab.items.iter().filter(|k| self.items.contains_key(*k) && name_ok(k)).cloned());
+                    }
+                }
+            }
+        }
         self.search.set = out.iter().cloned().collect();
         self.search.matches = out;
         self.search.cur = 0;
@@ -298,6 +312,10 @@ impl App {
             self.sel.clear();
             return;
         };
+        // On another desktop page: that page first.
+        if let Some(p) = deskboxes_core::pages::page_of_item(&self.layout, &k).filter(|p| *p != self.layout.page) {
+            self.go_page(p);
+        }
         self.sel.select_only(&k);
         let found = self.layout.boxes.iter().find_map(|b| b.tabs.iter().position(|t| t.items.contains(&k)).map(|ti| (b.id, ti)));
         if let Some((id, ti)) = found {

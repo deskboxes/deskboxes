@@ -18,4 +18,11 @@ namespace dbx
     // cancel = true.
     void ShowColorPicker(winrt::Windows::Data::Json::JsonObject const& data,
                          std::function<void(winrt::Windows::Data::Json::JsonObject)> send);
+
+    // A dialog as Windows' ContentDialog looks (a small Mica window without a title bar,
+    // centered on the pointer's monitor, fading and scaling in): `data` = { dialog (id), kind:
+    // "text" | "confirm", title, body, value, placeholder, ok, cancel }. The answer goes back as
+    // { scope: "dialog", dialog, ok, value } (Esc, Cancel or closing: ok = false).
+    void ShowDialog(winrt::Windows::Data::Json::JsonObject const& data,
+                    std::function<void(winrt::Windows::Data::Json::JsonObject)> send);
 }

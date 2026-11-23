@@ -128,9 +128,10 @@ pub fn find_tab(l: &MonitorLayout, tab: u32) -> Option<(u32, usize)> {
     l.boxes.iter().find_map(|b| b.tabs.iter().position(|t| t.id == tab).map(|i| (b.id, i)))
 }
 
-/// Where rules send an item: the first enabled rule that matches and whose tab still exists.
+/// Where rules send an item: the first enabled rule that matches and whose tab still exists (on
+/// any desktop page).
 pub fn target(l: &MonitorLayout, it: &Item, now: u64) -> Option<u32> {
-    l.rules.iter().filter(|r| find_tab(l, r.target).is_some()).find(|r| matches(r, it, now)).map(|r| r.target)
+    l.rules.iter().filter(|r| crate::pages::find_tab(l, r.target).is_some()).find(|r| matches(r, it, now)).map(|r| r.target)
 }
 
 /// Put `items` where the rules say (in the given order). `fresh` = they just appeared on the
@@ -139,13 +140,15 @@ pub fn target(l: &MonitorLayout, it: &Item, now: u64) -> Option<u32> {
 pub fn apply(l: &mut MonitorLayout, items: &[&Item], fresh: bool, now: u64) -> bool {
     let mut changed = false;
     for it in items {
-        let dest = target(l, it, now).or(if fresh { l.new_items_to.filter(|t| find_tab(l, *t).is_some()) } else { None });
+        let dest = target(l, it, now).or(if fresh { l.new_items_to.filter(|t| crate::pages::find_tab(l, *t).is_some()) } else { None });
         let Some(tab) = dest else { continue };
-        if matches!(place_of(l, &it.key), Some(Place::Box { tab: t, .. }) if t == tab) {
+        // (The tab may be on another desktop page: done there.)
+        let Some((page, box_id, ti)) = crate::pages::find_tab(l, tab) else { continue };
+        let there = crate::pages::with_page(l, page, |l| matches!(place_of(l, &it.key), Some(Place::Box { tab: t, .. }) if t == tab)).unwrap_or(false);
+        if there {
             continue;
         }
-        let Some((box_id, ti)) = find_tab(l, tab) else { continue };
-        changed |= move_to_tab(l, std::slice::from_ref(&it.key), box_id, ti, None);
+        changed |= crate::pages::with_page(l, page, |l| move_to_tab(l, std::slice::from_ref(&it.key), box_id, ti, None)).unwrap_or(false);
     }
     changed
 }

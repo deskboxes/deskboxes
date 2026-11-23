@@ -39,6 +39,7 @@ namespace dbx
     struct MenuRequest
     {
         bool background = false;
+        bool ownOnly = false;               // only Deskboxes' own entries (the page name's menu)
         std::wstring folder;                // parsing name of the folder (desktop or fixture)
         std::vector<std::wstring> items;    // parsing names (full paths or ::{CLSID})
         bool shift = false;

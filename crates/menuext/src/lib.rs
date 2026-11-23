@@ -2,9 +2,11 @@
 //! turned off ("Turn off Deskboxes" ends the core, so nothing of ours is running to add it).
 //!
 //! An `IExplorerCommand` that Explorer loads from the sparse package the installer registers
-//! (`package/AppxManifest.xml`, unsigned, per user, no admin). `GetState` reads
-//! `%APPDATA%\Deskboxes\settings.json` and hides the item unless `"enabled": false`; `Invoke`
-//! starts the watchdog next to this DLL with `--launch --enable` (as the Start menu shortcut does).
+//! (`package/AppxManifest.xml`, unsigned; registering it needs administrator rights once).
+//! `GetState` reads `%APPDATA%\Deskboxes\settings.json` and hides the item unless
+//! `"enabled": false`; `Invoke` starts the watchdog next to this DLL with `--launch --enable` (as
+//! the Start menu shortcut does), through Explorer: started from here directly, Deskboxes would
+//! inherit the package's identity (`deskboxes_shell::launch`).
 
 #![allow(non_snake_case)]
 
@@ -99,7 +101,12 @@ impl IExplorerCommand_Impl for TurnOn_Impl {
     }
     fn Invoke(&self, _: Ref<IShellItemArray>, _: Ref<IBindCtx>) -> Result<()> {
         let dir = here().ok_or(Error::from(E_FAIL))?;
-        let wd = HSTRING::from(dir.join("deskboxes-watchdog.exe").as_os_str());
+        let exe = dir.join("deskboxes-watchdog.exe");
+        if deskboxes_shell::launch::via_explorer(&exe, "--launch --enable", &dir).is_ok() {
+            return Ok(());
+        }
+        // (The watchdog leaves the package itself then: see its `main`.)
+        let wd = HSTRING::from(exe.as_os_str());
         let d = HSTRING::from(dir.as_os_str());
         let r = unsafe { ShellExecuteW(None, w!("open"), &wd, w!("--launch --enable"), &d, SW_SHOWNORMAL) };
         if r.0 as isize <= 32 {

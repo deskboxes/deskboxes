@@ -2,6 +2,7 @@
 //! Phase 1 redraws the whole surface per frame (frames happen only on input or model changes).
 
 use crate::app::{ease_out, header_h, radius, App, Drag, PAD, TAB_ANIM_S, TAB_GAP, TIP_FADE_S};
+use deskboxes_core::pages;
 use deskboxes_core::*;
 use deskboxes_render::{self as r, rgba, Color, Dc, RectF};
 use std::time::Instant;
@@ -138,8 +139,10 @@ impl App {
         self.step_roll_anim();
         self.vanish_animating();
         self.prepare();
+        self.pages_before_frame();
+        self.prepare_beside();
         let Some(surf) = self.surf.take() else { return };
-        let res = surf.draw(self.scale, |dc| self.paint(dc));
+        let res = surf.draw(self.scale, |dc| self.paint_frame(dc));
         self.surf = Some(surf);
         if let Err(e) = res.and_then(|_| self.gpu.commit()) {
             log::warn!("draw: {e}");
@@ -170,11 +173,29 @@ impl App {
             self.write_scene();
         }
         self.selection_changed_check();
+        self.pages_after_frame();
         crate::anim::set(self.animating());
     }
 
+    /// During a slide between pages: the labels of the page beside made too.
+    fn prepare_beside(&mut self) {
+        let Some(o) = self.page_frame().and_then(|f| f.other).filter(|o| *o != self.layout.page) else { return };
+        let back = self.layout.page;
+        if !pages::switch_to(&mut self.layout, o) {
+            return;
+        }
+        let cells = self.cells_in_view();
+        for (k, cell, in_box) in &cells {
+            self.prep_label(k, *cell, *in_box);
+        }
+        self.request_sized_icons(&cells);
+        pages::switch_to(&mut self.layout, back);
+    }
+
+    /// Where the monitor's top-left is in what is being drawn (a page sliding by is moved: the
+    /// wallpaper behind its boxes' glass is not).
     pub fn mon_offset(&self) -> (f32, f32) {
-        ((self.mon.left - self.origin_px.x) as f32 / self.scale, (self.mon.top - self.origin_px.y) as f32 / self.scale)
+        ((self.mon.left - self.origin_px.x) as f32 / self.scale - self.pages.paint_dx, (self.mon.top - self.origin_px.y) as f32 / self.scale)
     }
 
     /// Explorer's drag image: the dragged icons and labels, half transparent, moved by (dx, dy)
@@ -182,7 +203,7 @@ impl App {
     fn paint_ghost(&self, dc: &Dc, keys: &[ItemKey], dx: f32, dy: f32, alpha: f32) -> r::R<()> {
         let ghost_text = Color { a: (1.25 * alpha).min(1.0), ..Self::desktop_theme().text };
         let set: std::collections::HashSet<&ItemKey> = keys.iter().collect();
-        for (k, cell, bx) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
+        for (k, cell, bx) in self.drag_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
             let m = self.metrics_of(*bx);
             let (icon, label) = self.item_parts(k, *cell, false, &m);
             if self.privacy_on() {
@@ -214,7 +235,7 @@ impl App {
         let m = r::LABEL_MARGIN + 2.0;
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         let set: std::collections::HashSet<&ItemKey> = keys.iter().collect();
-        for (_, cell, _) in self.visible_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
+        for (_, cell, _) in self.drag_cells().iter().filter(|(k, _, _)| set.contains(k)).take(64) {
             x0 = x0.min(cell.x - m);
             y0 = y0.min(cell.y - m);
             x1 = x1.max(cell.right() + m);
@@ -331,9 +352,74 @@ impl App {
         Ok(())
     }
 
+    /// A frame: the page shown, or while it slides to or from another page both of them, each
+    /// moved (`pages.rs`); the wallpaper and what is over the pages stay put.
+    fn paint_frame(&mut self, dc: &Dc) -> r::R<()> {
+        let Some(f) = self.page_frame() else { return self.paint(dc) };
+        self.paint_back(dc)?;
+        if !self.settings.show_icons {
+            return Ok(());
+        }
+        self.pages.sliding = true;
+        let r: r::R<()> = (|| {
+            if let Some(o) = f.other.filter(|o| *o != self.layout.page) {
+                let back = self.layout.page;
+                if pages::switch_to(&mut self.layout, o) {
+                    let pl = self.preview_loose.take();
+                    let r = self.paint_moved(dc, f.other_dx, f.other_alpha, false);
+                    self.preview_loose = pl;
+                    pages::switch_to(&mut self.layout, back);
+                    r?;
+                }
+            }
+            self.paint_moved(dc, f.dx, f.alpha, true)?;
+            // A box carried to this page: under the pointer, not sliding.
+            if let Drag::MoveBox { id, .. } = &self.drag {
+                if let Some(b) = self.box_by_id(*id) {
+                    self.paint_box(dc, b)?;
+                }
+            }
+            Ok(())
+        })();
+        self.pages.sliding = false;
+        r?;
+        self.paint_overlays(dc)
+    }
+
+    /// A page moved by `dx` at `alpha` (`current`: the page shown, with what is being dragged).
+    fn paint_moved(&mut self, dc: &Dc, dx: f32, alpha: f32, current: bool) -> r::R<()> {
+        if alpha <= 0.002 || dx.abs() >= self.size_dip.0 {
+            return Ok(());
+        }
+        self.pages.paint_dx = dx;
+        let all = rf(Rect::new(-dx, 0.0, self.size_dip.0, self.size_dip.1));
+        let layer = alpha < 0.998;
+        let r = r::translated(dc, dx, 0.0, || {
+            if layer {
+                r::push_layer(dc, all, alpha)?;
+            }
+            let r = self.paint_content(dc, current);
+            if layer {
+                r::pop_layer(dc);
+            }
+            r
+        });
+        self.pages.paint_dx = 0.0;
+        r
+    }
+
     fn paint(&self, dc: &Dc) -> r::R<()> {
-        let above = self.is_above();
-        if above {
+        self.paint_back(dc)?;
+        if !self.settings.show_icons {
+            return Ok(());
+        }
+        self.paint_content(dc, true)?;
+        self.paint_overlays(dc)
+    }
+
+    /// Behind the pages: the wallpaper, or (boxes above windows) the windows, dimmed a little.
+    fn paint_back(&self, dc: &Dc) -> r::R<()> {
+        if self.is_above() {
             // Boxes above windows: the windows behind, dimmed a little; no wallpaper or loose icons.
             let d = self.above_dim();
             if d > 0.002 {
@@ -344,16 +430,32 @@ impl App {
             let sz = unsafe { w.GetPixelSize() };
             r::draw_bitmap(dc, w, r::rect(ox, oy, sz.width as f32 / self.scale, sz.height as f32 / self.scale), 1.0);
         }
+        Ok(())
+    }
+
+    /// Over the pages: an edge a drag is held at, the search pill, the page's name, tooltips.
+    fn paint_overlays(&self, dc: &Dc) -> r::R<()> {
+        self.paint_page_edge(dc)?;
+        self.paint_search(dc)?;
+        self.paint_page_pill(dc)?;
+        self.paint_tip(dc)?;
+        if self.diag {
+            self.paint_diagnostics(dc)?;
+        }
+        Ok(())
+    }
+
+    /// A page: its loose icons and boxes, and (`current`: the page shown) the selection band and
+    /// what is being dragged.
+    fn paint_content(&self, dc: &Dc, current: bool) -> r::R<()> {
+        let above = self.is_above();
         let dragging: Vec<ItemKey> = match &self.drag {
             Drag::Items { keys, .. } => keys.clone(),
             _ => vec![],
         };
         let dt = Self::desktop_theme();
-        if !self.settings.show_icons {
-            return Ok(());
-        }
         // Hidden with a double-click (Settings › Hide all): fading away or back.
-        let all = rf(Rect::new(0.0, 0.0, self.size_dip.0, self.size_dip.1));
+        let all = rf(Rect::new(-self.pages.paint_dx, 0.0, self.size_dip.0, self.size_dip.1));
         let ta = if above { 0.0 } else { self.tuck_alpha(None) };
         if ta > 0.002 {
             if ta < 0.998 {
@@ -385,11 +487,11 @@ impl App {
         }
         // A selection band started on the desktop goes behind the boxes: it selects only loose
         // icons, and this shows it.
-        let band_behind = match &self.drag {
-            Drag::Rubber { scope: None, .. } => true,
-            Drag::RightRubber { start, .. } => !self.layout.boxes.iter().any(|b| self.shown_rect(b).contains(*start)),
-            _ => false,
-        };
+        let band_behind = current
+            && match &self.drag {
+                Drag::Rubber { scope: None, .. } | Drag::RightRubber { scope: None, .. } => true,
+                _ => false,
+            };
         if band_behind {
             self.paint_band(dc)?;
         }
@@ -397,6 +499,10 @@ impl App {
         for b in &self.layout.boxes {
             let ba = self.tuck_alpha(Some(b));
             if ba <= 0.002 {
+                continue;
+            }
+            // (A box carried to another page is drawn over the slide.)
+            if self.pages.sliding && matches!(&self.drag, Drag::MoveBox { id, .. } if *id == b.id) {
                 continue;
             }
             if ba < 0.998 {
@@ -407,10 +513,13 @@ impl App {
                 r::pop_layer(dc);
             }
         }
+        if !current {
+            return Ok(());
+        }
         // Drag feedback.
         match &self.drag {
             Drag::Items { keys, start, cur } => {
-                let cells = self.visible_cells();
+                let cells = self.drag_cells();
                 self.paint_ghost(dc, &dragging, cur.x - start.x, cur.y - start.y, 0.6)?;
                 // How many are being dragged.
                 if self.settings.extras.drag_count && keys.len() > 1 {
@@ -454,22 +563,17 @@ impl App {
             Drag::Rubber { .. } | Drag::RightRubber { .. } if !band_behind => self.paint_band(dc)?,
             _ => {}
         }
-        self.paint_search(dc)?;
-        self.paint_tip(dc)?;
-        if self.diag {
-            self.paint_diagnostics(dc)?;
-        }
         Ok(())
     }
 
     /// The selection band (Explorer's accent rectangle).
     fn paint_band(&self, dc: &Dc) -> r::R<()> {
-        let (Drag::Rubber { start, cur, .. } | Drag::RightRubber { start, cur }) = &self.drag else { return Ok(()) };
+        let (Drag::Rubber { start, cur, .. } | Drag::RightRubber { start, cur, .. }) = &self.drag else { return Ok(()) };
         let band = Rect::from_points(*start, *cur);
         let (ar, ag, ab) = accent();
         // A band started in a box stays inside it (it selects only that box's icons).
         let clip = match &self.drag {
-            Drag::Rubber { scope: Some(id), .. } => self.box_by_id(*id).map(App::content_rect),
+            Drag::Rubber { scope: Some(id), .. } | Drag::RightRubber { scope: Some(id), .. } => self.box_by_id(*id).map(App::content_rect),
             _ => None,
         };
         if let Some(c) = clip {

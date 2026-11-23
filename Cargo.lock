@@ -45,6 +45,7 @@ name = "deskboxes-menuext"
 version = "0.1.2"
 dependencies = [
  "deskboxes-i18n",
+ "deskboxes-shell",
  "serde_json",
  "windows",
  "windows-core",

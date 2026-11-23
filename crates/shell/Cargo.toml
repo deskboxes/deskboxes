@@ -11,9 +11,14 @@ deskboxes-core = { workspace = true }
 log = { workspace = true }
 windows-core = { workspace = true }
 windows = { workspace = true, features = [
+    "ApplicationModel",
+    "Foundation",
+    "Foundation_Collections",
+    "Management_Deployment",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_Security",

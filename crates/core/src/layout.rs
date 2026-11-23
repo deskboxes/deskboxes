@@ -44,6 +44,20 @@ pub fn free_cell(l: &MonitorLayout, g: &Grid, from: i32, taken: &HashSet<Cell>) 
 pub fn reconcile(l: &mut MonitorLayout, present: &[ItemKey], g: &Grid) -> bool {
     let set: HashSet<&ItemKey> = present.iter().collect();
     let mut changed = false;
+    // The other desktop pages: removed items go from there too; their items are placed.
+    for c in l.parked.values_mut() {
+        let n = c.loose.len();
+        c.loose.retain(|k, _| set.contains(k));
+        c.homes.retain(|k, _| set.contains(k));
+        changed |= n != c.loose.len();
+        for b in c.boxes.iter_mut().filter(|b| !b.is_folder()) {
+            for t in &mut b.tabs {
+                let n = t.items.len();
+                t.items.retain(|k| set.contains(k));
+                changed |= n != t.items.len();
+            }
+        }
+    }
     let before = l.loose.len();
     l.loose.retain(|k, _| set.contains(k));
     changed |= before != l.loose.len();
@@ -62,6 +76,7 @@ pub fn reconcile(l: &mut MonitorLayout, present: &[ItemKey], g: &Grid) -> bool {
             placed.extend(t.items.iter().cloned());
         }
     }
+    placed.extend(crate::pages::parked_keys(l));
     let mut taken = occupied(l);
     // Cells pushed off-grid (smaller screen) are re-placed.
     let off: Vec<ItemKey> = l.loose.iter().filter(|(_, c)| c.col >= g.cols || c.row >= g.rows).map(|(k, _)| k.clone()).collect();
@@ -97,6 +112,16 @@ fn remove_everywhere(l: &mut MonitorLayout, keys: &[ItemKey]) {
     for b in &mut l.boxes {
         for t in &mut b.tabs {
             t.items.retain(|k| !set.contains(k));
+        }
+    }
+    // (And from the other desktop pages.)
+    for c in l.parked.values_mut() {
+        c.loose.retain(|k, _| !set.contains(k));
+        c.homes.retain(|k, _| !set.contains(k));
+        for b in &mut c.boxes {
+            for t in &mut b.tabs {
+                t.items.retain(|k| !set.contains(k));
+            }
         }
     }
 }

@@ -354,6 +354,34 @@ pub struct MonitorLayout {
     /// path). A folder without one is shown folders first, then by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub folder_orders: BTreeMap<String, Vec<ItemKey>>,
+    /// Desktop pages, in order (empty: one unnamed page). The page shown is `page`: its boxes and
+    /// icons are `boxes` / `loose` / `homes` above, the other pages' wait in `parked` (see
+    /// `pages.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PageMeta>,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parked: BTreeMap<u32, PageContent>,
+}
+
+/// A desktop page: its id and the name it was given ("" = none: "Page N" is shown).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageMeta {
+    pub id: u32,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A page not shown now: its boxes and loose icons (as `MonitorLayout`'s own).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageContent {
+    #[serde(default)]
+    pub boxes: Vec<BoxModel>,
+    #[serde(default)]
+    pub loose: BTreeMap<ItemKey, Cell>,
+    #[serde(default)]
+    pub homes: BTreeMap<ItemKey, Cell>,
 }
 
 /// A sorting rule: icons matching the condition go into tab `target` (a tab id).
@@ -428,6 +456,55 @@ pub struct Settings {
     pub above: AboveSettings,
     /// Updates from GitHub.
     pub update: UpdateSettings,
+    /// Desktop pages.
+    pub pages: PagesSettings,
+}
+
+/// Settings › Desktop pages.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PagesSettings {
+    /// Pages at all (off: one desktop; turning it off with several pages puts everything on one).
+    pub enabled: bool,
+    /// Alt+Left / Alt+Right, and Alt+wheel, on the desktop.
+    pub alt_keys: bool,
+    /// A touchpad's two-finger swipe left or right (its horizontal wheel).
+    pub swipe: bool,
+    /// Dragging the desktop with the middle button.
+    pub middle_drag: bool,
+    /// Dragging the desktop with both buttons held.
+    pub both_drag: bool,
+    /// Pulling the desktop from its left or right screen edge.
+    pub edge_pull: bool,
+    /// Icons or a box dragged to the screen's left or right edge and held there go to the page
+    /// beside (a new one past the last).
+    pub edge_drag: bool,
+    /// Pages slide (off: a quick fade).
+    pub animate: bool,
+    /// A light bounce as a page settles.
+    pub bounce: bool,
+    /// The page's name at the top of the screen for a moment after a switch.
+    pub show_name: bool,
+    /// Where new desktop files appear: "current" (the page shown) or "first".
+    pub new_files: String,
+}
+
+impl Default for PagesSettings {
+    fn default() -> Self {
+        PagesSettings {
+            enabled: true,
+            alt_keys: true,
+            swipe: true,
+            middle_drag: true,
+            both_drag: true,
+            edge_pull: true,
+            edge_drag: true,
+            animate: true,
+            bounce: true,
+            show_name: true,
+            new_files: "current".into(),
+        }
+    }
 }
 
 /// Settings › General › Updates.
@@ -509,6 +586,7 @@ impl Default for Settings {
             saved: SavedSettings::default(),
             above: AboveSettings::default(),
             update: UpdateSettings::default(),
+            pages: PagesSettings::default(),
         }
     }
 }

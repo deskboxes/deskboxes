@@ -6,6 +6,10 @@
 //! How: a top-level window over the monitor (not topmost, so our menus still open above it)
 //! takes over the surface's composition visual and input while it is up (`App::hwnd` points at
 //! it); the desktop surface gets it back afterwards. Nothing is drawn twice.
+//!
+//! Dragging while they are up: the dim fades and the window shrinks (its region) to the boxes,
+//! so outside them the drag reaches the app below (a file dropped into it), or the desktop where
+//! no window is; over a box, the box takes it. Back to the whole screen when the drag ends.
 
 use crate::app::{ease_out, App};
 use deskboxes_core::*;
@@ -30,16 +34,10 @@ pub const HOTKEYS: &[(&str, HOT_KEY_MODIFIERS, u32)] = &[
     ("ctrl+alt+b", HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0), b'B' as u32),
 ];
 
-/// The monitor's pixels where other apps' windows are (premultiplied BGRA; transparent where
-/// the desktop shows, which is ours: its boxes would be blurred into their own backdrop).
-fn capture_windows(mon: RECT) -> Option<deskboxes_core::snapshot::IconImage> {
+/// Where other apps' windows are on the monitor (px relative to its top-left, clipped to it):
+/// visible, not minimized or cloaked, not ours, not the desktop or the taskbar.
+fn app_windows(mon: RECT) -> Vec<RECT> {
     use windows::Win32::Graphics::Dwm::*;
-    use windows::Win32::Graphics::Gdi::*;
-    let (w, h) = (mon.right - mon.left, mon.bottom - mon.top);
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    // Where the windows are: visible, not minimized or cloaked, not ours, not the desktop.
     let mut rects: Vec<RECT> = vec![];
     unsafe extern "system" fn each(hw: HWND, l: LPARAM) -> windows::core::BOOL {
         let v = &mut *(l.0 as *mut Vec<RECT>);
@@ -78,13 +76,24 @@ fn capture_windows(mon: RECT) -> Option<deskboxes_core::snapshot::IconImage> {
     unsafe {
         let _ = EnumWindows(Some(each), LPARAM(&mut rects as *mut Vec<RECT> as isize));
     }
-    let inside: Vec<RECT> = rects
+    rects
         .into_iter()
         .filter_map(|r| {
             let (l, t, rr, b) = (r.left.max(mon.left) - mon.left, r.top.max(mon.top) - mon.top, r.right.min(mon.right) - mon.left, r.bottom.min(mon.bottom) - mon.top);
             (rr > l && b > t).then_some(RECT { left: l, top: t, right: rr, bottom: b })
         })
-        .collect();
+        .collect()
+}
+
+/// The monitor's pixels where other apps' windows are (premultiplied BGRA; transparent where
+/// the desktop shows, which is ours: its boxes would be blurred into their own backdrop).
+fn capture_windows(mon: RECT) -> Option<deskboxes_core::snapshot::IconImage> {
+    use windows::Win32::Graphics::Gdi::*;
+    let (w, h) = (mon.right - mon.left, mon.bottom - mon.top);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let inside = app_windows(mon);
     if inside.is_empty() {
         // Nothing open: the wallpaper alone (no capture needed).
         return Some(deskboxes_core::snapshot::IconImage { w: w as u32, h: h as u32, bgra: vec![0; (w * h * 4) as usize] });
@@ -150,14 +159,145 @@ impl App {
 
     /// How far the windows behind are dimmed (0..dim).
     pub fn above_dim(&self) -> f32 {
+        let undim = match self.above_undim {
+            Some((true, t0)) => 1.0 - ease_out(t0.elapsed().as_secs_f32() / DIM_S),
+            Some((false, t0)) => ease_out(t0.elapsed().as_secs_f32() / DIM_S),
+            None => 1.0,
+        };
         match &self.above {
-            Some((_, _, t0)) if self.settings.above.dim => 0.24 * ease_out(t0.elapsed().as_secs_f32() / DIM_S),
+            Some((_, _, t0)) if self.settings.above.dim => 0.24 * ease_out(t0.elapsed().as_secs_f32() / DIM_S) * undim,
             _ => 0.0,
         }
     }
 
     pub fn above_animating(&self) -> bool {
         self.above.as_ref().map(|(_, _, t0)| t0.elapsed().as_secs_f32() < DIM_S).unwrap_or(false)
+            || self.above_undim.map(|(_, t0)| t0.elapsed().as_secs_f32() < DIM_S).unwrap_or(false)
+    }
+
+    /// The desktop is in front (it, or our surface, has the focus), or no app window is open on
+    /// the screen: the boxes are in front already, so the shortcut and the corner do nothing.
+    pub fn desktop_in_front(&self) -> bool {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0.is_null() {
+                return true;
+            }
+            let root = GetAncestor(fg, GA_ROOT);
+            let mut cls = [0u16; 64];
+            let n = GetClassNameW(root, &mut cls) as usize;
+            let c = String::from_utf16_lossy(&cls[..n]);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(root, Some(&mut pid));
+            if matches!(c.as_str(), "Progman" | "WorkerW") || pid == std::process::id() {
+                return true;
+            }
+        }
+        app_windows(self.mon).is_empty()
+    }
+
+    /// A drag starts over the boxes (ours, or one from an app entering them): the dim fades, then
+    /// the window shrinks to the boxes so the apps behind can take the drop.
+    pub fn above_drag_begin(&mut self) {
+        if !self.is_above() || self.above_drag.is_some() {
+            return;
+        }
+        log::info!("boxes above windows: drag; the windows behind take drops outside the boxes");
+        self.above_drag = Some(Instant::now());
+        self.above_undim = Some((true, Instant::now()));
+        unsafe {
+            SetTimer(Some(self.msg_hwnd), crate::app::T_ABOVE_DRAG, 40, None);
+        }
+        crate::anim::set(true);
+        self.invalidate();
+    }
+
+    /// The drag is over (dropped or cancelled): the whole screen again, dimmed again, and the
+    /// desktop behind shown as it is now (an icon may have been dropped there).
+    pub fn above_drag_end(&mut self) {
+        if self.above_drag.take().is_none() {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.msg_hwnd), crate::app::T_ABOVE_DRAG);
+        }
+        self.set_above_region(vec![]);
+        if self.is_above() {
+            self.above_undim = Some((false, Instant::now()));
+            self.redraw_still();
+        } else {
+            self.above_undim = None;
+        }
+        crate::anim::set(true);
+        self.invalidate();
+    }
+
+    /// While dragging: once the dim is gone, the window covers only the boxes (as they are now:
+    /// one opened on hover grows). And the drag's end, noticed by the buttons being up (a drag
+    /// from an app that ends elsewhere doesn't tell us).
+    pub fn above_drag_tick(&mut self) {
+        let Some(t0) = self.above_drag else {
+            unsafe {
+                let _ = KillTimer(Some(self.msg_hwnd), crate::app::T_ABOVE_DRAG);
+            }
+            return;
+        };
+        let held = unsafe { [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|v| GetAsyncKeyState(v.0 as i32) as u16 & 0x8000 != 0) };
+        if !held && self.own_drag.is_none() {
+            self.above_drag_end();
+            return;
+        }
+        if t0.elapsed().as_secs_f32() >= DIM_S {
+            let s = self.scale;
+            let (ox, oy) = self.above_off;
+            let rects: Vec<(i32, i32, i32, i32)> = self
+                .layout
+                .boxes
+                .iter()
+                .map(|b| self.shown_rect(b).inflate(2.0))
+                .map(|r| ((r.x * s).floor() as i32 - ox, (r.y * s).floor() as i32 - oy, (r.right() * s).ceil() as i32 - ox, (r.bottom() * s).ceil() as i32 - oy))
+                .collect();
+            self.set_above_region(rects);
+        }
+    }
+
+    /// The boxes-above window answers (and shows) only inside `rects` (empty: everywhere).
+    fn set_above_region(&mut self, rects: Vec<(i32, i32, i32, i32)>) {
+        if rects == self.above_rgn {
+            return;
+        }
+        let Some((hw, _, _)) = self.above else {
+            self.above_rgn.clear();
+            return;
+        };
+        unsafe {
+            use windows::Win32::Graphics::Gdi::*;
+            if rects.is_empty() {
+                SetWindowRgn(hw, None, true);
+            } else {
+                let rgn = CreateRectRgn(0, 0, 0, 0);
+                for (l, t, r, b) in &rects {
+                    let one = CreateRectRgn(*l, *t, *r, *b);
+                    CombineRgn(Some(rgn), Some(rgn), Some(one), RGN_OR);
+                    let _ = DeleteObject(one.into());
+                }
+                // (Windows owns the region from here.)
+                SetWindowRgn(hw, Some(rgn), true);
+            }
+        }
+        self.above_rgn = rects;
+    }
+
+    /// The desktop window behind the boxes-above window, drawn again (its icons as they are now).
+    fn redraw_still(&mut self) {
+        if let Some(surf) = self.surf.take() {
+            let scale = self.scale;
+            let still = |dc: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext| self.paint_still(dc);
+            if let Err(e) = surf.redraw_still(&self.gpu, scale, &still) {
+                log::warn!("boxes above windows: desktop behind: {e}");
+            }
+            self.surf = Some(surf);
+        }
     }
 
     pub fn toggle_above(&mut self) {
@@ -242,10 +382,21 @@ impl App {
             self.set_tucked(false);
             self.above = Some((hw, self.hwnd, Instant::now()));
             self.above_had_front = false;
+            self.above_drag = None;
+            self.above_undim = None;
+            self.above_rgn.clear();
             self.hwnd = hw;
             self.above_poll();
             log::info!("boxes above windows: on");
         } else {
+            if self.above_drag.take().is_some() {
+                self.set_above_region(vec![]);
+                unsafe {
+                    let _ = KillTimer(Some(self.msg_hwnd), crate::app::T_ABOVE_DRAG);
+                }
+            }
+            self.above_undim = None;
+            self.above_rgn.clear();
             let Some((hw, desk, _)) = self.above.take() else { return };
             self.cancel_drag();
             self.hwnd = desk;
@@ -326,7 +477,8 @@ impl App {
     /// put the boxes back. Our own menus and Settings keep them up. Only once our window has had
     /// the front: the corner, reached while dragging from another app, cannot take it.
     pub fn above_check_foreground(&mut self) {
-        if !self.is_above() {
+        // (Not in the middle of a drag: it goes where it was going first.)
+        if !self.is_above() || self.above_drag.is_some() {
             return;
         }
         unsafe {
@@ -371,7 +523,11 @@ impl App {
             None => self.corner_since = Some(Instant::now()),
             Some(t0) if t0.elapsed().as_millis() >= CORNER_MS && !self.is_above() => {
                 self.corner_since = Some(Instant::now() + std::time::Duration::from_secs(3600));
-                self.set_above(true);
+                if self.desktop_in_front() {
+                    log::info!("boxes above windows: corner ignored (the desktop is in front)");
+                } else {
+                    self.set_above(true);
+                }
             }
             _ => {}
         }

@@ -55,6 +55,13 @@ const T_TIP: usize = 14;
 const T_BTNTIP: usize = 15;
 /// Boxes above windows: the screen corner and whether another app came to the front.
 pub const T_ABOVE: usize = 16;
+/// Boxes above windows: a drag under way (the region follows the boxes; its end is noticed).
+pub const T_ABOVE_DRAG: usize = 19;
+/// A menu asked of the shell host has not shown in time: the host is stuck, start a new one.
+const T_MENU_WAIT: usize = 20;
+/// How long a menu may take to show before the shell host counts as stuck, ms (a cold menu with
+/// slow shell extensions on a slow PC takes a few seconds; a stuck host never shows one).
+const MENU_WAIT_MS: u32 = 8000;
 /// Labels of icons out of view are made while idle.
 pub const T_PREP: usize = 40;
 /// Settings changed from the settings window are written a moment later (sliders send many).
@@ -217,6 +224,8 @@ pub enum Drag {
     RightRubber {
         start: Pt,
         cur: Pt,
+        /// Where it started: a box (selects only that box's icons) or the desktop.
+        scope: Option<u32>,
     },
     /// Dragging along a box's A–Z index.
     Scrub {
@@ -242,6 +251,15 @@ pub struct HeaderLayout {
 pub struct MenuCtx {
     pub at: Pt,
     pub hit: Hit,
+    pub new_rect: Option<Rect>,
+}
+
+/// A context menu as asked for (`App::show_menu`'s arguments).
+#[derive(Clone, Debug)]
+pub struct MenuAsk {
+    pub hit: Hit,
+    pub at: Pt,
+    pub keyboard: bool,
     pub new_rect: Option<Rect>,
 }
 
@@ -392,6 +410,10 @@ pub struct App {
     pub host_child: Option<std::process::Child>,
     pub host_starts: Vec<Instant>,
     pub menu: Option<(u32, MenuCtx)>,
+    /// A menu asked of the shell host and not shown (or closed) yet: its id, and how to ask again.
+    pub menu_wait: Option<(u32, MenuAsk)>,
+    /// A menu to ask again once a new shell host is ready (the old one never showed it), since.
+    pub menu_replay: Option<(Instant, MenuAsk)>,
     /// An icon created from the "New" menu: sorted by the rules once its name is given.
     pub sort_after_rename: Option<ItemKey>,
     /// An icon's name being edited (Windows' text box).
@@ -522,6 +544,17 @@ pub struct App {
     pub above: Option<(HWND, HWND, Instant)>,
     /// Our window had the front while the boxes were up (so another app taking it puts them back).
     pub above_had_front: bool,
+    /// A drag (ours, or from an app) under way while the boxes are up, since: the windows behind
+    /// take drops outside the boxes (see `above::above_drag_begin`).
+    pub above_drag: Option<Instant>,
+    /// The dim fading out for a drag (true) or back in after it (false), since.
+    pub above_undim: Option<(bool, Instant)>,
+    /// The boxes-above window's region now (px rects; empty: the whole window).
+    pub above_rgn: Vec<(i32, i32, i32, i32)>,
+    /// Hit-testing for the desktop window under the boxes-above window (its loose icons count).
+    pub hit_desk: bool,
+    /// Desktop pages: the slide between them, the page's name, gestures (`pages.rs`).
+    pub pages: crate::pages::PageState,
     /// Windows gave us the shortcut.
     pub above_hotkey_ok: bool,
     /// The pointer has been resting in the hot corner since.
@@ -986,6 +1019,8 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         host_child: None,
         host_starts: vec![],
         menu: None,
+        menu_wait: None,
+        menu_replay: None,
         sort_after_rename: None,
         rename: None,
         returning: None,
@@ -1058,6 +1093,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         tucked: (false, Instant::now() - std::time::Duration::from_secs(5)),
         above: None,
         above_had_front: false,
+        above_drag: None,
+        above_undim: None,
+        above_rgn: vec![],
+        hit_desk: false,
+        pages: Default::default(),
         above_hotkey_ok: true,
         corner_since: None,
         folders_sent: vec![],
@@ -1212,7 +1252,8 @@ impl App {
     /// wallpaper kept in memory (a blur slider used to read and decode the file per step).
     /// Levels no box uses any more are dropped.
     pub fn ensure_backdrops(&mut self) {
-        let mut blurs: Vec<i32> = self.layout.boxes.iter().map(|b| b.style.blur as i32).collect();
+        // (Every page's boxes: the one beside slides in with its glass.)
+        let mut blurs: Vec<i32> = deskboxes_core::pages::all_boxes(&self.layout).map(|(_, b)| b.style.blur as i32).collect();
         blurs.push(self.settings.default_style.blur as i32);
         blurs.sort();
         blurs.dedup();
@@ -1811,7 +1852,7 @@ impl App {
     }
 
     /// Recompute where loose icons would settle with the dragged box where it is now.
-    fn update_preview(&mut self) {
+    pub(crate) fn update_preview(&mut self) {
         let mut l = self.layout.clone();
         layout::settle(&mut l, &self.grid);
         self.preview_loose = Some(l.loose);
@@ -1832,6 +1873,7 @@ impl App {
             || self.blend_animating()
             || self.tuck_animating()
             || self.above_animating()
+            || self.pages_animating()
             || self.scroll_animating()
             || (matches!(self.drag, Drag::MoveBox { .. }) && self.move_t0.elapsed().as_secs_f32() < LIFT_S)
             || !self.vanishing.is_empty()
@@ -2158,6 +2200,7 @@ impl App {
             _ => self.make_room(None, &[]),
         }
         drag_wheel_hook(p.is_some());
+        self.page_edge_over(p);
     }
 
     /// The wheel turned while something is dragged over us (Windows' drag holds the mouse, so
@@ -2246,7 +2289,7 @@ impl App {
                 let busy = matches!(self.drag, Drag::MoveBox { id: d, .. } | Drag::Resize { id: d, .. } if d == *id)
                     || matches!(self.drag, Drag::Items { .. })
                     || matches!(self.drag, Drag::Rubber { scope: Some(s), .. } if s == *id)
-                    || matches!(self.drag, Drag::RightRubber { start, .. } if b.rect.contains(start))
+                    || matches!(self.drag, Drag::RightRubber { scope: Some(s), .. } if s == *id)
                     || self.own_drag.is_some()
                     || self.drop_at.map(|q| b.rect.inflate(12.0).contains(q)).unwrap_or(false);
                 (over_us && b.rect.inflate(12.0).contains(p)) || busy || menu_box == Some(*id) || self.box_edit.as_ref().map(|e| e.id == *id).unwrap_or(false)
@@ -2599,7 +2642,9 @@ impl App {
             }
             return Hit::BoxBody { id: b.id };
         }
-        if self.is_tucked(None) {
+        // Hidden, or under the boxes-above window (not drawn there: they are on the desktop
+        // window behind, which hit-tests them itself).
+        if self.is_tucked(None) || (self.is_above() && !self.hit_desk) {
             return Hit::Empty;
         }
         for (k, c) in self.layout.loose.iter() {
@@ -2687,7 +2732,9 @@ impl App {
     }
 
     pub fn change_layout(&mut self, f: impl FnOnce(&mut MonitorLayout, &Grid)) {
-        let before = self.layout.clone();
+        // (A drag that took things to another page: recorded against the layout before it, so
+        // one undo puts them back on their page.)
+        let before = self.pages.before.take().unwrap_or_else(|| self.layout.clone());
         f(&mut self.layout, &self.grid);
         if self.layout.keep_sorted {
             self.apply_rules(None, false);
@@ -2700,6 +2747,8 @@ impl App {
     }
 
     pub fn layout_changed(&mut self) {
+        // Another page now (undo, a saved layout): it slides in.
+        self.page_check_shown();
         // Undo, a saved layout or a deleted box can change what folder boxes show.
         self.folder_sync();
         if self.host.is_some() && self.settings_sig() != self.settings_sent {
@@ -2923,7 +2972,7 @@ impl App {
         self.no_glide.extend(back);
         // A new icon named after "New": the rules sort it now.
         let renamed_new = self.sort_after_rename.clone().filter(|k| self.rename.as_ref().map(|r| &r.key) != Some(k) && !old.is_empty());
-        let changed = layout::reconcile(&mut self.layout, &present, &self.grid);
+        let changed = self.reconcile_pages(&present);
         let changed = self.sort_new_items(&old, &dropped) | changed;
         let changed = match renamed_new {
             Some(k) if self.items.contains_key(&k) => {
@@ -3112,6 +3161,10 @@ impl App {
                     }
                     kf.push(json!({ "id": "dbx.fbchoose", "text": t(self.lang, S::FolderBoxChoose), "glyph": "\u{ED25}" }));
                     sub.push(json!({ "id": "dbx.newfolderbox", "text": t(self.lang, S::NewFolderBox), "glyph": "\u{E8B7}", "children": kf }));
+                    // Desktop pages: go to one, make, rename or delete one.
+                    if self.pages_on() {
+                        sub.push(json!({ "id": "dbx.pagesmenu", "text": t(self.lang, S::PagesMenu), "glyph": crate::pages::PAGES_GLYPH, "children": self.pages_menu_entries() }));
+                    }
                     sub.push(json!({ "separator": true }));
                 }
                 sub.push(json!({ "id": "dbx.sortnow", "text": t(self.lang, self.sort_now_text()), "glyph": "\u{E8CB}" }));
@@ -3230,7 +3283,7 @@ impl App {
             .collect();
         let sorting = (&self.layout.rules, self.layout.keep_sorted, self.layout.new_items_to);
         let look = (&self.settings.look.title_bar, &self.settings.look.align, self.settings.lock_all, self.settings.privacy.allowed, &self.settings.extras, &self.settings.az, &self.settings.search, &self.settings.icons, &self.settings.hide, &self.settings.saved, &self.settings.above, self.above_hotkey_ok, &self.settings.update, crate::update::status());
-        serde_json::to_string(&(boxes, &self.settings.default_style, &self.settings.language, sorting, &self.settings.tabs, &self.settings.rollup, look)).unwrap_or_default()
+        serde_json::to_string(&(boxes, &self.settings.default_style, &self.settings.language, sorting, &self.settings.tabs, &self.settings.rollup, look, self.pages_sig())).unwrap_or_default()
     }
 
     fn autostart_on() -> bool {
@@ -3248,18 +3301,22 @@ impl App {
             .map(|(i, (_, _, (r, g, b)))| json!({ "name": color_name(self.lang, i), "rgb": format!("#{r:02X}{g:02X}{b:02X}") }))
             .collect();
         let boxes: Vec<Value> = self.layout.boxes.iter().map(|b| json!({ "id": b.id, "title": b.title(), "style": style(&b.style), "az": b.az, "tint": b.tint, "blend": b.blend, "stayVisible": b.stay_visible })).collect();
-        // Tabs rules can send icons to: each tab by its title (a plain box: the box title).
-        let targets: Vec<Value> = self
-            .layout
-            .boxes
-            .iter()
-            .flat_map(|b| {
+        // Tabs rules can send icons to: each tab by its title (a plain box: the box title), on
+        // every desktop page (another page's: its name after it).
+        let cur_page = self.layout.page;
+        let page_names: HashMap<u32, String> = deskboxes_core::pages::ids(&self.layout).into_iter().map(|p| (p, self.page_title(p))).collect();
+        let targets: Vec<Value> = deskboxes_core::pages::all_boxes(&self.layout)
+            .flat_map(|(p, b)| {
+                let page = (p != cur_page).then(|| page_names.get(&p).cloned()).flatten();
                 b.tabs.iter().map(move |t| {
-                    let name = if b.tabs.len() > 1 {
+                    let mut name = if b.tabs.len() > 1 {
                         format!("{}   ({})", t.title, b.tabs.iter().map(|x| x.title.as_str()).collect::<Vec<_>>().join(" · "))
                     } else {
                         t.title.clone()
                     };
+                    if let Some(pn) = &page {
+                        name = format!("{name}   — {pn}");
+                    }
                     json!({ "id": t.id, "name": name })
                 })
             })
@@ -3296,6 +3353,7 @@ impl App {
                 "version": crate::update::current(),
             },
             "above": { "hotkey": self.settings.above.hotkey, "corner": self.settings.above.corner, "dim": self.settings.above.dim, "hotkeyOk": self.above_hotkey_ok },
+            "pages": self.pages_json(),
             "folderBoxes": {
                 "known": items::known_folders().iter().map(|(n, p)| json!({ "id": n, "path": p.display().to_string(), "name": t(self.lang, match *n {
                     "documents" => S::KfDocuments,
@@ -3367,6 +3425,13 @@ impl App {
         let id = v["box"].as_f64().unwrap_or(0.0) as u32;
         if scope == "pick" {
             return self.on_picked_color(v);
+        }
+        if scope == "dialog" {
+            return self.on_dialog(v);
+        }
+        if scope == "pages" {
+            log::info!("setting pages.{key} = {val}");
+            return self.apply_pages_setting(key, val);
         }
         log::info!("setting {scope}.{key} box={id} = {val}");
         let set_style = |st: &mut BoxStyle| match key {
@@ -3717,6 +3782,9 @@ impl App {
         let folder_items = items.iter().any(|p| self.items.values().any(|i| i.source == Source::Folder && i.parsing_name == *p));
         if !folder_items {
             v.push(json!({ "id": "dbx.boxfromsel", "text": t(self.lang, S::BoxFromSelection), "glyph": "\u{E8A9}", "placement": "beforeProperties" }));
+            if self.pages_on() {
+                v.push(self.move_to_page_entry("dbx.pageitems:", Some("beforeProperties")));
+            }
         }
         if let [one] = items {
             // A folder in a folder box: open it in a new tab of that box (as Explorer's).
@@ -3855,6 +3923,9 @@ impl App {
             { "separator": true },
             { "id": "dbx.lockall", "text": t(l, S::LockEverything), "checkable": true, "checked": self.settings.lock_all },
         ] }));
+        if self.pages_on() {
+            sub.push(self.move_to_page_entry("dbx.pagebox:", None));
+        }
         sub.push(json!({ "separator": true }));
         sub.push(json!({ "id": "dbx.removebox", "text": t(l, S::DeleteBox), "glyph": "\u{E74D}" }));
         sub.push(json!({ "id": "dbx.boxsettings", "text": t(l, S::MoreSettings), "glyph": "\u{E713}" }));
@@ -3937,12 +4008,16 @@ impl App {
         self.host_prefetch = Some((items, shift));
     }
 
-    fn show_menu(&mut self, hit: Hit, at: Pt, keyboard: bool, new_rect: Option<Rect>) {
+    pub(crate) fn show_menu(&mut self, hit: Hit, at: Pt, keyboard: bool, new_rect: Option<Rect>) {
         let Some(h) = self.host.clone() else {
             log::warn!("context menu requested before the shell host is ready");
             return;
         };
-        let mut req = self.menu_request(&hit, at, new_rect);
+        // (Our own entries only: the page name's menu.)
+        let mut req = match self.pages.menu_own.take() {
+            Some(v) => json!({ "kind": "own", "items": [], "folder": "", "extra": v }),
+            None => self.menu_request(&hit, at, new_rect),
+        };
         // The host uses up (or drops) its prefetch on every show.
         self.host_prefetch = None;
         let (x, y) = self.to_screen(at);
@@ -3958,9 +4033,42 @@ impl App {
                 let _ = AllowSetForegroundWindow(c.id());
             }
         }
+        let ask = MenuAsk { hit: hit.clone(), at, keyboard, new_rect };
         match h.send("show", req) {
-            Ok(id) => self.menu = Some((id, MenuCtx { at, hit, new_rect })),
+            Ok(id) => {
+                log::info!("menu {id} asked for");
+                self.menu = Some((id, MenuCtx { at, hit, new_rect }));
+                self.menu_wait = Some((id, ask));
+                unsafe {
+                    SetTimer(Some(self.msg_hwnd), T_MENU_WAIT, MENU_WAIT_MS, None);
+                }
+            }
             Err(e) => log::warn!("show menu: {e}"),
+        }
+    }
+
+    /// The host answered about menu `id` (shown or closed): it is not stuck.
+    fn menu_answered(&mut self, id: f64) {
+        if self.menu_wait.as_ref().map(|(w, _)| *w as f64 == id).unwrap_or(false) {
+            self.menu_wait = None;
+            unsafe {
+                let _ = KillTimer(Some(self.msg_hwnd), T_MENU_WAIT);
+            }
+        }
+    }
+
+    /// A menu never showed: the shell host is stuck (it was, after Deskboxes was turned off and on,
+    /// until it was ended by hand). End it; a new one starts and shows the menu.
+    fn menu_wait_due(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.msg_hwnd), T_MENU_WAIT);
+        }
+        let Some((id, ask)) = self.menu_wait.take() else { return };
+        log::warn!("menu {id} not shown in {MENU_WAIT_MS} ms: the shell host is stuck; starting a new one");
+        self.menu_replay = Some((Instant::now(), ask));
+        self.menu = None;
+        if let Some(c) = self.host_child.as_mut() {
+            let _ = c.kill();
         }
     }
 
@@ -3971,7 +4079,10 @@ impl App {
                 self.stats.host_ready_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
                 log::info!("PHASE host_ready ms={:.1}", self.stats.host_ready_ms);
             }
-            "shown" => log::info!("menu shown in {} ms", v["ms"]),
+            "shown" => {
+                log::info!("menu {} shown in {} ms", v["id"], v["ms"]);
+                self.menu_answered(v["id"].as_f64().unwrap_or(-1.0));
+            }
             "command" => {
                 let cmd = v["cmd"].as_str().unwrap_or("").to_string();
                 let ctx = self.menu.as_ref().map(|(_, c)| c.clone());
@@ -3981,8 +4092,10 @@ impl App {
             // one is the open menu now.
             "closed" if self.menu.as_ref().map(|(id, _)| v["id"].as_f64() != Some(*id as f64)).unwrap_or(false) => {
                 log::info!("menu {} closed for the next one", v["id"]);
+                self.menu_answered(v["id"].as_f64().unwrap_or(-1.0));
             }
             "closed" => {
+                self.menu_answered(v["id"].as_f64().unwrap_or(-1.0));
                 log::info!("menu closed invoked={} {}", v["invoked"], v["error"]);
                 if v["invoked"].as_str().map(is_new_verb).unwrap_or(false) {
                     // Windows' "New" made a file or folder: it goes where the menu was opened (or
@@ -4026,6 +4139,7 @@ impl App {
             _ => None,
         };
         match cmd {
+            c if c.starts_with("dbx.page") => self.page_command(c, box_id),
             "rename" => {
                 if let Some(k) = self.sel.ordered(&self.order()).first().cloned() {
                     self.begin_rename(RenameTarget::Item(k));
@@ -4823,6 +4937,9 @@ impl App {
         if self.above_click_outside(p) {
             return;
         }
+        if self.page_lbutton_down(p, dbl) {
+            return;
+        }
         if let Some(id) = self.folder_back_at(p) {
             self.end_rename(true);
             self.folder_back(id);
@@ -4963,6 +5080,12 @@ impl App {
                 self.invalidate();
             }
             return After::None;
+        }
+        if self.page_gesture_move(p) {
+            return After::None;
+        }
+        if matches!(self.drag, Drag::MoveBox { .. } | Drag::Items { .. }) {
+            self.page_edge_over(Some(p));
         }
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXDRAG) as f32 / self.scale, GetSystemMetrics(SM_CYDRAG) as f32 / self.scale) };
@@ -5142,10 +5265,10 @@ impl App {
                 Drag::Resize { id, start, orig, l, t, r, b }
             }
             // The right button's band selects too (Explorer's); its menu is then for them.
-            Drag::RightRubber { start, .. } => {
-                let hit = self.band_hits(Rect::from_points(start, p), None);
+            Drag::RightRubber { start, scope, .. } => {
+                let hit = self.band_hits(Rect::from_points(start, p), scope);
                 self.sel.rubber_band(&BTreeSet::new(), &hit, false);
-                Drag::RightRubber { start, cur: p }
+                Drag::RightRubber { start, cur: p, scope }
             }
             Drag::Scrub { id } => {
                 self.az_jump(id, p.x);
@@ -5162,6 +5285,7 @@ impl App {
             Drag::None => {
                 self.hover_reveal(p, false);
                 self.blend_pointer(p);
+                self.page_pill_hover(p);
                 let hh = match self.hit_test(p) {
                     Hit::Header { id, tab, add } => Some((id, tab, add)),
                     _ => None,
@@ -5274,6 +5398,9 @@ impl App {
     }
 
     fn on_lbutton_up(&mut self, _p: Pt) {
+        if self.page_button_up(false) {
+            return;
+        }
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -5339,6 +5466,9 @@ impl App {
             }
             _ => {}
         }
+        // (A drag that went to other pages: done.)
+        self.page_dropped();
+        self.page_drag_ended();
         self.invalidate();
     }
 
@@ -5356,6 +5486,11 @@ impl App {
         self.room = None;
         self.box_want = None;
         self.box_room = None;
+        // Taken to another page: back to its own, as it was.
+        if self.own_drag.is_none() {
+            self.page_drag_cancelled();
+            self.page_drag_ended();
+        }
     }
 
     pub fn drop_items(&mut self, keys: Vec<ItemKey>, start: Pt, cur: Pt) {
@@ -5459,7 +5594,7 @@ impl App {
                 // Loose grid: every item moves by the drag offset, so the group keeps its shape
                 // (Explorer). Items not on screen (scrolled out in a box) go next to the cursor.
                 let (dx, dy) = (cur.x - start.x, cur.y - start.y);
-                let cells = self.visible_cells();
+                let cells = self.drag_cells();
                 let moves: Vec<(ItemKey, Cell)> = keys
                     .iter()
                     .map(|k| {
@@ -5483,6 +5618,9 @@ impl App {
         if self.above_click_outside(p) {
             return;
         }
+        if self.page_rbutton_down(p) {
+            return;
+        }
         if self.on_pill(p) || self.box_search_field().map(|(_, f)| f.contains(p)).unwrap_or(false) {
             return;
         }
@@ -5495,29 +5633,38 @@ impl App {
                 self.sel.focus = Some(key.clone());
             }
             self.prefetch(&hit);
-        } else if matches!(hit, Hit::Empty) {
+        } else if let Hit::Empty | Hit::BoxBody { .. } = hit {
+            // A band from the desktop selects loose icons; from inside a box, that box's (as the
+            // left button's does).
+            let scope = if let Hit::BoxBody { id } = hit { Some(id) } else { None };
             self.sel.clear();
             unsafe {
                 SetCapture(self.hwnd);
             }
-            self.drag = Drag::RightRubber { start: p, cur: p };
+            self.drag = Drag::RightRubber { start: p, cur: p, scope };
         }
         self.invalidate();
     }
 
     fn on_rbutton_up(&mut self, p: Pt) {
+        if self.page_button_up(true) {
+            return;
+        }
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         unsafe {
             let _ = ReleaseCapture();
         }
         let mut hit = self.hit_test(p);
         let new_rect = match drag {
-            Drag::RightRubber { start, cur } => {
-                // Icons the band selected: their menu (Explorer's). None: the desktop's, with
-                // "Create box here" the band's size.
+            Drag::RightRubber { start, cur, scope } => {
+                // Icons the band selected: their menu (Explorer's). None: the menu of where it
+                // started: the box's, or the desktop's with "Create box here" the band's size.
                 if let Some(k) = self.sel.ordered(&self.order()).first().cloned() {
                     self.sel.focus = Some(k.clone());
-                    hit = Hit::Item { key: k, in_box: None };
+                    hit = Hit::Item { key: k, in_box: scope };
+                    None
+                } else if let Some(id) = scope {
+                    hit = Hit::BoxBody { id };
                     None
                 } else {
                     let r = Rect::from_points(start, cur);
@@ -5532,6 +5679,10 @@ impl App {
 
     fn on_wheel(&mut self, p: Pt, delta: i16, ctrl: bool) {
         self.hide_tip();
+        // Alt+wheel: the pages.
+        if self.page_wheel(delta) {
+            return;
+        }
         // Ctrl + wheel over a box: that box's view and icon size, a step per notch (as in a File
         // Explorer window). Elsewhere: the desktop's icon size (small, medium, large).
         if ctrl && self.settings.extras.ctrl_wheel_size && delta != 0 {
@@ -5894,6 +6045,27 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 app.on_wheel(p, ((w.0 >> 16) & 0xffff) as i16, w.0 & 0x0008 != 0);
                 Some(LRESULT(0))
             }
+            // A touchpad's two-finger swipe (or a tilt wheel): the pages.
+            WM_MOUSEHWHEEL if is_surface => {
+                app.page_hwheel(((w.0 >> 16) & 0xffff) as i16);
+                Some(LRESULT(0))
+            }
+            WM_MBUTTONDOWN | WM_MBUTTONDBLCLK if is_surface => {
+                let (x, y) = lparam_pt(l);
+                app.page_mbutton(true, app.client_dip(x, y));
+                Some(LRESULT(0))
+            }
+            WM_MBUTTONUP if is_surface => {
+                let (x, y) = lparam_pt(l);
+                app.page_mbutton(false, app.client_dip(x, y));
+                Some(LRESULT(0))
+            }
+            WM_CAPTURECHANGED if is_surface && app.pages.gesture.is_some() => {
+                if l.0 != app.hwnd.0 as isize {
+                    app.page_gesture_lost();
+                }
+                Some(LRESULT(0))
+            }
             WM_CAPTURECHANGED if is_surface => {
                 if !matches!(app.drag, Drag::None) && l.0 != app.hwnd.0 as isize {
                     app.cancel_drag();
@@ -5969,6 +6141,9 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                     app.set_above(false);
                     return Some(LRESULT(0));
                 }
+                if m == WM_SYSKEYDOWN && app.page_key(VIRTUAL_KEY(w.0 as u16)) {
+                    return Some(LRESULT(0));
+                }
                 if (w.0 == VK_F10.0 as usize && key_down(VK_SHIFT)) || w.0 == VK_APPS.0 as usize {
                     let (hit, at) = match app.focus_cell().filter(|(k, _)| app.sel.is_selected(k)) {
                         Some((k, r)) => (
@@ -6030,6 +6205,13 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         }
                         Ev::HostReady(c) => {
                             app.host = Some(c);
+                            // The menu the stuck host never showed, if it was asked for just now.
+                            if let Some((t0, ask)) = app.menu_replay.take() {
+                                if t0.elapsed().as_secs() < 20 {
+                                    log::info!("showing the menu the old shell host did not");
+                                    app.show_menu(ask.hit, ask.at, ask.keyboard, ask.new_rect);
+                                }
+                            }
                         }
                         Ev::HostMsg(v) => app.on_host_msg(v),
                         Ev::InfoTip { key, text } => app.on_info_tip(key, text),
@@ -6045,6 +6227,8 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                                 log::warn!("shell host disconnected; restarting it");
                                 app.host = None;
                                 app.menu = None;
+                                app.menu_wait = None;
+                                let _ = KillTimer(Some(app.msg_hwnd), T_MENU_WAIT);
                                 if let Some(mut c) = app.host_child.take() {
                                     let _ = c.wait_timeout_ms(200);
                                 }
@@ -6093,6 +6277,9 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         app.above_check_foreground();
                         app.above_poll();
                     }
+                    T_ABOVE_DRAG => app.above_drag_tick(),
+                    crate::pages::T_PAGE_EDGE | crate::pages::T_PAGE_SWIPE | crate::pages::T_PAGE_PILL => app.page_timer(id),
+                    T_MENU_WAIT => app.menu_wait_due(),
                     T_CARET => {
                         if let Some(be) = app.box_edit.as_mut() {
                             be.caret_on = !be.caret_on;
@@ -6147,7 +6334,12 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 None
             }
             WM_HOTKEY if w.0 as i32 == crate::above::HK_ABOVE => {
-                app.toggle_above();
+                // Only over an app: on the desktop the boxes are already in front.
+                if app.is_above() || !app.desktop_in_front() {
+                    app.toggle_above();
+                } else {
+                    log::info!("boxes above windows: shortcut ignored (the desktop is in front)");
+                }
                 Some(LRESULT(0))
             }
             WM_QUERYENDSESSION => {
@@ -6163,6 +6355,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
         }
     });
     if let After::OleDrag(paths, ghost) = after {
+        with(|app| app.above_drag_begin());
         ole_drag(h, paths, ghost);
     }
     r
@@ -6223,6 +6416,8 @@ unsafe fn ole_drag(h: HWND, paths: Vec<String>, ghost: Option<(u32, u32, Vec<u8>
             with(|app| {
                 app.own_drag = None;
                 app.ole_drag_over(None, None);
+                app.above_drag_end();
+                app.page_drag_ended();
                 let _ = app.worker.send(Req::Scan);
             });
         }
@@ -6251,6 +6446,7 @@ fn add_turn_on_verb(settings: &deskboxes_core::Settings) {
     let lang = Lang::pick(&settings.language, unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() });
     let exe = std::env::current_exe().unwrap_or_default();
     turnon::add_verb(t(lang, S::TurnOn), &exe.with_file_name("deskboxes-watchdog.exe"), &exe);
+    turnon::pin_modern_verb();
 }
 
 /// A verb of Windows' "New" submenu: a file type (".txt", ".docx"), a folder or a shortcut.

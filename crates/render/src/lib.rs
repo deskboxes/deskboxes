@@ -560,6 +560,24 @@ impl Surface {
         }
     }
 
+    /// Draw what its own window shows while the surface is elsewhere (see `retarget`) again.
+    pub fn redraw_still(&self, gpu: &Gpu, scale: f32, f: &dyn Fn(&ID2D1DeviceContext) -> R<()>) -> R<()> {
+        let Some(v) = self.still.as_ref() else { return Ok(()) };
+        unsafe {
+            let s = gpu.dcomp.CreateSurface(self.w.max(1), self.h.max(1), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED)?;
+            let mut off = POINT::default();
+            let dc: ID2D1DeviceContext = s.BeginDraw(None, &mut off)?;
+            dc.SetTransform(&Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: off.x as f32, M32: off.y as f32 });
+            dc.Clear(Some(&Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let r = f(&dc);
+            s.EndDraw()?;
+            r?;
+            v.SetContent(&s)?;
+            gpu.commit()
+        }
+    }
+
     /// Redraw the whole surface (Phase 1: full redraws; dirty rects are a Phase 2 optimization).
     /// `scale` = DIP → pixel factor; callers draw in DIPs.
     pub fn draw(&self, scale: f32, f: impl FnOnce(&ID2D1DeviceContext) -> R<()>) -> R<()> {
@@ -836,6 +854,29 @@ pub fn scaled<T>(dc: &ID2D1DeviceContext, cx: f32, cy: f32, s: f32, f: impl FnOn
             M22: s,
             M31: cx * (1.0 - s),
             M32: cy * (1.0 - s),
+        };
+        dc.SetTransform(&(m * old));
+        let r = f();
+        dc.SetTransform(&old);
+        r
+    }
+}
+
+/// Draw `f` moved by (`dx`, `dy`).
+pub fn translated<T>(dc: &ID2D1DeviceContext, dx: f32, dy: f32, f: impl FnOnce() -> R<T>) -> R<T> {
+    if dx == 0.0 && dy == 0.0 {
+        return f();
+    }
+    unsafe {
+        let mut old = Matrix3x2::identity();
+        dc.GetTransform(&mut old);
+        let m = Matrix3x2 {
+            M11: 1.0,
+            M12: 0.0,
+            M21: 0.0,
+            M22: 1.0,
+            M31: dx,
+            M32: dy,
         };
         dc.SetTransform(&(m * old));
         let r = f();

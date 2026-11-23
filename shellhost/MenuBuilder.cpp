@@ -131,6 +131,14 @@ namespace dbx
         auto t0 = NowMs();
         auto m = std::make_unique<BuiltMenu>();
         m->req = r;
+        if (r.ownOnly)
+        {
+            // Deskboxes' own menu (a desktop page's name): its entries alone, no shell.
+            m->list = r.extra;
+            for (auto& e : m->list) e.packageFamily.clear();
+            m->msTotal = NowMs() - t0;
+            return m;
+        }
         const Policy& pol = GetPolicy();
         m->customizable = CustomizableMenuPresent();
 

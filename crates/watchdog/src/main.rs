@@ -109,7 +109,24 @@ fn main() {
         log("usage: deskboxes-watchdog --launch [core args]");
         std::process::exit(1);
     }
-    let core_args: Vec<String> = args[1..].to_vec();
+    // Started inside our menu package (from Windows' desktop menu): start again through Explorer,
+    // outside it (a packaged core's HKCU writes are virtualized, and its shell host could hang on
+    // the menu's `dllhost`, leaving context menus dead). Once only.
+    let relaunched = args.iter().any(|a| a == "--relaunched");
+    let core_args: Vec<String> = args[1..].iter().filter(|a| *a != "--relaunched").cloned().collect();
+    if !relaunched && deskboxes_shell::launch::has_package_identity() {
+        deskboxes_shell::com_sta();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let again = format!("{} --relaunched", args.join(" "));
+        match deskboxes_shell::launch::via_explorer(&exe, &again, &dir) {
+            Ok(()) => {
+                log("started inside the menu package: started again through Explorer");
+                return;
+            }
+            Err(e) => log(&format!("started inside the menu package; through Explorer failed ({e}): going on")),
+        }
+    }
     unsafe {
         let _mutex = CreateMutexW(None, true, w!(r"Local\DeskboxesWatchdog"));
         if GetLastError() == ERROR_ALREADY_EXISTS {

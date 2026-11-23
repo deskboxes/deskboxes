@@ -66,9 +66,26 @@ impl DropTarget {
 /// own drag, a layout move, else the folder background's drop target.
 fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
     with(|app| {
+        // (The desktop window under the boxes-above window: its loose icons count.)
+        app.hit_desk = app.is_above() && hwnd != app.hwnd;
+        let t = target_at_in(app, hwnd, pt);
+        app.hit_desk = false;
+        t
+    })
+    .flatten()
+}
+
+fn target_at_in(app: &mut crate::app::App, hwnd: HWND, pt: &POINTL) -> Option<Target> {
+    {
         let p = app.screen_to_dip(pt.x, pt.y);
         let own = app.own_drag.as_ref().map(|(keys, _)| keys.clone());
-        if let Hit::Item { key, .. } = app.hit_test(p) {
+        let hit = app.hit_test(p);
+        // Boxes above windows, outside the boxes: the app below takes it once the window has
+        // shrunk to the boxes (`above_drag_begin`); until then, nothing here does.
+        if app.is_above() && hwnd == app.hwnd && matches!(hit, Hit::Empty) {
+            return None;
+        }
+        if let Hit::Item { key, .. } = hit {
             let dragged = own.as_ref().map(|k| k.contains(&key)).unwrap_or(false);
             // Our own icons next to an icon (its name, the room around it) go in beside it: only
             // its picture takes them in (as the icons making room show).
@@ -105,8 +122,7 @@ fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
             .map_err(|e| log::warn!("background drop target: {e}"))
             .ok()
             .map(|t| Target::Shell("bg".to_string(), t, Dest { name: deskboxes_i18n::t(app.lang, deskboxes_i18n::S::DesktopName).to_string(), open_with: false }))
-    })
-    .flatten()
+    }
 }
 
 /// The drag image's caption ("Move to Documents"): set by the drop target. Windows' folder drop
@@ -194,6 +210,12 @@ impl IDropTarget_Impl for DropTarget_Impl {
         let data = pdataobj.ok()?.clone();
         *self.data.borrow_mut() = Some(data.clone());
         let allowed = unsafe { *eff };
+        // A drag from an app over the boxes above windows: outside the boxes it goes on to the apps.
+        with(|app| {
+            if app.is_above() && self.hwnd == app.hwnd {
+                app.above_drag_begin();
+            }
+        });
         let t = target_at(self.hwnd, pt);
         // Back from another window: its caption may still be on the drag.
         *self.caption_set.borrow_mut() = None;
@@ -268,6 +290,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
         // dropped on the surface, or onto a folder, the Recycle Bin or a program here, are ours to
         // do (through the worker, so Undo can take them back).
         let ours = with(|app| {
+            app.hit_desk = app.is_above() && self.hwnd != app.hwnd;
             let p = app.screen_to_dip(pt.x, pt.y);
             let bx = match app.hit_test(p) {
                 Hit::BoxBody { id } | Hit::Header { id, .. } | Hit::Item { in_box: Some(id), .. } => Some(id),
@@ -281,6 +304,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 };
                 if take {
                     app.drop_items(keys, start, p);
+                    app.hit_desk = false;
                     app.invalidate();
                     return true;
                 }
@@ -288,6 +312,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 app.pending_drop = Some((std::time::Instant::now(), p, bx));
                 app.known_before_drop = app.items.keys().cloned().collect();
             }
+            app.hit_desk = false;
             false
         })
         .unwrap_or(false);

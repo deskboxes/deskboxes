@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 deskboxes-i18n = { workspace = true }
+deskboxes-shell = { workspace = true }
 serde_json = { workspace = true }
 windows-core = { workspace = true }
 windows = { workspace = true, features = [

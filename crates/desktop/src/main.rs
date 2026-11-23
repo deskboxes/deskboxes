@@ -35,6 +35,7 @@ mod droptarget;
 mod events;
 mod iconfx;
 mod logger;
+mod pages;
 mod saved;
 mod above;
 mod folderbox;

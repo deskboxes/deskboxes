@@ -467,6 +467,46 @@ S.privacy = { dur: 4.6, wp: [1900, -300, -380], cam: [180, 190, 1200, 675], draw
     box({ x: 880, y: 230, w: bw(3), h: bh(2), cols: 3, title: 'Documents', items: DOCS.slice(0, 6), f: () => ({ priv: pv }) }) + pill + p.html;
 } };
 
+S.pages = { dur: 5.4, wp: [1900, -300, -360], cam: [110, 110, 1380, 776], draw: t => {
+  // Alt+Right: the next page slides in (the wallpaper stays), its name in the pill at the top;
+  // Alt+Left: back. Starts and ends as the still: the first page, its name shown.
+  const back = x => { const c1 = .7, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); };
+  const t1 = .95, t2 = 3.35, S1 = .62;
+  const f = t < t2 ? back(seg(t, t1, t1 + S1)) : 1 - back(seg(t, t2, t2 + S1));
+  const dx = -1600 * f;
+  const pageA = o => box(Object.assign({ x: 200 + o, y: 250, w: bw(4), h: bh(2), tabs: [{ n: 'Documents', w: 150 }, { n: 'Sheets', c: 'green', w: 100 }], items: DOCS }, {})) +
+    box({ x: 860 + o, y: 250, w: bw(3), h: bh(2), cols: 3, title: 'Apps', items: APPS.slice(0, 6) });
+  const pageB = o => box({ x: 200 + o, y: 250, w: bw(3), h: bh(2), cols: 3, title: 'Games', tint: 'teal', items: GAMES.concat(['Spotify', 'Blender']) }) +
+    box({ x: 720 + o, y: 250, w: bw(4), h: bh(2), title: 'Photos', tint: 'purple', items: PHOTOS });
+  let html = glow(800, 470, 620, D ? .14 : .1);
+  if (f < .999) html += pageA(dx);
+  if (f > .001) html += pageB(dx + 1600);
+  // The pill: the name slides the way the page went, the dot glides.
+  const names = ['Work', 'Games'];
+  const nt = t < t2 ? seg(t, t1, t1 + .3) : seg(t, t2, t2 + .3);
+  const [from, to, dir] = t < t2 ? [0, 1, 1] : [1, 0, -1];
+  const started = t >= t1;
+  const e = out(nt);
+  const PW = 250, PH = 78, PX0 = 800 - PW / 2, PY0 = 132;
+  const label = (n, x, a) => `<div class="abs" style="left:0;right:0;top:12px;text-align:center;transform:translateX(${x}px);opacity:${a};font:600 25px 'Segoe UI Variable Display';color:${FG}">${n}</div>`;
+  let names_ = '';
+  if (!started) names_ = label(names[0], 0, 1);
+  else {
+    names_ += label(names[from], -dir * 40 * e, Math.max(0, 1 - e * 2.2));
+    names_ += label(names[to], dir * 40 * (1 - e), clamp((e - .3) / .7));
+  }
+  const di = started ? lerp(from, to, out(seg(t, t < t2 ? t1 : t2, (t < t2 ? t1 : t2) + .35))) : 0;
+  const dots = [0, 1, 2].map(i => `<div class="abs" style="left:${PW / 2 - 24 + i * 24 - 5}px;top:56px;width:10px;height:10px;border-radius:5px;background:${D ? 'rgba(255,255,255,.45)' : 'rgba(0,0,0,.3)'}"></div>`).join('') +
+    `<div class="abs" style="left:${PW / 2 - 24 + di * 24 - 14}px;top:56px;width:28px;height:10px;border-radius:5px;background:${ACC}"></div>`;
+  html += card(PX0, PY0, PW, PH, `<div class="abs" style="inset:0;overflow:hidden;border-radius:26px">${names_}${dots}</div>`, 'border-radius:26px;z-index:40');
+  // The keys.
+  const press = c => Math.max(0, 1 - Math.abs(t - c + .05) / .14);
+  const arrow = t < 2.4 ? '→' : '←';
+  const ka = kf(t, [[0, 0], [.35, 0], [.6, 1], [1.7, 1], [2.0, 0], [2.75, 0], [3.0, 1], [4.1, 1], [4.4, 0]]);
+  html += `<div class="abs" style="left:0;width:1600px;top:780px;display:flex;justify-content:center;align-items:center;opacity:${ka};z-index:60">${key('Alt', 120, Math.max(press(t1 - .12), press(t2 - .12), (t > t1 - .2 && t < t1 + .15) || (t > t2 - .2 && t < t2 + .15) ? 1 : 0))}${plus}${key(arrow, 0, Math.max(press(t1), press(t2)))}</div>`;
+  return html;
+} };
+
 // ---------- render ----------
 const sc = S[SCENE];
 const W = sc.w || 1600, H = sc.h || 900;

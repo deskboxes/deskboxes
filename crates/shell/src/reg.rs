@@ -47,6 +47,24 @@ pub fn set_string(key: &str, value: &str, data: &str) -> windows::core::Result<(
     unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, pcw(&k), pcw(&v), REG_SZ.0, Some(d.as_ptr() as _), (d.len() * 2) as u32).ok() }
 }
 
+pub fn set_dword(key: &str, value: &str, data: u32) -> windows::core::Result<()> {
+    let (k, v) = (wide(key), wide(value));
+    unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, pcw(&k), pcw(&v), REG_DWORD.0, Some(&data as *const u32 as _), 4).ok() }
+}
+
+/// The key exists (under HKCU).
+pub fn key_exists(key: &str) -> bool {
+    let k = wide(key);
+    let mut h = HKEY::default();
+    unsafe {
+        let ok = RegOpenKeyExW(HKEY_CURRENT_USER, pcw(&k), None, KEY_READ, &mut h).is_ok();
+        if ok {
+            let _ = RegCloseKey(h);
+        }
+        ok
+    }
+}
+
 /// Remove a key and everything under it.
 pub fn delete_tree(key: &str) -> bool {
     let k = wide(key);

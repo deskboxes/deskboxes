@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const A = path.dirname(fileURLToPath(import.meta.url));
 const RES = path.resolve(A, '..', '..', 'res', 'settings');
-const ALL = ['home', 'boxes', 'look', 'icons', 'tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy'];
+const ALL = ['home', 'boxes', 'look', 'icons', 'tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy', 'pages'];
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf(n); return i < 0 ? d : args.splice(i, 2)[1]; };
 const themes = opt('--themes', 'dark,light').split(',');

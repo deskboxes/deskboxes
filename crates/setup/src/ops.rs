@@ -19,7 +19,7 @@ use deskboxes_shell::{autostart, hide, reg};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows::core::{w, Interface, BSTR, HSTRING, PCWSTR, PWSTR};
+use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Registry::*;
@@ -108,13 +108,9 @@ pub fn autostart_on() -> bool {
 // ---------------------------------------------------------------------------------------------
 // The desktop-menu package ("Turn on Deskboxes" in Windows 11's main desktop menu).
 
-pub const MENU_PACKAGE: &str = "Deskboxes.DesktopMenu";
-/// Its package family name (name + hash of the manifest's publisher).
-pub const MENU_PFN: &str = "Deskboxes.DesktopMenu_hq7sd8dcym9vw";
+pub use deskboxes_shell::turnon::{MENU_PACKAGE, MENU_PFN};
+use deskboxes_shell::turnon::MENU_PREFS;
 pub const MENU_MSIX: &str = "deskboxes-menu.msix";
-/// Windows 26H2's "Customize menu": packaged extensions listed here with Enabled=1 sit in the
-/// menu itself, the others go into "App extensions".
-const MENU_PREFS: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\ContextMenu\Preferences";
 
 fn powershell(script: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
@@ -125,9 +121,7 @@ fn powershell(script: &str) -> std::process::Command {
 
 /// Where the menu package's files are registered from, if it is registered for this user.
 pub fn menu_package_location() -> Option<PathBuf> {
-    let out = powershell(&format!("(Get-AppxPackage -Name {MENU_PACKAGE} | Select-Object -First 1).EffectiveExternalLocation")).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then(|| PathBuf::from(s))
+    deskboxes_shell::turnon::menu_package_dir()
 }
 
 /// Register the menu package from `dir` (Windows 11 only). It is unsigned, which Windows accepts
@@ -181,21 +175,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 fn show_menu_on_top() {
-    if key_exists(MENU_PREFS) {
-        let _ = set_dword(&format!(r"{MENU_PREFS}\extensions\{MENU_PFN}"), "Enabled", 1);
-    }
-}
-
-fn key_exists(key: &str) -> bool {
-    let k = HSTRING::from(key);
-    let mut h = HKEY::default();
-    unsafe {
-        let ok = RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), None, KEY_READ, &mut h).is_ok();
-        if ok {
-            let _ = RegCloseKey(h);
-        }
-        ok
-    }
+    deskboxes_shell::turnon::pin_modern_verb();
 }
 
 /// powershell.exe `script` as administrator (a UAC prompt), hidden; its exit code, or None if the
@@ -576,35 +556,13 @@ pub fn token_elevated() -> bool {
 pub fn launch(exe: &Path, args: &str, cwd: &Path) -> Result<(), String> {
     if token_elevated() {
         log("elevated: starting through Explorer");
-        return launch_via_explorer(exe, args, cwd).map_err(|e| e.to_string());
+        return deskboxes_shell::launch::via_explorer(exe, args, cwd).map_err(|e| e.to_string());
     }
     let mut c = std::process::Command::new(exe);
     for a in args.split_whitespace() {
         c.arg(a);
     }
     c.current_dir(cwd).spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
-fn launch_via_explorer(exe: &Path, args: &str, cwd: &Path) -> windows::core::Result<()> {
-    use windows::Win32::System::Variant::*;
-    unsafe {
-        let sw: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
-        let mut loc = VARIANT::default();
-        (*loc.Anonymous.Anonymous).vt = VT_I4;
-        (*loc.Anonymous.Anonymous).Anonymous.lVal = CSIDL_DESKTOP as i32;
-        let root = VARIANT::default();
-        let mut hwnd = 0i32;
-        let disp = sw.FindWindowSW(&loc, &root, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
-        let sp: windows::Win32::System::Com::IServiceProvider = disp.cast()?;
-        let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
-        let view = browser.QueryActiveShellView()?;
-        let bg: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
-        let fv: IShellFolderViewDual = bg.cast()?;
-        let app: IShellDispatch2 = fv.Application()?.cast()?;
-        let v = |s: &str| VARIANT::from(BSTR::from(s));
-        app.ShellExecute(&BSTR::from(exe.to_string_lossy().as_ref()), &v(args), &v(&cwd.to_string_lossy()), &v("open"), &VARIANT::from(SW_SHOWNORMAL.0))?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
