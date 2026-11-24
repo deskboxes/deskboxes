@@ -11,6 +11,9 @@ use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 static ON: AtomicBool = AtomicBool::new(false);
+/// The app is closing: no more frames. (Posted frames would keep the queue from ever being empty,
+/// and Windows hands out WM_QUIT only then: a two-screen debug build never quit, 2026-11-24.)
+static STOPPED: AtomicBool = AtomicBool::new(false);
 /// A frame is posted and not drawn yet (shared with `App::invalidate`).
 pub static PENDING: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicIsize = AtomicIsize::new(0);
@@ -18,6 +21,9 @@ static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
 /// Post one frame request to the UI thread unless one is already queued.
 pub fn request_frame() {
+    if STOPPED.load(Ordering::Acquire) {
+        return;
+    }
     if !PENDING.swap(true, Ordering::AcqRel) {
         let h = HWND(TARGET.load(Ordering::Relaxed) as _);
         unsafe {
@@ -54,12 +60,19 @@ pub fn start(target: HWND) {
 
 /// Animations running (keep frames coming at the refresh rate) or not.
 pub fn set(on: bool) {
+    let on = on && !STOPPED.load(Ordering::Acquire);
     let was = ON.swap(on, Ordering::AcqRel);
     if on && !was {
         if let Some(t) = THREAD.get() {
             t.unpark();
         }
     }
+}
+
+/// No more frames, for good (the app is closing).
+pub fn stop() {
+    STOPPED.store(true, Ordering::Release);
+    ON.store(false, Ordering::Release);
 }
 
 fn primary_output() -> Option<IDXGIOutput> {

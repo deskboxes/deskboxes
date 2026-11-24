@@ -19,6 +19,26 @@ fn local_stamp() -> u64 {
     ((t.wYear as u64 * 100 + t.wMonth as u64) * 100 + t.wDay as u64) * 1_000_000 + (t.wHour as u64 * 100 + t.wMinute as u64) * 100 + t.wSecond as u64
 }
 
+/// Until 0.1.3 the layout file was named after the main screen's size ("primary-2560x1440-96");
+/// now one file ("desktop") holds every screen's pages. The first start after that copies the
+/// saved layouts across (the old ones stay where they were, for an older version).
+pub fn copy_legacy_saved(paths: &crate::Paths, legacy: &str, now: &str) {
+    let root = paths.layouts.parent().map(|p| p.join("saved")).unwrap_or_else(|| paths.layouts.join("saved"));
+    let (from, to) = (root.join(legacy), root.join(now));
+    if to.exists() || !from.is_dir() {
+        return;
+    }
+    let mut n = 0;
+    if std::fs::create_dir_all(&to).is_ok() {
+        for e in std::fs::read_dir(&from).into_iter().flatten().flatten() {
+            if e.path().extension().is_some_and(|x| x == "json") && std::fs::copy(e.path(), to.join(e.file_name())).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    log::info!("saved layouts: {n} copied from {legacy} to {now}");
+}
+
 /// "2026-11-20 04:15" (saved) or "2026-11-20" (a day's backup).
 pub fn shown(id: u64) -> String {
     if id >= 10_000_000_000_000 {
@@ -74,12 +94,17 @@ impl App {
             .filter_map(|e| {
                 let day = e.file_name().to_str()?.to_string();
                 let id: u64 = day.replace('-', "").parse().ok()?;
-                let l = persist::load_layout(&e.path(), &self.topology)?;
+                let l = self.backup_of(&e.path())?;
                 Some(SavedLayout { id, when: shown(id), boxes: l.boxes.len() })
             })
             .collect();
         v.sort_by(|a, b| b.id.cmp(&a.id));
         v
+    }
+
+    /// The layout in a day's backup folder (a backup from before 0.1.4 has it under the old name).
+    fn backup_of(&self, day: &std::path::Path) -> Option<MonitorLayout> {
+        persist::load_layout(day, &self.topology).or_else(|| persist::load_layout(day, &self.legacy_topology))
     }
 
     pub fn save_layout_now(&mut self) {
@@ -96,7 +121,7 @@ impl App {
             persist::load_layout(&self.saved_dir(), &id.to_string())
         } else {
             let day = shown(id);
-            persist::load_layout(&self.paths.backups.join(day), &self.topology)
+            self.backup_of(&self.paths.backups.join(day))
         };
         let Some(m) = m else {
             log::warn!("restore layout {id}: not found");

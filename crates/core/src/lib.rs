@@ -9,6 +9,7 @@ pub mod selection;
 pub mod snapshot;
 pub mod persist;
 pub mod rules;
+pub mod screens;
 
 pub use geom::*;
 pub use model::*;

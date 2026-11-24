@@ -70,6 +70,8 @@ const T_SAVE_SETTINGS: usize = 41;
 const T_WALLPAPER: usize = 42;
 /// The taskbar check again, a moment after the desktop got the front.
 const T_TASKBAR: usize = 43;
+/// The layout file's name: one for every screen setup.
+pub const LAYOUT_NAME: &str = "desktop";
 /// Hover highlights fading in, s.
 pub const HOVER_FADE_S: f32 = 0.12;
 /// The search button opening into a field (and closing), s.
@@ -379,7 +381,19 @@ pub struct App {
     pub icon_imgs: HashMap<u32, IconImage>,
     pub layout: MonitorLayout,
     pub hist: History,
+    /// The layout file's name ("desktop": one for every screen setup).
     pub topology: String,
+    /// The per-main-screen file name used until 0.1.3 (older backups and saved layouts).
+    pub legacy_topology: String,
+    /// Every screen's own state; the one in use (`cur`) has it in the fields above (`screens.rs`).
+    pub screens: Vec<crate::screens::ScreenRt>,
+    pub cur: usize,
+    /// A screen not in use is being drawn (no pointer feedback, search or tooltips on it).
+    pub paint_inactive: bool,
+    /// The screens as last found (a display change that keeps them changes nothing).
+    pub screens_sig: String,
+    /// Fixture screens (`--screens`), as test windows.
+    pub fixture_screens: String,
     pub sel: Selection,
     pub hover: Option<ItemKey>,
     pub drag: Drag,
@@ -733,7 +747,7 @@ fn icon_title_font() -> (String, f32) {
     }
 }
 
-unsafe fn primary_monitor() -> (RECT, RECT) {
+pub(crate) unsafe fn primary_monitor() -> (RECT, RECT) {
     let hm = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -778,7 +792,9 @@ unsafe fn register_classes() {
 
 /// Create the surface window: a child of Progman covering the primary monitor (desktop mode),
 /// or a normal top-level window (fixture `--window` mode).
-unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Result<(HWND, POINT)> {
+/// The surface window for monitor `mon` (desktop mode: a child of Progman over it); in window
+/// mode a test window, at `test` (else the default size near the main monitor's corner).
+pub(crate) unsafe fn create_surface_window(desktop: bool, mon: RECT, test: Option<RECT>) -> windows::core::Result<(HWND, POINT)> {
     let hinst = GetModuleHandleW(None)?;
     if desktop {
         let progman = hide::progman();
@@ -801,7 +817,7 @@ unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Resu
         let _ = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         Ok((h, POINT { x: mon.left, y: mon.top }))
     } else {
-        let (w, h) = (1600, 1000);
+        let r = test.unwrap_or(RECT { left: mon.left + 80, top: mon.top + 60, right: mon.left + 80 + 1600, bottom: mon.top + 60 + 1000 });
         // The harness brings it to the foreground before screenshots and input. Not topmost:
         // the shell host's menus must open above it, as they do above the desktop.
         let hw = CreateWindowExW(
@@ -809,10 +825,10 @@ unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Resu
             class_name(false),
             w!("Deskboxes (fixture)"),
             WS_POPUP | WS_BORDER,
-            mon.left + 80,
-            mon.top + 60,
-            w,
-            h,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
             None,
             None,
             Some(hinst.into()),
@@ -984,8 +1000,28 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     };
     log::info!("MEM after graphics devices: private/working set {:.1?} MB", mem_mb());
     let t_devices = t0.elapsed().as_secs_f64() * 1000.0;
-    let (mon_full, work_px) = primary_monitor();
-    let (hwnd, origin_px) = match create_surface_window(desktop_mode, mon_full) {
+    // The screens: the main one is made now, the others once it is on screen.
+    let mut monitors = crate::screens::monitors();
+    let fixture_screens = args.screens.clone().unwrap_or_default();
+    let (mon_full, work_px) = match monitors.first() {
+        Some(m) if desktop_mode => (m.rect, m.work),
+        _ => primary_monitor(),
+    };
+    if !desktop_mode {
+        let main = monitors.first().cloned().unwrap_or(crate::screens::Monitor { id: "fixture".into(), name: String::new(), n: 1, rect: mon_full, work: work_px, dpi: 96 });
+        monitors = if fixture_screens.is_empty() {
+            // The one test window, as always.
+            let r = RECT { left: mon_full.left + 80, top: mon_full.top + 60, right: mon_full.left + 80 + 1600, bottom: mon_full.top + 60 + 1000 };
+            vec![crate::screens::Monitor { id: "fixture-1".into(), name: String::new(), n: 1, rect: r, work: r, dpi: main.dpi }]
+        } else {
+            crate::screens::fixture_monitors(&fixture_screens, &main)
+        };
+    }
+    if monitors.is_empty() {
+        monitors.push(crate::screens::Monitor { id: "main".into(), name: String::new(), n: 1, rect: mon_full, work: work_px, dpi: 96 });
+    }
+    let test_rect = (!desktop_mode).then(|| monitors[0].rect);
+    let (hwnd, origin_px) = match create_surface_window(desktop_mode, mon_full, test_rect) {
         Ok(x) => x,
         Err(e) => {
             log::error!("cannot create the surface window: {e}");
@@ -1042,17 +1078,26 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let glyph_tf = gpu.text_format("Segoe Fluent Icons", 12.0, false).or_else(|_| gpu.text_format("Segoe MDL2 Assets", 12.0, false)).expect("text format");
     let line_h = gpu.label(&label_tf, "Ag", 200.0, 100.0, 1, true).map(|l| deskboxes_render::text_height(&l)).unwrap_or(font.1 * 1.33);
     let t_text = t0.elapsed().as_secs_f64() * 1000.0;
-    let topology = format!("primary-{}x{}-{}", mon_full.right - mon_full.left, mon_full.bottom - mon_full.top, dpi);
-    let lay = match persist::load_layout_checked(&paths.layouts, &topology) {
+    // One layout file for every screen setup (its screens' pages inside: `screens.rs`). Until
+    // 0.1.3 there was one per main-screen size: that one is read the first time.
+    let topology = LAYOUT_NAME.to_string();
+    let legacy_topology = format!("primary-{}x{}-{}", mon_full.right - mon_full.left, mon_full.bottom - mon_full.top, dpi);
+    let from_legacy = !persist::layout_path(&paths.layouts, &topology).exists() && persist::layout_path(&paths.layouts, &legacy_topology).exists();
+    let read_name = if from_legacy { legacy_topology.clone() } else { topology.clone() };
+    if from_legacy {
+        log::info!("layout: reading {legacy_topology} (from now on kept as {topology})");
+        crate::saved::copy_legacy_saved(&paths, &legacy_topology, &topology);
+    }
+    let lay = match persist::load_layout_checked(&paths.layouts, &read_name) {
         Ok(l) => l.unwrap_or_default(),
         Err(e) => {
             // Not overwritten unseen: a copy stays next to it (a newer version's layout, say).
-            let kept = persist::keep_unreadable(&persist::layout_path(&paths.layouts, &topology));
-            log::warn!("layout {topology} unreadable ({e}): starting empty; the file is kept as {kept:?}");
+            let kept = persist::keep_unreadable(&persist::layout_path(&paths.layouts, &read_name));
+            log::warn!("layout {read_name} unreadable ({e}): starting empty; the file is kept as {kept:?}");
             Default::default()
         }
     };
-    let first_run = !persist::layout_path(&paths.layouts, &topology).exists();
+    let first_run = !persist::layout_path(&paths.layouts, &read_name).exists();
     let template_pending = args.first_run_template || (fresh_install && first_run && args.desktop_dir.is_none());
     let seed: Vec<Item> = snap.as_ref().filter(|s| s.icon_px == icon_px).map(|s| s.items.clone()).unwrap_or_default();
     let first_icon_id = snap.as_ref().map(|s| s.icons.len() as u32).unwrap_or(0);
@@ -1106,6 +1151,12 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         layout: lay,
         hist: History::default(),
         topology,
+        legacy_topology,
+        screens: vec![],
+        cur: 0,
+        paint_inactive: false,
+        screens_sig: crate::screens::signature(&monitors),
+        fixture_screens,
         sel: Selection::default(),
         hover: None,
         drag: Drag::None,
@@ -1288,6 +1339,8 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         app.stats.hide_ms = th.elapsed().as_secs_f64() * 1000.0;
         log::info!("PHASE hide_icons ms={:.1} state={s:?}", app.stats.hide_ms);
     }
+    app.screens = vec![crate::screens::ScreenRt::empty(monitors[0].clone())];
+    app.add_other_screens(monitors);
     app.folder_sync();
     let _ = app.worker.send(Req::Scan);
     deskboxes_shell::watch::watch(dirs.iter().map(|d| d.path.clone()).collect(), || events::post(Ev::Rescan));
@@ -2048,6 +2101,20 @@ impl App {
     }
 
     /// Whether anything is animating (keeps the frame clock running).
+    /// What is animating (for the log).
+    pub fn anim_why(&self) -> String {
+        let v = [
+            ("roll", self.anim_roll), ("glide", !self.glide.is_empty()), ("box_glide", !self.box_glide.is_empty()),
+            ("tab", self.tab_anim.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_ANIM_S).unwrap_or(false)),
+            ("tabcolor", self.tab_color_from.map(|(_, _, t0)| t0.elapsed().as_secs_f32() < TAB_COLOR_S).unwrap_or(false)),
+            ("tip", self.tip.as_ref().map(|t| t.4.elapsed().as_secs_f32() < TIP_FADE_S).unwrap_or(false)),
+            ("search", self.search_animating()), ("az", self.az_animating()), ("snap", self.snap_animating()), ("header", self.header_animating()),
+            ("blend", self.blend_animating()), ("tuck", self.tuck_animating()), ("above", self.above_animating()), ("pages", self.pages_animating()),
+            ("scroll", self.scroll_animating()), ("vanish", !self.vanishing.is_empty()), ("appear", !self.appearing.is_empty()),
+        ];
+        v.iter().filter(|x| x.1).map(|x| x.0).collect::<Vec<_>>().join(",")
+    }
+
     pub fn animating(&self) -> bool {
         self.anim_roll
             || !self.glide.is_empty()
@@ -2939,6 +3006,8 @@ impl App {
     }
 
     pub fn layout_changed(&mut self) {
+        // The page shown on another screen now (undo, a saved layout): that screen in use.
+        self.screen_sync();
         // Another page now (undo, a saved layout): it slides in.
         self.page_check_shown();
         // Undo, a saved layout or a deleted box can change what folder boxes show.
@@ -2946,11 +3015,29 @@ impl App {
         if self.host.is_some() && self.settings_sig() != self.settings_sent {
             self.send_settings(false, None);
         }
-        self.ensure_backdrops();
+        if self.multi_screen() {
+            self.for_each_screen(|a| a.ensure_backdrops());
+        } else {
+            self.ensure_backdrops();
+        }
+        self.save_soon();
+        self.invalidate();
+    }
+
+    /// Write the layout in a moment (changes close together are written once).
+    pub fn save_soon(&mut self) {
         unsafe {
             SetTimer(Some(self.msg_hwnd), T_SAVE, 1000, None);
         }
-        self.invalidate();
+    }
+
+    /// The main screen's window (the first one made; it outlives the others).
+    pub fn main_hwnd(&self) -> HWND {
+        if self.cur == 0 {
+            self.hwnd
+        } else {
+            self.screens.first().map(|s| s.hwnd).unwrap_or(self.hwnd)
+        }
     }
 
     pub fn save(&mut self) {
@@ -3166,7 +3253,7 @@ impl App {
         self.shown_cache.borrow_mut().clear();
         if renamed || first {
             self.labels.clear();
-            self.label_bmps.clear();
+            self.clear_label_bmps_all();
         }
         if let Some(nv) = &native {
             if nv.spacing.0 > 0 && nv.spacing.1 > 0 {
@@ -3252,6 +3339,9 @@ impl App {
         if first && self.template_pending {
             self.template_pending = false;
             log::info!("first run: the default boxes");
+            // New icons are on the main screen (with the pointer on another one, the template
+            // found none there: 2026-11-24).
+            self.enter_screen(0);
             self.apply_template();
         }
         self.sel.set.retain(|k| self.items.contains_key(k));
@@ -4375,6 +4465,8 @@ impl App {
                 if self.args.open_settings {
                     self.send_settings(true, None);
                 }
+                // A screen disconnected before the host was there.
+                self.next_screen_notice();
             }
             "shown" => {
                 log::info!("menu {} shown in {} ms", v["id"], v["ms"]);
@@ -4865,7 +4957,7 @@ impl App {
         self.seeded = false;
         self.views.forget_icons();
         self.labels.clear();
-        self.label_bmps.clear();
+        self.clear_label_bmps_all();
         log::info!("icon size -> {dip} DIP ({} px)", self.icon_px);
         // Explorer's desktop gets the size too only when this is the real desktop (a fixture
         // or a window keeps it to itself).
@@ -6253,12 +6345,24 @@ impl App {
             return;
         }
         self.set_above(false);
+        if self.multi_screen() || !self.screens.is_empty() {
+            let ms = self.find_monitors();
+            if !ms.is_empty() {
+                self.rebuild_screens(ms);
+                if !self.frame_ok {
+                    log::error!("no frame after the Explorer restart: restoring icons, exiting for a restart");
+                    hide::restore();
+                    unsafe { PostQuitMessage(4) };
+                }
+                return;
+            }
+        }
         unsafe {
             if IsWindow(Some(self.hwnd)).as_bool() {
                 let _ = DestroyWindow(self.hwnd);
             }
             let (mon, _) = primary_monitor();
-            match create_surface_window(true, mon) {
+            match create_surface_window(true, mon, None) {
                 Ok((h, o)) => {
                     self.hwnd = h;
                     self.origin_px = o;
@@ -6346,6 +6450,7 @@ impl App {
         }
         self.set_above(false);
         self.quitting = true;
+        crate::anim::stop();
         self.end_rename(false);
         self.flush_settings();
         self.save();
@@ -6432,6 +6537,25 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
     }
     let mut after = After::None;
     let r = with(|app| {
+        // Several screens: a message for another screen's window makes that screen the one in
+        // use (the wheel goes to the screen under the pointer, whichever window has the focus).
+        if app.multi_screen() {
+            let target = match m {
+                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                    let (x, y) = lparam_pt(l);
+                    app.screen_at(x, y).filter(|_| app.screen_of_hwnd(h).is_some())
+                }
+                WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONDBLCLK | WM_MBUTTONUP | WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR | WM_SETFOCUS => app.screen_of_hwnd(h),
+                _ => None,
+            };
+            if let Some(k) = target {
+                app.enter_screen(k);
+            }
+            // A box carried over to another screen goes along with the pointer.
+            if m == WM_MOUSEMOVE && h == app.hwnd {
+                app.carry_box_across();
+            }
+        }
         let is_surface = h == app.hwnd;
         if is_surface && (m == WM_SETFOCUS || m == WM_KILLFOCUS) {
             app.set_desk_active(m == WM_SETFOCUS);
@@ -6726,8 +6850,9 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                     T_TASKBAR => keep_taskbar_on_top(),
                     T_WALLPAPER => {
                         let _ = KillTimer(Some(h), T_WALLPAPER);
-                        app.wallpaper_check();
+                        app.for_each_screen(|a| a.wallpaper_check());
                     }
+                    crate::screens::T_SCREENS => app.screens_due(),
                     T_FS => {
                         let _ = app.worker.send(Req::Scan);
                     }
@@ -6749,7 +6874,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 let light = reg::apps_use_light_theme();
                 if light != app.light {
                     app.light = light;
-                    app.load_wallpaper();
+                    app.for_each_screen(|a| a.load_wallpaper());
                     app.fx_cache.borrow_mut().clear();
                     app.invalidate();
                 } else if w.0 as u32 == SPI_SETDESKWALLPAPER.0 || w.0 == 0 {
@@ -6758,12 +6883,25 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 None
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
-                log::info!("display change: Phase 1 re-layout needs a restart (UNVERIFIED path)");
+                // A monitor plugged in or out, another resolution or scale: the screens are made
+                // anew once Windows has settled (`screens.rs`).
+                app.on_display_change();
                 None
+            }
+            WM_CLOSE if !app.desktop_mode && app.screen_of_hwnd(h).is_some_and(|k| k != 0 || app.cur != 0) && Some(h) != app.screens.first().map(|s| s.hwnd).filter(|_| app.cur != 0) && h != app.main_hwnd() => {
+                // (Fixture screens: closing one is unplugging it.)
+                app.fixture_screen_closed(h);
+                Some(LRESULT(0))
             }
             WM_HOTKEY if w.0 as i32 == crate::above::HK_ABOVE => {
                 // Only over an app: on the desktop the boxes are already in front.
                 if app.is_above() || !app.desktop_in_front() {
+                    // (Several screens: the boxes of the screen the pointer is on come up.)
+                    if !app.is_above() && app.multi_screen() {
+                        if let Some(k) = app.screen_under_cursor() {
+                            app.enter_screen(k);
+                        }
+                    }
                     app.toggle_above();
                 } else {
                     log::info!("boxes above windows: shortcut ignored (the desktop is in front)");

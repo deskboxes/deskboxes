@@ -830,6 +830,13 @@ namespace dbx
             x += Card(L"&#xE916;", Str(L"pagesAnimate"), Str(L"pagesAnimateDesc"), Toggle(L"PgAnimate", on(L"animate")));
             x += Card(L"&#xE945;", Str(L"pagesBounce"), L"", Toggle(L"PgBounce", on(L"bounce")));
             x += Card(L"&#xE8EC;", Str(L"pagesShowName"), Str(L"pagesShowNameDesc"), Toggle(L"PgShowName", on(L"showName")));
+            // Several screens (only once a second one was seen).
+            if (p.GetNamedNumber(L"screens", 1) > 1)
+            {
+                x += Section(Str(L"pagesScreens"));
+                x += Note(Str(L"pagesScreensNote"));
+                x += Card(L"&#xE7F4;", Str(L"pagesScreenNotice"), Str(L"pagesScreenNoticeDesc"), Toggle(L"PgScreenNotice", on(L"screenNotice")));
+            }
             return x;
         }
 
@@ -1685,6 +1692,7 @@ namespace dbx
             OnToggle(root, L"PgAnimate", L"pages", L"animate");
             OnToggle(root, L"PgBounce", L"pages", L"bounce");
             OnToggle(root, L"PgShowName", L"pages", L"showName");
+            OnToggle(root, L"PgScreenNotice", L"pages", L"screenNotice");
             OnCombo(root, L"PgNewFiles", [](std::wstring v) { Send(L"pages", 0, L"newFiles", JsonValue::CreateStringValue(v)); });
             OnClick(root, L"PgNew", L"pages", 0, L"new");
             for (auto const& e : g.data.GetNamedObject(L"pages", JsonObject()).GetNamedArray(L"list", JsonArray()))

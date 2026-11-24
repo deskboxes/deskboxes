@@ -66,6 +66,7 @@ impl DropTarget {
 /// own drag, a layout move, else the folder background's drop target.
 fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
     with(|app| {
+        enter_screen_of(app, hwnd);
         // (The desktop window under the boxes-above window: its loose icons count.)
         app.hit_desk = app.is_above() && hwnd != app.hwnd;
         let t = target_at_in(app, hwnd, pt);
@@ -73,6 +74,16 @@ fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
         t
     })
     .flatten()
+}
+
+/// Several screens: a drag over another screen's window makes that screen the one in use (its
+/// page is the layout's own then, and points are its own).
+fn enter_screen_of(app: &mut crate::app::App, hwnd: HWND) {
+    if app.multi_screen() {
+        if let Some(k) = app.screen_of_hwnd(hwnd).filter(|k| *k != app.cur) {
+            app.enter_screen(k);
+        }
+    }
 }
 
 fn target_at_in(app: &mut crate::app::App, hwnd: HWND, pt: &POINTL) -> Option<Target> {
@@ -290,6 +301,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
         // dropped on the surface, or onto a folder, the Recycle Bin or a program here, are ours to
         // do (through the worker, so Undo can take them back).
         let ours = with(|app| {
+            enter_screen_of(app, self.hwnd);
             app.hit_desk = app.is_above() && self.hwnd != app.hwnd;
             let p = app.screen_to_dip(pt.x, pt.y);
             let bx = match app.hit_test(p) {

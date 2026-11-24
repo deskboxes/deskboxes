@@ -12,24 +12,22 @@ use crate::layout;
 use crate::model::*;
 use std::collections::HashSet;
 
-/// The pages' ids, in order (one unnamed page until a second one is made).
+/// The pages' ids, in order (one unnamed page until a second one is made): those of the screen
+/// the page shown is on (each screen has pages of its own, `screens.rs`).
 pub fn ids(l: &MonitorLayout) -> Vec<u32> {
     if l.pages.is_empty() {
-        vec![l.page]
-    } else {
-        l.pages.iter().map(|p| p.id).collect()
+        return vec![l.page];
     }
+    let s = crate::screens::screen_of(l, l.page);
+    l.pages.iter().filter(|p| p.screen == s).map(|p| p.id).collect()
 }
 
 pub fn count(l: &MonitorLayout) -> usize {
-    l.pages.len().max(1)
+    ids(l).len().max(1)
 }
 
 pub fn index_of(l: &MonitorLayout, id: u32) -> Option<usize> {
-    if l.pages.is_empty() {
-        return (id == l.page).then_some(0);
-    }
-    l.pages.iter().position(|p| p.id == id)
+    ids(l).iter().position(|p| *p == id)
 }
 
 /// The page shown: its position (0-based).
@@ -50,7 +48,7 @@ pub fn name(l: &MonitorLayout, id: u32) -> &str {
 /// The single page gets an entry of its own (before a second one is made, or it is named).
 fn materialize(l: &mut MonitorLayout) {
     if l.pages.is_empty() {
-        l.pages.push(PageMeta { id: l.page, name: String::new() });
+        l.pages.push(PageMeta { id: l.page, ..Default::default() });
     }
 }
 
@@ -83,8 +81,14 @@ pub fn with_page<R>(l: &mut MonitorLayout, id: u32, f: impl FnOnce(&mut MonitorL
 pub fn new_page(l: &mut MonitorLayout, name: &str, at: Option<usize>) -> u32 {
     materialize(l);
     let id = layout::alloc_id(l);
-    let at = at.unwrap_or(l.pages.len()).min(l.pages.len());
-    l.pages.insert(at, PageMeta { id, name: name.trim().to_string() });
+    let screen = crate::screens::screen_of(l, l.page).to_string();
+    // `at` counts this screen's pages: the new one goes before the one at `at` there.
+    let mine = ids(l);
+    let at = match at.and_then(|i| mine.get(i)) {
+        Some(before) => l.pages.iter().position(|p| p.id == *before).unwrap_or(l.pages.len()),
+        None => mine.last().and_then(|last| l.pages.iter().position(|p| p.id == *last)).map(|i| i + 1).unwrap_or(l.pages.len()),
+    };
+    l.pages.insert(at, PageMeta { id, name: name.trim().to_string(), screen, home: String::new() });
     l.parked.insert(id, PageContent::default());
     id
 }
@@ -100,15 +104,19 @@ pub fn rename(l: &mut MonitorLayout, id: u32, name: &str) -> bool {
     }
 }
 
-/// Move page `id` to position `to`.
+/// Move page `id` to position `to` (among its screen's pages).
 pub fn move_page(l: &mut MonitorLayout, id: u32, to: usize) -> bool {
-    let Some(from) = l.pages.iter().position(|p| p.id == id) else { return false };
-    let to = to.min(l.pages.len() - 1);
-    if from == to {
+    let mine = ids(l);
+    let (Some(from), Some(&dest)) = (mine.iter().position(|p| *p == id), mine.get(to.min(mine.len().saturating_sub(1)))) else { return false };
+    if mine[from] == dest {
         return false;
     }
-    let p = l.pages.remove(from);
-    l.pages.insert(to, p);
+    let Some(i) = l.pages.iter().position(|p| p.id == id) else { return false };
+    let p = l.pages.remove(i);
+    let j = l.pages.iter().position(|p| p.id == dest).unwrap_or(l.pages.len());
+    // Moving right: after the page now at `to`; left: before it.
+    let j = if to > from { j + 1 } else { j };
+    l.pages.insert(j.min(l.pages.len()), p);
     true
 }
 

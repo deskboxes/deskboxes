@@ -15,6 +15,8 @@
 //!           [--no-host]             do not start the shell host
 //!           [--host EXE]            shell host executable
 //!           [--watchdog-pid PID]    started by the watchdog
+//!           [--screens 1200x800,900x700]  (with --window) test windows standing in for
+//!                                   several monitors; closing one is unplugging it
 //!           [--diagnostics]         show the diagnostics overlay (also Ctrl+Shift+F12)
 //!           [--enable]              turn Deskboxes back on if "Disable Deskboxes" turned it off
 //!                                   (the Start menu shortcut and setup's "Open Deskboxes now";
@@ -37,6 +39,7 @@ mod iconfx;
 mod logger;
 mod pages;
 mod saved;
+mod screens;
 mod above;
 mod folderbox;
 mod update;
@@ -80,6 +83,8 @@ pub struct Args {
     pub first_run_template: bool,
     /// Open Settings once the shell host is ready (for checks of the Settings window).
     pub open_settings: bool,
+    /// Fixture monitors (`--screens 1200x800,900x700`, with --window).
+    pub screens: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -111,6 +116,7 @@ fn parse_args() -> Args {
             "--enable" => a.enable = true,
             "--open-settings" => a.open_settings = true,
             "--first-run-template" => a.first_run_template = true,
+            "--screens" => a.screens = Some(next(&mut i)),
             other => eprintln!("unknown argument {other}"),
         }
         i += 1;

@@ -512,7 +512,9 @@ impl App {
         unsafe {
             let _ = GetCursorPos(&mut p);
         }
-        let m = self.mon;
+        // (Several screens: the corner of the screen the pointer is on.)
+        let k = if self.multi_screen() && !self.is_above() { self.screen_at(p.x, p.y).unwrap_or(self.cur) } else { self.cur };
+        let m = if k == self.cur { self.mon } else { self.screens[k].mon_rect };
         let (l, t, r, b) = (p.x <= m.left + 1, p.y <= m.top + 1, p.x >= m.right - 2, p.y >= m.bottom - 2);
         // On this monitor (a monitor beside it lines up with its edges too).
         let on_mon = p.x >= m.left && p.x < m.right && p.y >= m.top && p.y < m.bottom;
@@ -536,6 +538,7 @@ impl App {
                 if self.desktop_in_front() {
                     log::info!("boxes above windows: corner ignored (the desktop is in front)");
                 } else {
+                    self.enter_screen(k);
                     self.set_above(true);
                 }
             }

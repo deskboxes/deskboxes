@@ -166,6 +166,9 @@ pub struct PageState {
     /// A dialog open: its id and what it asks.
     pub dialog: Option<(u32, Ask)>,
     pub dialog_seq: u32,
+    /// Disconnected screens still to tell about (screen, its first page's name, how many pages,
+    /// that page): one dialog at a time, once the shell host is there.
+    pub screen_notices: Vec<(String, String, usize, Option<u32>)>,
 }
 
 /// Ease out with a light overshoot (the page settling with a small bounce).
@@ -501,7 +504,7 @@ impl App {
     }
 
     /// The layout before a drag takes things to another page (kept for its undo, or its cancel).
-    fn page_keep_before(&mut self) {
+    pub(crate) fn page_keep_before(&mut self) {
         let carrying = matches!(self.drag, Drag::MoveBox { .. } | Drag::Items { .. }) || self.own_drag.is_some();
         if carrying && self.pages.before.is_none() {
             let mut b = self.layout.clone();
@@ -1086,6 +1089,16 @@ impl App {
     /// New desktop icons onto the page shown, or the first page (Settings › Pages); icons gone
     /// from the disk leave every page.
     pub fn reconcile_pages(&mut self, present: &[ItemKey]) -> bool {
+        // Several screens, another one in use: new icons go to the main screen (as Windows puts
+        // new desktop files there), onto the page it shows or its first.
+        if self.multi_screen() && self.cur != 0 {
+            let main = &self.screens[0];
+            let (g, id) = (main.grid, main.mon.id.clone());
+            let page = if self.pages_on() && self.settings.pages.new_files == "first" { deskboxes_core::screens::pages_of(&self.layout, &id).first().copied() } else { deskboxes_core::screens::shown_on(&self.layout, &id) };
+            if let Some(p) = page.filter(|p| *p != self.layout.page) {
+                return pg::with_page(&mut self.layout, p, |l| deskboxes_core::layout::reconcile(l, present, &g)).unwrap_or(false);
+            }
+        }
         let g = self.grid;
         let first = pg::id_at(&self.layout, 0).unwrap_or(self.layout.page);
         if self.pages_on() && self.settings.pages.new_files == "first" && first != self.layout.page {
@@ -1119,6 +1132,8 @@ pub enum Ask {
     Delete(u32),
     /// Turning pages off with several: everything onto one first.
     Merge,
+    /// A screen was disconnected (`screens.rs`): "Show page" shows the first of its pages.
+    ScreenGone(Option<u32>),
 }
 
 impl App {
@@ -1247,6 +1262,30 @@ impl App {
             Ok(_) => self.pages.dialog = Some((id, ask)),
             Err(e) => log::warn!("dialog: {e}"),
         }
+    }
+
+    /// A screen was disconnected and its pages are on the main screen now: say so (one dialog at
+    /// a time; at the start, once the shell host is there).
+    pub fn screen_notice(&mut self, screen: &str, page: &str, n: usize, first: Option<u32>) {
+        self.pages.screen_notices.push((screen.to_string(), page.to_string(), n, first));
+        self.next_screen_notice();
+    }
+
+    pub fn next_screen_notice(&mut self) {
+        if self.host.is_none() || self.pages.dialog.is_some() || self.pages.screen_notices.is_empty() {
+            return;
+        }
+        let (screen, page, n, first) = self.pages.screen_notices.remove(0);
+        let l = self.lang;
+        let text = if n > 1 { t(l, S::ScreenGoneBodyMore).replace("{n}", &n.to_string()) } else { t(l, S::ScreenGoneBody).to_string() };
+        let body = serde_json::json!({
+            "kind": "confirm",
+            "title": t(l, S::ScreenGoneTitle).replace("{screen}", &screen),
+            "body": text.replace("{page}", &page),
+            "ok": t(l, S::ShowPage),
+            "cancel": t(l, S::Close),
+        });
+        self.open_dialog(Ask::ScreenGone(first), body);
     }
 
     /// A name for a new page (suggested: "Page N").
@@ -1393,6 +1432,18 @@ impl App {
                 // (Cancelled: the switch in Settings goes back on.)
                 self.send_settings(false, None);
             }
+            Ask::ScreenGone(first) => {
+                // Its pages are the main screen's now.
+                if let (true, Some(p)) = (ok, first) {
+                    if self.multi_screen() {
+                        self.enter_screen(0);
+                    }
+                    if pg::index_of(&self.layout, p).is_some() {
+                        self.go_page(p);
+                    }
+                }
+                self.next_screen_notice();
+            }
             _ => {}
         }
         self.invalidate();
@@ -1424,6 +1475,7 @@ impl App {
             "enabled": p.enabled, "altKeys": p.alt_keys, "swipe": p.swipe, "middleDrag": p.middle_drag, "bothDrag": p.both_drag,
             "edgePull": p.edge_pull, "edgeDrag": p.edge_drag, "animate": p.animate, "bounce": p.bounce, "showName": p.show_name,
             "newFiles": p.new_files, "current": self.layout.page, "list": list,
+            "screenNotice": p.screen_notice, "screens": self.layout.screens.len().max(self.screens.len()),
         })
     }
 
@@ -1454,6 +1506,7 @@ impl App {
             "animate" => p.animate = b,
             "bounce" => p.bounce = b,
             "showName" => p.show_name = b,
+            "screenNotice" => p.screen_notice = b,
             "newFiles" => p.new_files = if val.as_str() == Some("first") { "first" } else { "current" }.to_string(),
             "go" => {
                 if let Some(id) = id {

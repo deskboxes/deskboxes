@@ -368,6 +368,30 @@ pub struct MonitorLayout {
     pub page: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parked: BTreeMap<u32, PageContent>,
+    /// Several screens (`screens.rs`): the page each screen shows, for every screen but the one
+    /// whose page is `page` (that one is shown there).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shown: BTreeMap<String, u32>,
+    /// The screens this layout has been shown on, by id: their sizes (for moving a screen's
+    /// pages to another one while it is gone, and back).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub screens: BTreeMap<String, ScreenInfo>,
+}
+
+/// A screen (monitor) as last seen: its size and work area in DIPs (from its top-left), its icon
+/// grid and its name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenInfo {
+    pub w: f32,
+    pub h: f32,
+    pub work: Rect,
+    pub cols: i32,
+    pub rows: i32,
+    /// The monitor's own name ("DELL U2720Q"), or "" when Windows gives none.
+    pub name: String,
+    /// Its number in Windows' display settings order (1 = the first), for "Screen 2".
+    pub n: u32,
 }
 
 /// A desktop page: its id and the name it was given ("" = none: "Page N" is shown).
@@ -376,6 +400,13 @@ pub struct PageMeta {
     pub id: u32,
     #[serde(default)]
     pub name: String,
+    /// The screen it is on ("": the only one; see `screens.rs`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub screen: String,
+    /// The screen it belongs to while that one is gone (unplugged): it is shown on `screen` (the
+    /// main one) meanwhile and goes back when it returns. "" = none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub home: String,
 }
 
 /// A page not shown now: its boxes and loose icons (as `MonitorLayout`'s own).
@@ -492,6 +523,8 @@ pub struct PagesSettings {
     pub show_name: bool,
     /// Where new desktop files appear: "current" (the page shown) or "first".
     pub new_files: String,
+    /// A dialog says where a disconnected screen's boxes went (`screens.rs`).
+    pub screen_notice: bool,
 }
 
 impl Default for PagesSettings {
@@ -508,6 +541,7 @@ impl Default for PagesSettings {
             bounce: true,
             show_name: true,
             new_files: "current".into(),
+            screen_notice: true,
         }
     }
 }

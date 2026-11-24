@@ -134,7 +134,34 @@ impl App {
         self.prep_gen = gen;
     }
 
+    /// A frame: every screen's (each other screen first, the one in use last).
     pub fn draw(&mut self) {
+        let others = self.draw_other_screens();
+        let mine = self.draw_screen_only();
+        crate::anim::set(mine || others);
+        self.note_long_animation(mine || others, mine);
+    }
+
+    /// Frames at the refresh rate for half a minute on end are a stuck animation (a screen's held
+    /// edge did that, 2026-11-24): say once which one, for a report.
+    fn note_long_animation(&self, on: bool, mine: bool) {
+        thread_local! {
+            static SINCE: std::cell::Cell<Option<(Instant, bool)>> = const { std::cell::Cell::new(None) };
+        }
+        SINCE.with(|s| match (on, s.get()) {
+            (false, _) => s.set(None),
+            (true, None) => s.set(Some((Instant::now(), false))),
+            (true, Some((t0, false))) if t0.elapsed().as_secs() >= 30 => {
+                let what = if mine { self.anim_why() } else { "another screen".into() };
+                log::warn!("animating for 30 s on end: {what} (screen in use {})", self.cur);
+                s.set(Some((t0, true)));
+            }
+            _ => {}
+        });
+    }
+
+    /// The frame of the screen in use; true while something on it is animating.
+    pub fn draw_screen_only(&mut self) -> bool {
         let t = Instant::now();
         self.step_roll_anim();
         self.vanish_animating();
@@ -143,7 +170,7 @@ impl App {
         self.prepare_beside();
         let Some(surf) = self.surf.take() else {
             self.frame_ok = false;
-            return;
+            return false;
         };
         *self.paint_memo.borrow_mut() = Some(std::collections::HashMap::new());
         let res = surf.draw(self.scale, |dc| self.paint_frame(dc));
@@ -178,12 +205,12 @@ impl App {
         }
         // Test harness only; not during a drag, so frame timings stay representative (the frame
         // after the drag ends writes it).
-        if self.args.scene_out.is_some() && matches!(self.drag, Drag::None | Drag::Pending { .. }) {
+        if self.args.scene_out.is_some() && !self.paint_inactive && matches!(self.drag, Drag::None | Drag::Pending { .. }) {
             self.write_scene();
         }
         self.selection_changed_check();
         self.pages_after_frame();
-        crate::anim::set(self.animating());
+        self.animating()
     }
 
     /// During a slide between pages: the labels of the page beside made too.
@@ -381,7 +408,7 @@ impl App {
                     r?;
                 }
             }
-            self.paint_moved(dc, f.dx, f.alpha, true)?;
+            self.paint_moved(dc, f.dx, f.alpha, !self.paint_inactive)?;
             // A box carried to this page: under the pointer, not sliding.
             if let Drag::MoveBox { id, .. } = &self.drag {
                 if let Some(b) = self.box_by_id(*id) {
@@ -422,7 +449,7 @@ impl App {
         if !self.settings.show_icons {
             return Ok(());
         }
-        self.paint_content(dc, true)?;
+        self.paint_content(dc, !self.paint_inactive)?;
         self.paint_overlays(dc)
     }
 
@@ -444,6 +471,10 @@ impl App {
 
     /// Over the pages: an edge a drag is held at, the search pill, the page's name, tooltips.
     fn paint_overlays(&self, dc: &Dc) -> r::R<()> {
+        // (Another screen than the one in use: only its page's name; the rest follows the pointer.)
+        if self.paint_inactive {
+            return self.paint_page_pill(dc);
+        }
         self.paint_page_edge(dc)?;
         self.paint_search(dc)?;
         self.paint_page_pill(dc)?;
