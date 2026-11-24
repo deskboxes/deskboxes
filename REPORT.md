@@ -652,3 +652,20 @@ UNVERIFIED:
 - The hover fade on a slow PC.
 - List and Tiles in a narrow box at large DPI.
 - Adding a folder-box tab by its menu in the real shell (built, not driven).
+
+## 21. One public repository (2026-11-24)
+
+From 0.1.4 the source and the releases live together in `deskboxes/deskboxes`, which is public
+and source-available under the PolyForm Strict License 1.0.0 (`LICENSE.md`; contribution terms
+in `CONTRIBUTING.md`). This supersedes the split in §18.
+
+- Updates read `https://github.com/deskboxes/deskboxes/releases/latest/download/latest.json` and
+  the notes from `api.github.com/repos/deskboxes/deskboxes/releases/latest`.
+- 0.1.4 was also published to the old `deskboxes/releases` repository, so 0.1.0–0.1.3 copies
+  (which read that feed) update to it and then follow the new one. That repository is archived
+  with a pointer here; its downloads keep working.
+- `tools/release.ps1 -Publish` tags and pushes the code and creates the release in this
+  repository. The notes follow `docs/releases/TEMPLATE.md`; the installer's SHA-256 table is
+  added by the script.
+- Issues use forms (`.github/ISSUE_TEMPLATE`), Discussions are on, and vulnerabilities are
+  reported privately (`SECURITY.md`).

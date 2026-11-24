@@ -1,8 +1,9 @@
 //! Updates (Settings › General › Updates). An installed copy looks once a day for
-//! `latest.json` in the newest release of the public `deskboxes/releases` repository:
+//! `latest.json` in the newest release of the public `deskboxes/deskboxes` repository (until
+//! 0.1.3: `deskboxes/releases`, which got 0.1.4 too so those copies moved over):
 //!
 //! ```json
-//! { "version": "0.2.0", "url": "https://github.com/deskboxes/releases/releases/download/v0.2.0/DeskboxesSetup.exe",
+//! { "version": "0.2.0", "url": "https://github.com/deskboxes/deskboxes/releases/download/v0.2.0/DeskboxesSetup.exe",
 //!   "sha256": "…64 hex…", "size": 22000000 }
 //! ```
 //!
@@ -25,9 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const FEED: &str = "https://github.com/deskboxes/releases/releases/latest/download/latest.json";
+pub const FEED: &str = "https://github.com/deskboxes/deskboxes/releases/latest/download/latest.json";
 /// The newest release (its notes): GitHub's REST API.
-const NOTES: &str = "https://api.github.com/repos/deskboxes/releases/releases/latest";
+const NOTES: &str = "https://api.github.com/repos/deskboxes/deskboxes/releases/latest";
 const DAY: u64 = 24 * 3600;
 const MAX_SETUP: u64 = 200 * 1024 * 1024;
 

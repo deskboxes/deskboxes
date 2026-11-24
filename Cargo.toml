@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.3"
-license = "MIT"
+license = "LicenseRef-PolyForm-Strict-1.0.0"
 
 [workspace.dependencies]
 windows = "0.62"

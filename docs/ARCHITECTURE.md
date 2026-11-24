@@ -550,7 +550,7 @@ buttons drawn by us). Colors are WinUI 3's theme resources and the accent from `
 ## 17. Updates (`crates/desktop/src/update.rs`)
 
 ```text
-github.com/deskboxes/releases  (public)  release vX: DeskboxesSetup.exe, latest.json
+github.com/deskboxes/deskboxes  (public)  release vX: DeskboxesSetup.exe, latest.json
 latest.json  {"version", "url", "sha256", "size"}   read via releases/latest/download/latest.json
 %LOCALAPPDATA%\Deskboxes\update\state.json  {last_check, pending: {version, file, sha256}, attempts}
 %LOCALAPPDATA%\Deskboxes\update\DeskboxesSetup-X.exe  verified download

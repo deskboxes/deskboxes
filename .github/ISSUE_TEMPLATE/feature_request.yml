@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest an idea or an improvement for Deskboxes.
+labels: ["Issue-Feature", "Needs-Triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search the [existing issues](https://github.com/deskboxes/deskboxes/issues?q=is%3Aissue) and [Discussions](https://github.com/deskboxes/deskboxes/discussions) first. For open-ended ideas, start a discussion instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Description of the new feature or improvement
+      description: What would you like Deskboxes to do, and what problem does it solve for you?
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: How would you use it? Walk through an example.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other ways you tried to do this, in Deskboxes or elsewhere.

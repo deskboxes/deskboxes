@@ -315,6 +315,14 @@ namespace dbx
                 size_t lead = ln.find_first_not_of(L' ');
                 if (lead == std::wstring::npos) { flush(); continue; }
                 std::wstring t = ln.substr(lead);
+                // Not for a text page: tables (the installer hashes), HTML, pictures and rules;
+                // and the hashes' own heading.
+                if (t[0] == L'|' || t[0] == L'<' || t.rfind(L"![", 0) == 0 || t == L"---" || t == L"***" || t == L"___" ||
+                    (t[0] == L'#' && t.find(L"Installer hash") != std::wstring::npos))
+                {
+                    flush();
+                    continue;
+                }
                 if (t[0] == L'#')
                 {
                     flush();
@@ -407,7 +415,7 @@ namespace dbx
             x += Section(Str(L"updOptions"));
             x += Card(L"&#xE895;", Str(L"updAuto"), Str(L"updAutoDesc"), Toggle(L"UpdateAuto", up.GetNamedBoolean(L"auto", true)));
             x += Card(L"&#xE946;", Str(L"updInstalled"), L"Deskboxes " + version,
-                      L"<HyperlinkButton Content=\"" + Str(L"updAllReleases") + L"\" NavigateUri=\"https://github.com/deskboxes/releases/releases\"/>");
+                      L"<HyperlinkButton Content=\"" + Str(L"updAllReleases") + L"\" NavigateUri=\"https://github.com/deskboxes/deskboxes/releases\"/>");
             return x;
         }
 
