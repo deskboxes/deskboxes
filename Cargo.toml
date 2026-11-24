@@ -19,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.3"
+version = "0.1.4"
 license = "LicenseRef-PolyForm-Strict-1.0.0"
 
 [workspace.dependencies]
