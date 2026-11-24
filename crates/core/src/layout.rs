@@ -100,6 +100,26 @@ pub fn reconcile(l: &mut MonitorLayout, present: &[ItemKey], g: &Grid) -> bool {
         placed.insert(k.clone());
         changed = true;
     }
+    // Icons on the other pages pushed off the grid too (a smaller grid: bigger icons, another
+    // screen): each to a free cell on its own page.
+    let off_pages: Vec<u32> = l.parked.iter().filter(|(_, c)| c.loose.values().any(|c| c.col >= g.cols || c.row >= g.rows)).map(|(id, _)| *id).collect();
+    for id in off_pages {
+        crate::pages::with_page(l, id, |l| {
+            let off: Vec<ItemKey> = l.loose.iter().filter(|(_, c)| c.col >= g.cols || c.row >= g.rows).map(|(k, _)| k.clone()).collect();
+            for k in &off {
+                l.loose.remove(k);
+            }
+            let mut taken = occupied(l);
+            let mut cursor = 0;
+            for k in off {
+                let c = free_cell(l, g, cursor, &taken).unwrap_or(Cell { col: g.cols - 1, row: g.rows - 1 });
+                cursor = g.index_of(c) + 1;
+                taken.insert(c);
+                l.loose.insert(k, c);
+            }
+        });
+        changed = true;
+    }
     changed
 }
 
@@ -726,26 +746,58 @@ pub fn placed_keys(l: &MonitorLayout) -> BTreeSet<ItemKey> {
     s
 }
 
+/// A file's identity on its volume (volume serial, file id): the same file after a move or a
+/// rename on that volume (and in its Recycle Bin); a file saved under the same name since is
+/// another one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId(pub u64, pub u128);
+
+/// One file of a file operation: where it was (`from`), where it went (`to`: the new name, the
+/// copy, its file in the Recycle Bin; "" if not known), and which file it is where it is now (at
+/// `to` while the operation is done, at `from` while it is undone; None: not known, not checked).
+/// Undo and redo only touch a file that is still that one.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct FileMove {
+    pub from: String,
+    pub to: String,
+    pub id: Option<FileId>,
+}
+
+impl FileMove {
+    pub fn new(from: impl Into<String>, to: impl Into<String>, id: Option<FileId>) -> Self {
+        FileMove { from: from.into(), to: to.into(), id }
+    }
+}
+
 /// A file operation Deskboxes did that can be undone, as Explorer's Undo Move / Undo Delete /
 /// Undo Rename (paths: full file-system paths).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileOp {
-    /// Moved into a folder: (from, to).
-    Moved(Vec<(String, String)>),
-    /// Copied into a folder: (source, the copy).
-    Copied(Vec<(String, String)>),
-    /// Into the Recycle Bin: (where it was, the file in the Recycle Bin; "" if not known).
-    Recycled(Vec<(String, String)>),
-    /// Renamed: (from, to).
-    Renamed(String, String),
+    /// Moved into a folder.
+    Moved(Vec<FileMove>),
+    /// Copied into a folder (`to`: the copy).
+    Copied(Vec<FileMove>),
+    /// Into the Recycle Bin (`to`: the file in the Recycle Bin).
+    Recycled(Vec<FileMove>),
+    /// Renamed.
+    Renamed(FileMove),
+}
+
+impl FileOp {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            FileOp::Moved(v) | FileOp::Copied(v) | FileOp::Recycled(v) => v.is_empty(),
+            FileOp::Renamed(_) => false,
+        }
+    }
 }
 
 /// A file operation in the undo history, with where its icons were (so they come back there).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileStep {
     pub op: FileOp,
-    /// Each icon's place and its position in a box tab.
-    pub places: Vec<(ItemKey, Place, usize)>,
+    /// Each icon's page, its place there and its position in a box tab.
+    pub places: Vec<(u32, ItemKey, Place, usize)>,
 }
 
 enum Entry {
@@ -754,11 +806,23 @@ enum Entry {
 }
 
 /// What an undo or redo did: the layout was put back, or a file operation is to be reversed
-/// (undo) or done again (redo) by the caller.
+/// (undo) or done again (redo) by the caller, who reports back with `History::files_done`.
 #[derive(Debug)]
 pub enum Step {
     Layout,
     Files(FileStep),
+}
+
+/// A file step being undone or redone: until its files are done it is on neither stack, and
+/// nothing else can be undone or redone.
+struct InFlight {
+    step: FileStep,
+    undoing: bool,
+    /// Its place on the undo stack: where an undo that went nowhere goes back, and where a redo
+    /// goes (under anything done meanwhile).
+    at: usize,
+    /// Something new was done meanwhile (the redo stack was cleared).
+    superseded: bool,
 }
 
 /// Undo history: whole-layout snapshots (layouts are small: a few KB for 1,000 items) and file
@@ -767,6 +831,7 @@ pub enum Step {
 pub struct History {
     undo: Vec<Entry>,
     redo: Vec<Entry>,
+    busy: Option<InFlight>,
 }
 
 impl History {
@@ -774,8 +839,15 @@ impl History {
         self.undo.push(e);
         if self.undo.len() > 50 {
             self.undo.remove(0);
+            // (`at` is a place on the undo stack, for an undo and a redo alike.)
+            if let Some(b) = self.busy.as_mut() {
+                b.at = b.at.saturating_sub(1);
+            }
         }
         self.redo.clear();
+        if let Some(b) = self.busy.as_mut() {
+            b.superseded = true;
+        }
     }
     pub fn record(&mut self, before: &MonitorLayout) {
         self.push(Entry::Layout(before.clone()));
@@ -783,56 +855,101 @@ impl History {
     pub fn record_files(&mut self, step: FileStep) {
         self.push(Entry::Files(step));
     }
+    /// A file step is being undone or redone.
+    pub fn busy(&self) -> bool {
+        self.busy.is_some()
+    }
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        self.busy.is_none() && !self.undo.is_empty()
     }
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.busy.is_none() && !self.redo.is_empty()
     }
     /// The kind of the next undo / redo: None, Some(None) a layout change, Some(Some(op)) a file
     /// operation (for the menu's "Undo Move" and the like).
     pub fn next_undo(&self) -> Option<Option<&FileOp>> {
+        if self.busy.is_some() {
+            return None;
+        }
         self.undo.last().map(|e| match e {
             Entry::Layout(_) => None,
             Entry::Files(s) => Some(&s.op),
         })
     }
     pub fn next_redo(&self) -> Option<Option<&FileOp>> {
+        if self.busy.is_some() {
+            return None;
+        }
         self.redo.last().map(|e| match e {
             Entry::Layout(_) => None,
             Entry::Files(s) => Some(&s.op),
         })
     }
     pub fn undo(&mut self, current: &mut MonitorLayout) -> Option<Step> {
+        if self.busy.is_some() {
+            return None;
+        }
         match self.undo.pop()? {
             Entry::Layout(prev) => {
                 self.redo.push(Entry::Layout(std::mem::replace(current, prev)));
                 Some(Step::Layout)
             }
             Entry::Files(s) => {
-                self.redo.push(Entry::Files(s.clone()));
+                self.busy = Some(InFlight { step: s.clone(), undoing: true, at: self.undo.len(), superseded: false });
                 Some(Step::Files(s))
             }
         }
     }
     pub fn redo(&mut self, current: &mut MonitorLayout) -> Option<Step> {
+        if self.busy.is_some() {
+            return None;
+        }
         match self.redo.pop()? {
             Entry::Layout(next) => {
                 self.undo.push(Entry::Layout(std::mem::replace(current, next)));
                 Some(Step::Layout)
             }
             Entry::Files(s) => {
-                self.undo.push(Entry::Files(s.clone()));
+                self.busy = Some(InFlight { step: s.clone(), undoing: false, at: self.undo.len(), superseded: false });
                 Some(Step::Files(s))
             }
         }
     }
-    /// A file step just undone or redone came out differently (new names, new Recycle Bin
-    /// files): keep what really happened for the next redo / undo.
-    pub fn update_last(&mut self, undone: bool, op: FileOp) {
-        let stack = if undone { &mut self.redo } else { &mut self.undo };
-        if let Some(Entry::Files(s)) = stack.last_mut() {
-            s.op = op;
+    /// The file step being undone (`undone`) or redone is finished: `op` is what really went
+    /// through (only the files that did, with their new names and Recycle Bin files), None if
+    /// nothing did. Done, it goes onto the other stack as it came out; not done, back where it
+    /// was, so the same undo or redo is offered again.
+    pub fn files_done(&mut self, undone: bool, op: Option<FileOp>) {
+        let Some(b) = self.busy.take() else { return };
+        if b.undoing != undone {
+            self.busy = Some(b);
+            return;
+        }
+        let InFlight { mut step, undoing, at, superseded } = b;
+        let went = op.filter(|o| !o.is_empty());
+        match (went, undoing) {
+            (Some(op), true) => {
+                // Undone; its redo, unless something new was done meanwhile (that drops redos).
+                step.op = op;
+                if !superseded {
+                    self.redo.push(Entry::Files(step));
+                }
+            }
+            (Some(op), false) => {
+                // Redone: undoable again, under anything done meanwhile.
+                step.op = op;
+                let at = at.min(self.undo.len());
+                self.undo.insert(at, Entry::Files(step));
+            }
+            (None, true) => {
+                let at = at.min(self.undo.len());
+                self.undo.insert(at, Entry::Files(step));
+            }
+            (None, false) => {
+                if !superseded {
+                    self.redo.push(Entry::Files(step));
+                }
+            }
         }
     }
 }
@@ -1142,5 +1259,99 @@ mod tests {
         assert_eq!(r.x, 0.0);
         let r = snap(Rect::new(292.0, 300.0, 200.0, 100.0), &[Rect::new(500.0, 0.0, 100.0, 100.0)], &b, 10.0);
         assert_eq!(r.right(), 500.0);
+    }
+
+    #[test]
+    fn off_grid_icons_on_other_pages_come_back() {
+        let g = grid(); // 10 x 5
+        let mut l = MonitorLayout::default();
+        let k = keys(2);
+        reconcile(&mut l, &k, &g);
+        let p2 = crate::pages::new_page(&mut l, "", None);
+        crate::pages::move_items_to_page(&mut l, &k[1..], p2, &g);
+        crate::pages::with_page(&mut l, p2, |l| {
+            l.loose.insert(k[1].clone(), Cell { col: 4, row: 0 });
+        });
+        // The grid shrinks to two columns; the first page is the one reconciled.
+        let small = Grid::new(Rect::new(0.0, 0.0, 150.0, 500.0), 75.0, 100.0);
+        reconcile(&mut l, &k, &small);
+        let c = l.parked[&p2].loose[&k[1]];
+        assert!(c.col < small.cols && c.row < small.rows, "{c:?}");
+    }
+
+    fn recycled(paths: &[(&str, &str)]) -> FileOp {
+        FileOp::Recycled(paths.iter().map(|(a, b)| FileMove::new(*a, *b, None)).collect())
+    }
+
+    fn step(op: FileOp) -> FileStep {
+        FileStep { op, places: vec![] }
+    }
+
+    #[test]
+    fn failed_file_undo_stays_undoable() {
+        let mut h = History::default();
+        let mut l = MonitorLayout::default();
+        h.record_files(step(recycled(&[("C:\\d\\a.txt", "C:\\$R1")])));
+        assert!(matches!(h.undo(&mut l), Some(Step::Files(_))));
+        // In flight: nothing else until it is done.
+        assert!(!h.can_undo() && !h.can_redo());
+        assert!(h.undo(&mut l).is_none());
+        h.files_done(true, None);
+        assert!(h.can_undo());
+        assert!(!h.can_redo(), "nothing was restored: no Redo Delete");
+        // An empty result counts as nothing.
+        h.undo(&mut l);
+        h.files_done(true, Some(FileOp::Recycled(vec![])));
+        assert!(h.can_undo() && !h.can_redo());
+    }
+
+    #[test]
+    fn partial_file_undo_redoes_only_what_came_back() {
+        let mut h = History::default();
+        let mut l = MonitorLayout::default();
+        h.record_files(step(recycled(&[("C:\\d\\a.txt", "C:\\$Ra"), ("C:\\d\\b.txt", "C:\\$Rb")])));
+        h.undo(&mut l);
+        h.files_done(true, Some(recycled(&[("C:\\d\\b.txt", "")])));
+        assert_eq!(h.next_redo(), Some(Some(&recycled(&[("C:\\d\\b.txt", "")]))));
+        // Redone: the new bin file is what the next undo restores.
+        h.redo(&mut l);
+        h.files_done(false, Some(recycled(&[("C:\\d\\b.txt", "C:\\$Rb2")])));
+        assert_eq!(h.next_undo(), Some(Some(&recycled(&[("C:\\d\\b.txt", "C:\\$Rb2")]))));
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn file_steps_are_done_one_at_a_time() {
+        let mut h = History::default();
+        let mut l = MonitorLayout::default();
+        h.record_files(step(recycled(&[("C:\\d\\a.txt", "C:\\$Ra")])));
+        h.record_files(step(recycled(&[("C:\\d\\b.txt", "C:\\$Rb")])));
+        h.undo(&mut l);
+        h.undo(&mut l); // refused while the first is in flight
+        h.files_done(true, Some(recycled(&[("C:\\d\\b.txt", "")])));
+        h.undo(&mut l);
+        h.files_done(true, Some(recycled(&[("C:\\d\\a.txt", "")])));
+        h.redo(&mut l);
+        h.files_done(false, Some(recycled(&[("C:\\d\\a.txt", "C:\\$Ra2")])));
+        h.redo(&mut l);
+        h.files_done(false, Some(recycled(&[("C:\\d\\b.txt", "C:\\$Rb2")])));
+        // Each entry kept its own new bin file.
+        let Some(Step::Files(s)) = h.undo(&mut l) else { panic!("a file step") };
+        assert_eq!(s.op, recycled(&[("C:\\d\\b.txt", "C:\\$Rb2")]));
+        h.files_done(true, Some(recycled(&[("C:\\d\\b.txt", "")])));
+        let Some(Step::Files(s)) = h.undo(&mut l) else { panic!("a file step") };
+        assert_eq!(s.op, recycled(&[("C:\\d\\a.txt", "C:\\$Ra2")]));
+    }
+
+    #[test]
+    fn new_change_during_a_file_undo_drops_its_redo() {
+        let mut h = History::default();
+        let mut l = MonitorLayout::default();
+        h.record_files(step(recycled(&[("C:\\d\\a.txt", "C:\\$Ra")])));
+        h.undo(&mut l);
+        h.record(&l);
+        h.files_done(true, Some(recycled(&[("C:\\d\\a.txt", "")])));
+        assert!(!h.can_redo());
+        assert_eq!(h.next_undo(), Some(None));
     }
 }

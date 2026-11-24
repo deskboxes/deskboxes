@@ -175,7 +175,7 @@ pub fn start(dir: PathBuf, auto: bool) {
             s.notes_version = n.version.clone();
             s.notes_date = n.date.clone();
         }
-        if let Some(p) = st.pending.as_ref().filter(|p| newer(&p.version, current())) {
+        if let Some(p) = st.pending.as_ref().filter(|p| newer(&p.version, current()) && dir.join(&p.file).is_file()) {
             s.state = "ready".into();
             s.latest = p.version.clone();
         } else if st.last_check > 0 {
@@ -231,7 +231,8 @@ fn check(dir: &Path) {
         Err(e) => {
             log::warn!("update check failed: {e}");
             // A download that is already here stays ready; otherwise say what kind of trouble it was.
-            let pending = load_state(dir).pending.filter(|p| newer(&p.version, current()));
+            // (Only one whose file is really there: a "ready" without an installer is no use.)
+            let pending = load_state(dir).pending.filter(|p| newer(&p.version, current()) && dir.join(&p.file).is_file());
             set_status(|s| match pending {
                 Some(p) => {
                     s.state = "ready".into();
@@ -298,7 +299,7 @@ fn check_inner(dir: &Path) -> Result<(), String> {
             s.state = "downloading".into();
             s.latest = f.version.clone();
         });
-        clear_pending(dir, &mut st);
+        // An installer downloaded before stays until this one is verified and recorded.
         let _ = std::fs::create_dir_all(dir);
         let part = dir.join(format!("{file}.part"));
         let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
@@ -323,6 +324,9 @@ fn check_inner(dir: &Path) -> Result<(), String> {
             return Err(e);
         }
         std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+        if let Some(old) = st.pending.take().filter(|p| !p.file.eq_ignore_ascii_case(&file)) {
+            let _ = std::fs::remove_file(dir.join(&old.file));
+        }
         st.pending = Some(Pending { version: f.version.clone(), file, sha256: want });
         st.attempts = 0;
         log::info!("update {} downloaded and verified ({n} bytes)", f.version);

@@ -44,7 +44,10 @@ foreach ($t in $truthByCase.Values) {
     }
 }
 
-function Stop-Hosts { Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+# Hosts running already (the real Deskboxes' menus) are left alone; only the ones this starts go.
+$otherHosts = @(Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | ForEach-Object Id)
+function Our-Hosts { Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Where-Object { $otherHosts -notcontains $_.Id } }
+function Stop-Hosts { Our-Hosts | Stop-Process -Force -ErrorAction SilentlyContinue }
 
 $summary = @()
 try {
@@ -55,7 +58,7 @@ foreach ($k in $cases.Keys) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     if ($elevated) { & $runAs --no-wait -- $Host_ @args_ | Out-Null } else { Start-Process $Host_ -ArgumentList $args_ | Out-Null }
     $p = $null
-    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 30; $p = Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 30; $p = Our-Hosts | Select-Object -First 1 }
     if (-not $p) { Write-Warning "[$k] host did not start"; continue }
     $wins = @()
     while (-not $wins -and $sw.ElapsedMilliseconds -lt 8000) { Start-Sleep -Milliseconds 40; $wins = Get-MenuWindows $p.Id }

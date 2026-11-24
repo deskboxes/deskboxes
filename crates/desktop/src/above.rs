@@ -259,6 +259,13 @@ impl App {
                 .collect();
             self.set_above_region(rects);
         }
+        // The WM_TIMER dispatcher kills every timer it dispatches: armed again while the drag
+        // lasts (to shrink the window after the dim, and to notice a drag ending elsewhere).
+        if self.above_drag.is_some() {
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), crate::app::T_ABOVE_DRAG, 40, None);
+            }
+        }
     }
 
     /// The boxes-above window answers (and shows) only inside `rects` (empty: everywhere).
@@ -507,12 +514,15 @@ impl App {
         }
         let m = self.mon;
         let (l, t, r, b) = (p.x <= m.left + 1, p.y <= m.top + 1, p.x >= m.right - 2, p.y >= m.bottom - 2);
-        let inside = match c.as_str() {
-            "tl" => l && t,
-            "tr" => r && t,
-            "bl" => l && b,
-            _ => r && b,
-        };
+        // On this monitor (a monitor beside it lines up with its edges too).
+        let on_mon = p.x >= m.left && p.x < m.right && p.y >= m.top && p.y < m.bottom;
+        let inside = on_mon
+            && match c.as_str() {
+                "tl" => l && t,
+                "tr" => r && t,
+                "bl" => l && b,
+                _ => r && b,
+            };
         // (With a button held too: dragging a file from a window to the corner brings the boxes
         // up to drop it into one.)
         if !inside {

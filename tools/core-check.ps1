@@ -40,9 +40,12 @@ function Start-Core([string[]]$extra = @()) {
     $a = @('--desktop-dir', $fx, '--public-dir', $pub, '--window', '--profile', $prof, '--scene-out', $scene, '--no-ui-ops') + $extra
     & $runAs --no-wait -- $Exe @a | Out-Null
     $sw = [Diagnostics.Stopwatch]::StartNew(); $p = $null
-    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 50; $p = Get-Process deskboxes -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    # Only the instance this started: the real Deskboxes may be running too and is never touched.
+    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 50; $p = Get-Process deskboxes -ErrorAction SilentlyContinue | Where-Object { $script:otherPids -notcontains $_.Id } | Select-Object -First 1 }
     $p
 }
+# The menu host(s) of our test instance (its child processes), never the real Deskboxes' host.
+function Our-Hosts($p) { @(Get-CimInstance Win32_Process -Filter "Name='deskboxes-shellhost.exe' AND ParentProcessId=$($p.Id)" | ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }) }
 function Get-Scene { for ($i = 0; $i -lt 20; $i++) { try { return (Get-Content $scene -Raw -Encoding utf8 | ConvertFrom-Json) } catch { Start-Sleep -Milliseconds 50 } }; $null }
 function Wait-Scene([scriptblock]$cond, [int]$ms = 8000) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -70,8 +73,11 @@ function Capture-Menu($wins, [string]$name) {
     $g.CopyFromScreen([int]$l, [int]$t, 0, 0, $bm.Size); $g.Dispose(); $bm.Save((Join-Path $OutDir "$name.png")); $bm.Dispose()
 }
 function Stop-Core($p) {
-    $core = [TestInput]::FindWindowW('DeskboxesCore', [NullString]::Value)
-    if ($core -ne [IntPtr]::Zero) { [TestInput]::PostMessageW($core, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
+    $core = [IntPtr]::Zero
+    do {
+        $core = [TestInput]::FindWindowExW([IntPtr]::Zero, $core, 'DeskboxesCore', [NullString]::Value)
+        if ($core -ne [IntPtr]::Zero -and [TestInput]::Pid($core) -eq $p.Id) { [TestInput]::PostMessageW($core, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
+    } while ($core -ne [IntPtr]::Zero)
     if (-not $p.WaitForExit(8000)) { Write-Warning 'core did not exit; killing'; $p.Kill(); return 'killed' }
     'clean' 
 }
@@ -80,6 +86,8 @@ function Keys([uint16[]]$k) { [TestInput]::Keys($k) | Out-Null; Start-Sleep -Mil
 $VK = @{ CTRL = 0x11; SHIFT = 0x10; RIGHT = 0x27; F2 = 0x71; DEL = 0x2E; ENTER = 0x0D; ESC = 0x1B; A = 0x41; Z = 0x5A }
 function Chord($mod, $key) { Keys @($mod, $key, ($key -bor 0x8000), ($mod -bor 0x8000)) }
 
+$otherPids = @(Get-Process deskboxes, deskboxes-shellhost -ErrorAction SilentlyContinue | ForEach-Object Id)
+if ($otherPids) { Write-Host "Deskboxes is running (pid $($otherPids -join ', ')): left alone; the check uses its own instance" }
 $saveClip = $null; try { $saveClip = Get-Clipboard -Raw -ErrorAction Stop } catch {}
 try {
     # ---- run 1: cold start, layout file created -------------------------------------------
@@ -112,7 +120,7 @@ try {
     Note 'seed.boxes' @($s.boxes | ForEach-Object { "$($_.id):" + (($_.tabs | ForEach-Object { "$($_.title)=$($_.items)" }) -join '|') })
     $win = Win $p; [TestInput]::Focus($win) | Out-Null
     # Input guard: clicks and keys only reach the core, its shell host and their menus.
-    [TestInput]::Allowed.Clear(); [void][TestInput]::Allowed.Add($p.Id); Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | ForEach-Object { [void][TestInput]::Allowed.Add($_.Id) }
+    [TestInput]::Allowed.Clear(); [void][TestInput]::Allowed.Add($p.Id); Our-Hosts $p | ForEach-Object { [void][TestInput]::Allowed.Add($_.Id) }
     Capture $p 'boxes'
 
     $looseItems = @($s.items | Where-Object { $null -eq $_.box })
@@ -155,14 +163,16 @@ try {
 
     # Tab switch on the second box (tab pair).
     $b2s = $s.boxes[1]
-    Click @([int]($b2s.rect[0] + $b2s.rect[2] * 3 / 4), [int]($b2s.rect[1] + 15))
+    $t2 = $b2s.tabs[1].rect
+    if ($t2) { Click @([int]($t2[0] + $t2[2] / 2), [int]($t2[1] + $t2[3] / 2)) }
+    else { Click @([int]($b2s.rect[0] + $b2s.rect[2] * 3 / 4), [int]($b2s.rect[1] + 15)) }
     $s = Wait-Scene { param($s) $s.boxes[1].active -eq 1 } 2000
     Note 'tabs.switch' ($s.boxes[1].active -eq 1)
     Capture $p 'tab-switched'
 
     # Context menu on a .txt item through the shell host; compare with Explorer's recorded menu.
     $txt = $s.items | Where-Object { $_.path -like '*.txt' -and $null -eq $_.box } | Select-Object -First 1
-    $hostP = Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Select-Object -First 1
+    $hostP = Our-Hosts $p | Select-Object -First 1
     Click (Center $txt) 1
     $sw = [Diagnostics.Stopwatch]::StartNew(); $wins = @()
     while (-not $wins -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 40; if ($hostP) { $wins = Get-MenuWindows $hostP.Id } }
@@ -234,7 +244,7 @@ try {
     Note 'run3.stats' (Get-Content (Join-Path $prof 'stats3.json') | ConvertFrom-Json)
 }
 finally {
-    Get-Process deskboxes, deskboxes-shellhost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process deskboxes, deskboxes-shellhost -ErrorAction SilentlyContinue | Where-Object { $otherPids -notcontains $_.Id } | Stop-Process -Force -ErrorAction SilentlyContinue
     if ($null -ne $saveClip) { Set-Clipboard -Value $saveClip }
     if (-not $KeepFixture) { & $gen remove $fx | Write-Host }
     [IO.File]::WriteAllText((Join-Path $OutDir 'results.json'), ($results | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))

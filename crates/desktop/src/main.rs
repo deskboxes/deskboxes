@@ -78,6 +78,8 @@ pub struct Args {
     /// Sort the icons into the default boxes after the first scan, as a fresh install does
     /// (for fixture tests).
     pub first_run_template: bool,
+    /// Open Settings once the shell host is ready (for checks of the Settings window).
+    pub open_settings: bool,
 }
 
 fn parse_args() -> Args {
@@ -107,6 +109,7 @@ fn parse_args() -> Args {
             "--install-autostart" => a.install_autostart = true,
             "--diagnostics" => a.diagnostics = true,
             "--enable" => a.enable = true,
+            "--open-settings" => a.open_settings = true,
             "--first-run-template" => a.first_run_template = true,
             other => eprintln!("unknown argument {other}"),
         }

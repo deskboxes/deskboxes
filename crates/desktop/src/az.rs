@@ -67,6 +67,19 @@ pub struct Shown {
 
 impl App {
     fn shown(&self, b: &BoxModel, tab: &Tab) -> (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>) {
+        if let Some(m) = self.paint_memo.borrow().as_ref() {
+            if let Some(r) = m.get(&tab.id) {
+                return r.clone();
+            }
+        }
+        let r = self.shown_checked(b, tab);
+        if let Some(m) = self.paint_memo.borrow_mut().as_mut() {
+            m.insert(tab.id, r.clone());
+        }
+        r
+    }
+
+    fn shown_checked(&self, b: &BoxModel, tab: &Tab) -> (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (self.items_gen, b.az, tab.items.len()).hash(&mut h);

@@ -71,6 +71,9 @@ pub enum Ev {
         ms: f64,
         first: bool,
         resolved: usize,
+        /// Icon ids the worker may hand out again without their image (shared icons it keeps
+        /// by system icon index, at every size): never let go of.
+        keep: Vec<u32>,
     },
     /// Something changed on disk (watcher) or after one of our operations.
     Rescan,
@@ -84,11 +87,15 @@ pub enum Ev {
         key: deskboxes_core::ItemKey,
         text: String,
     },
-    /// A file operation went through (for undo): `undo` None a new one, Some(true) an undo,
-    /// Some(false) a redo, with what really happened.
+    /// A new file operation went through (for undo), with what really happened.
     FileDone {
         op: deskboxes_core::layout::FileOp,
-        undo: Option<bool>,
+    },
+    /// An undo (`undo`) or redo of a file operation finished: what really went through (None:
+    /// nothing did).
+    FileStepDone {
+        op: Option<deskboxes_core::layout::FileOp>,
+        undo: bool,
     },
     /// Icons made at another size for boxes (see `views`): (desktop icon id, its id at `px`).
     IconsAt {

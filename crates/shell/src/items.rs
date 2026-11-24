@@ -73,13 +73,26 @@ pub struct Entry {
 }
 
 /// `FindFirstFileExW(FindExInfoBasic, LARGE_FETCH)` over the folders, filtered like Explorer.
-pub fn scan(dirs: &[DirSpec], f: Filters) -> Vec<Entry> {
+/// Also returns the folders that could not be listed in full (their entries are left out: the
+/// caller keeps what it knew of them, rather than taking them for empty).
+pub fn scan(dirs: &[DirSpec], f: Filters) -> (Vec<Entry>, Vec<PathBuf>) {
     let mut out = Vec::new();
+    let mut failed = Vec::new();
     for d in dirs {
         let pat = wide(&format!("{}\\*", d.path.display()));
         let mut fd = WIN32_FIND_DATAW::default();
         let h = unsafe { FindFirstFileExW(pcw(&pat), FindExInfoBasic, &mut fd as *mut _ as _, FindExSearchNameMatch, None, FIND_FIRST_EX_LARGE_FETCH) };
-        let Ok(h) = h else { continue };
+        let h = match h {
+            Ok(h) => h,
+            // Not there (any more): truly nothing in it.
+            Err(e) if e.code() == ERROR_PATH_NOT_FOUND.to_hresult() || e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => continue,
+            Err(e) => {
+                log::warn!("cannot list {}: {e}", d.path.display());
+                failed.push(d.path.clone());
+                continue;
+            }
+        };
+        let start = out.len();
         loop {
             let n = fd.cFileName.iter().position(|&c| c == 0).unwrap_or(fd.cFileName.len());
             let name = String::from_utf16_lossy(&fd.cFileName[..n]);
@@ -97,7 +110,13 @@ pub fn scan(dirs: &[DirSpec], f: Filters) -> Vec<Entry> {
                     source: d.source,
                 });
             }
-            if unsafe { FindNextFileW(h, &mut fd) }.is_err() {
+            if let Err(e) = unsafe { FindNextFileW(h, &mut fd) } {
+                if e.code() != ERROR_NO_MORE_FILES.to_hresult() {
+                    // Stopped part way: what was listed is not the whole folder.
+                    log::warn!("listing {} stopped: {e}", d.path.display());
+                    out.truncate(start);
+                    failed.push(d.path.clone());
+                }
                 break;
             }
         }
@@ -105,12 +124,20 @@ pub fn scan(dirs: &[DirSpec], f: Filters) -> Vec<Entry> {
             let _ = FindClose(h);
         }
     }
-    out
+    (out, failed)
 }
 
 /// Stable identity: (volume serial, FileId). Opened with FILE_READ_ATTRIBUTES only and
 /// OPEN_REPARSE_POINT, so cloud placeholders are not hydrated.
 pub fn file_key(path: &str) -> ItemKey {
+    match file_id(path) {
+        Some(deskboxes_core::layout::FileId(v, id)) => ItemKey::file(v, id),
+        None => ItemKey::path(path),
+    }
+}
+
+/// The file's identity on its volume, if it can be read (as `file_key`).
+pub fn file_id(path: &str) -> Option<deskboxes_core::layout::FileId> {
     unsafe {
         let p = wide(path);
         let h = CreateFileW(
@@ -121,16 +148,13 @@ pub fn file_key(path: &str) -> ItemKey {
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
-        );
-        if let Ok(h) = h {
-            let mut info = FILE_ID_INFO::default();
-            let r = GetFileInformationByHandleEx(h, FileIdInfo, &mut info as *mut _ as _, std::mem::size_of::<FILE_ID_INFO>() as u32);
-            let _ = CloseHandle(h);
-            if r.is_ok() {
-                return ItemKey::file(info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier));
-            }
-        }
-        ItemKey::path(path)
+        )
+        .ok()?;
+        let mut info = FILE_ID_INFO::default();
+        let r = GetFileInformationByHandleEx(h, FileIdInfo, &mut info as *mut _ as _, std::mem::size_of::<FILE_ID_INFO>() as u32);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(deskboxes_core::layout::FileId(info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
     }
 }
 

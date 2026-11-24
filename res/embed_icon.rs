@@ -8,6 +8,7 @@ fn embed_icon() {
     let res = manifest.join("..").join("..").join("res");
     println!("cargo:rerun-if-changed={}", res.join("deskboxes.rc").display());
     println!("cargo:rerun-if-changed={}", res.join("deskboxes.ico").display());
+    println!("cargo:rerun-if-changed={}", res.join("deskboxes.manifest").display());
     let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
     let mut vers: Vec<PathBuf> = std::fs::read_dir(&kits)
         .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.join("x64").join("rc.exe").exists()).collect())
@@ -20,6 +21,8 @@ fn embed_icon() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("deskboxes.res");
     let ok = std::process::Command::new(&rc)
         .arg("/nologo")
+        .arg("/d")
+        .arg("DESKBOXES_MANIFEST")
         .arg("/i")
         .arg(&res)
         .arg("/fo")

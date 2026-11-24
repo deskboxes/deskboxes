@@ -41,8 +41,21 @@ const SHADE = D ? 'radial-gradient(ellipse at 50% 45%,rgba(0,0,0,.05),rgba(0,0,0
 // ---------- time ----------
 const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
 const seg = (t, a, b) => clamp((t - a) / (b - a));
-const io = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
-const out = x => 1 - Math.pow(1 - x, 3);
+// A CSS cubic-bezier(x1, y1, x2, y2) timing function.
+function bez(x1, y1, x2, y2) {
+  const f = (a, b, u) => 3 * a * u * (1 - u) * (1 - u) + 3 * b * u * u * (1 - u) + u * u * u;
+  return x => {
+    if (x <= 0) return 0; if (x >= 1) return 1;
+    let lo = 0, hi = 1, u = x;
+    for (let i = 0; i < 24; i++) { u = (lo + hi) / 2; if (f(x1, x2, u) < x) lo = u; else hi = u; }
+    return f(y1, y2, u);
+  };
+}
+// Windows' own motion (Fluent): things move from point to point quickly at first and settle
+// gently; what appears decelerates into place. The pointer moves as a hand does (`hand`).
+const io = bez(.55, .55, 0, 1);
+const out = bez(.1, .9, .2, 1);
+const hand = x => x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 const lerp = (a, b, x) => a + (b - a) * x;
 const mix = (a, b, x) => Array.isArray(a) ? a.map((v, i) => lerp(v, b[i], x)) : lerp(a, b, x);
 // A value through keyframes [[t, v], ...], eased between them.
@@ -163,8 +176,9 @@ function ripples(t, clicks) {
 const pressed = (t, clicks) => Math.max(0, ...clicks.map(([tc]) => 1 - Math.abs(t - tc - .04) / .1));
 // The pointer along keyframes [[t, x, y], ...], with its clicks.
 function pointer(t, keys, clicks = []) {
-  const [x, y] = kf(t, keys.map(k => [k[0], [k[1], k[2]]]));
-  return { x, y, html: ripples(t, clicks.map(c => [c, ...kf(c, keys.map(k => [k[0], [k[1], k[2]]]))])) + cursor(x, y, pressed(t, clicks.map(c => [c]))) };
+  const [x, y] = kf(t, keys.map(k => [k[0], [k[1], k[2]]]), hand);
+  // A ring where it clicks: the clips show what was clicked by it.
+  return { x, y, html: ripples(t, clicks.map(c => [c, ...kf(c, keys.map(k => [k[0], [k[1], k[2]]]), hand)])) + cursor(x, y, pressed(t, clicks.map(c => [c]))) };
 }
 function key(txt, w, down = 0) {
   const k = D ? `background:linear-gradient(#3C3C42,#2B2B30);color:#fff;box-shadow:0 ${6 - 4 * down}px 0 #16161A,0 ${12 - 6 * down}px 26px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.14)`
@@ -232,11 +246,14 @@ S.tabs = { dur: 5.2, wp: [1900, -300, -420], cam: [380, 205, 840, 472], draw: t 
   const act = step(t, seq);
   const ci = seq.findIndex(s => s[1] === act && t >= s[0]);
   const tc = seq.filter(s => t >= s[0]).pop()[0], prev = tc ? step(tc - .01, seq) : act;
-  const q = tc ? io(seg(t, tc, tc + .38)) : 1;
+  // As Windows switches content: the old icons fade out quickly, then the new ones slide in
+  // from the side they are on and settle (no crossfade of both).
+  const gone = tc ? seg(t, tc, tc + .083) : 1;
+  const q = tc ? out(seg(t, tc + .07, tc + .44)) : 1, qa = tc ? seg(t, tc + .07, tc + .17) : 1;
   const dir = act > prev ? 1 : -1;
   let body = '';
-  if (q < 1) body += `<div class="abs" style="left:${-dir * 60 * q}px;top:0;width:100%;height:100%;opacity:${1 - q}">${grid(sets[prev], 5)}</div>`;
-  body += `<div class="abs" style="left:${dir * 60 * (1 - q)}px;top:0;width:100%;height:100%;opacity:${q}">${grid(sets[act], 5)}</div>`;
+  if (gone < 1) body += `<div class="abs" style="left:0;top:0;width:100%;height:100%;opacity:${1 - gone}">${grid(sets[prev], 5)}</div>`;
+  if (qa > 0) body += `<div class="abs" style="left:${dir * 70 * (1 - q)}px;top:0;width:100%;height:100%;opacity:${qa}">${grid(sets[act], 5)}</div>`;
   const hov = cx.findIndex(c => Math.abs(p.x - c) < 60 && Math.abs(p.y - ty) < 20);
   return glow(800, 450, 520, D ? .22 : .18) + box({ x: X, y: Y, w: bw(5), h: bh(2), tabs, active: act, tabHover: hov, btns: ['', ''], btnStyle: 'opacity:.75', body }) + p.html;
 } };

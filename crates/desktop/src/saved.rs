@@ -20,7 +20,7 @@ fn local_stamp() -> u64 {
 }
 
 /// "2026-11-20 04:15" (saved) or "2026-11-20" (a day's backup).
-fn shown(id: u64) -> String {
+pub fn shown(id: u64) -> String {
     if id >= 10_000_000_000_000 {
         let (d, t) = (id / 1_000_000, id % 1_000_000);
         format!("{:04}-{:02}-{:02} {:02}:{:02}", d / 10_000, d / 100 % 100, d % 100, t / 10_000, t / 100 % 100)
@@ -34,7 +34,22 @@ impl App {
         self.paths.layouts.parent().map(|p| p.join("saved")).unwrap_or_else(|| self.paths.layouts.join("saved")).join(&self.topology)
     }
 
-    /// Saved layouts of this screen setup, newest first.
+    /// The newest `n` saved layouts' ids, from their file names alone (nothing read: for the
+    /// menu, which shows only when each was saved).
+    pub fn newest_saved_ids(&self, n: usize) -> Vec<u64> {
+        let mut v: Vec<u64> = std::fs::read_dir(self.saved_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| e.path().file_stem()?.to_str()?.parse().ok())
+            .collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v.truncate(n);
+        v
+    }
+
+    /// Saved layouts of this screen setup, newest first (each read, for its box count).
     pub fn saved_layouts(&self) -> Vec<SavedLayout> {
         let mut v: Vec<SavedLayout> = std::fs::read_dir(self.saved_dir())
             .into_iter()

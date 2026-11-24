@@ -129,9 +129,10 @@ pub fn find_tab(l: &MonitorLayout, tab: u32) -> Option<(u32, usize)> {
 }
 
 /// Where rules send an item: the first enabled rule that matches and whose tab still exists (on
-/// any desktop page).
+/// any desktop page) and can take icons (a rule pointing at a folder box is passed over, so the
+/// next one that matches still applies).
 pub fn target(l: &MonitorLayout, it: &Item, now: u64) -> Option<u32> {
-    l.rules.iter().filter(|r| crate::pages::find_tab(l, r.target).is_some()).find(|r| matches(r, it, now)).map(|r| r.target)
+    l.rules.iter().filter(|r| crate::pages::sortable_tab(l, r.target).is_some()).find(|r| matches(r, it, now)).map(|r| r.target)
 }
 
 /// Put `items` where the rules say (in the given order). `fresh` = they just appeared on the
@@ -140,7 +141,7 @@ pub fn target(l: &MonitorLayout, it: &Item, now: u64) -> Option<u32> {
 pub fn apply(l: &mut MonitorLayout, items: &[&Item], fresh: bool, now: u64) -> bool {
     let mut changed = false;
     for it in items {
-        let dest = target(l, it, now).or(if fresh { l.new_items_to.filter(|t| crate::pages::find_tab(l, *t).is_some()) } else { None });
+        let dest = target(l, it, now).or(if fresh { l.new_items_to.filter(|t| crate::pages::sortable_tab(l, *t).is_some()) } else { None });
         let Some(tab) = dest else { continue };
         // (The tab may be on another desktop page: done there.)
         let Some((page, box_id, ti)) = crate::pages::find_tab(l, tab) else { continue };

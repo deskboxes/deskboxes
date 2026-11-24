@@ -32,6 +32,9 @@ namespace dbx
             long long focusBox = 0;          // box to bring into view on the next build
             bool lookOpen = false;           // the Look entry is open in the navigation
             std::wstring lastSig;            // the data last built, without the download progress
+            // A page switch waiting for the old page to fade out (kept here: a timer nothing
+            // holds is released at once and never ticks).
+            winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer switchTimer{ nullptr };
         };
         State g;
 
@@ -900,9 +903,12 @@ namespace dbx
             // shows black until its next frame (the flash on hover), so the picture fades instead.
             std::wstring c = corner;
             std::wstring top = c.substr(0, c.find(L',')), bottom = c.find(L',') == std::wstring::npos ? c : c.substr(c.rfind(L',') + 1);
+            // The video is transparent until it has a frame to show (ClipState::Cover): before
+            // that it is black, which showed while the picture over it was still being decoded.
             return L"<Grid x:Name=\"ClipG_" + key + L"\" " + size + L">" +
+                   L"<Border Margin=\"1\" CornerRadius=\"" + corner + L"\" Background=\"{ThemeResource CardBackgroundFillColorSecondaryBrush}\"/>"
                    L"<Grid Margin=\"1\" IsHitTestVisible=\"False\"><MediaPlayerElement x:Name=\"Clip_" + key + L"\" Tag=\"" + clip + L";" + top + L";" + bottom + L"\" Stretch=\"UniformToFill\""
-                   L" AreTransportControlsEnabled=\"False\" AutoPlay=\"False\"/></Grid>" + x +
+                   L" Opacity=\"0\" AreTransportControlsEnabled=\"False\" AutoPlay=\"False\"/></Grid>" + x +
                    L"<Border IsHitTestVisible=\"False\" CornerRadius=\"" + corner + L"\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\"/></Grid>";
         }
 
@@ -1095,27 +1101,29 @@ namespace dbx
             return cur;
         }
 
-        // A page: its title and cards in a scroller. `standalone`: a XAML document of its own (a
-        // page switch puts it into the navigation view that is there). `animate`: the page starts
-        // hidden and SwitchPage fades it in while it rises a little, as Windows Settings pages do.
+        // A page: its title, fixed at the top as in Windows Settings, over its cards in a
+        // scroller. `standalone`: a XAML document of its own (a page switch puts it into the
+        // navigation view that is there). `animate`: the cards start hidden and SwitchPage brings
+        // them in as Windows Settings does (the title changes at once; the cards rise into place).
         // (One animation for the whole page: per-card entrance transitions started late, after the
         // page had already been drawn once, so it blinked and the pictures popped.)
         std::wstring PageXaml(const Page* cur, bool standalone, bool animate)
         {
-            std::wstring x = L"<ScrollViewer x:Name=\"Scroll\"";
+            std::wstring x = L"<Grid";
             if (standalone)
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
+            x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
+                 L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>"
+                 L"<ScrollViewer x:Name=\"Scroll\" Grid.Row=\"1\">";
             // In a Grid: straight in the ScrollViewer, a page narrower than MaxWidth was placed by
             // its own width and then stretched, so it sat off to the right in a wide window.
-            x += L"><Grid><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,12,36,36\" MaxWidth=\"1000\"";
+            x += L"<Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
             x += animate ? L" Opacity=\"0\">" : L">";
             if (animate)
-                x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.22\"/></StackPanel.OpacityTransition>"
-                     L"<StackPanel.TranslationTransition><Vector3Transition Duration=\"0:0:0.3\"/></StackPanel.TranslationTransition>";
-            x += L"<TextBlock Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"0,0,0,12\"/>";
+                x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.083\"/></StackPanel.OpacityTransition>";
             if (cur->hero) x += Hero(cur);
             x += cur->build();
-            return x + L"</StackPanel></Grid></ScrollViewer>";
+            return x + L"</StackPanel></Grid></ScrollViewer></Grid>";
         }
 
         std::wstring BuildXaml()
@@ -1339,6 +1347,11 @@ namespace dbx
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{ nullptr };
             // The picture over the video (Still_KEY in Pic).
             winrt::weak_ref<mux::UIElement> still;
+            // The video itself: transparent until it has shown a frame (before that it is black,
+            // which showed through while the picture over it was still loading).
+            winrt::weak_ref<mux::UIElement> player;
+            // The tick the video was made visible (under the picture), -1 before.
+            int shownAt = -1;
             void Cover(bool on)
             {
                 if (auto s = still.get()) s.Opacity(on ? 1.0 : 0.0);
@@ -1357,11 +1370,23 @@ namespace dbx
                     {
                         auto st = ws.lock();
                         auto e = weak.get();
-                        if (!st || !e || !st->want || ++st->ticks > 300) { t.Stop(); return; }
+                        // (Up to ~30 s: a first clip can be slow to open on a slow PC.)
+                        if (!st || !e || !st->want || ++st->ticks > 1000) { t.Stop(); return; }
                         auto mp = e.MediaPlayer();
                         if (!mp) return;
                         auto s = mp.PlaybackSession();
-                        if (s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(40))
+                        // First the video turns visible under the picture (a video element that
+                        // was transparent takes a few frames to show again: the picture fading
+                        // at once let the page show through); then the picture fades.
+                        if (st->shownAt < 0)
+                        {
+                            if (s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(40))
+                            {
+                                if (auto p = st->player.get()) p.Opacity(1.0);
+                                st->shownAt = st->ticks;
+                            }
+                        }
+                        else if (st->ticks - st->shownAt >= 4)
                         {
                             st->Cover(false);
                             t.Stop();
@@ -1369,6 +1394,7 @@ namespace dbx
                     });
             }
             st->ticks = 0;
+            st->shownAt = -1;
             st->timer.Stop();
             st->timer.Start();
         }
@@ -1388,7 +1414,8 @@ namespace dbx
                 mp.IsMuted(true);
                 mp.IsLoopingEnabled(true);
                 mp.AutoPlay(false);
-                mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f) { Log(L"settings: clip %s failed: %s", clip.c_str(), f.ErrorMessage().c_str()); });
+                mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f)
+                    { Log(L"settings: clip %s failed (%d, 0x%08X): %s", clip.c_str(), (int)f.Error(), (unsigned)f.ExtendedErrorCode().value, f.ErrorMessage().c_str()); });
                 e.SetMediaPlayer(mp);
                 mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(FileUri(file))));
                 return true;
@@ -1400,7 +1427,13 @@ namespace dbx
         // Start (or restart from the beginning) a feature's clip on its element; see WireClip.
         void StartClip(muxc::MediaPlayerElement const& e, const std::wstring& clip, std::shared_ptr<ClipState> want)
         {
-            if (!winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) return;
+            if (!winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled())
+            {
+                static bool told = false;
+                if (!told) Log(L"settings: Windows' animation effects are off: feature clips stay still");
+                told = true;
+                return;
+            }
             if (!LoadClip(e, clip)) return;
             want->want = true;
             want->Cover(true);
@@ -1443,6 +1476,7 @@ namespace dbx
             still.OpacityTransition(fade);
             auto want = std::make_shared<ClipState>();
             want->still = still;
+            want->player = el;
             auto stop = [weak, want]
             {
                 want->want = false;
@@ -1705,39 +1739,107 @@ namespace dbx
 
         void Build();
 
+        // The new page's cards rise into place as Windows Settings' do: from a little below,
+        // quickly at first and then settling (its decelerate curve), fading in at the start.
+        // `move` is the frame around `body`: an element with an OpacityTransition (the body) must
+        // not have its composition visual taken (WinUI ends the process).
+        void Rise(mux::UIElement const& move, mux::UIElement const& body)
+        {
+            auto vis = mux::Hosting::ElementCompositionPreview::GetElementVisual(move);
+            auto comp = vis.Compositor();
+            auto a = comp.CreateVector3KeyFrameAnimation();
+            auto ease = comp.CreateCubicBezierEasingFunction({ 0.1f, 0.9f }, { 0.2f, 1.0f });
+            a.InsertKeyFrame(0.0f, { 0.0f, 120.0f, 0.0f });
+            a.InsertKeyFrame(1.0f, { 0.0f, 0.0f, 0.0f }, ease);
+            a.Duration(std::chrono::milliseconds(380));
+            vis.StartAnimation(L"Translation", a);
+            body.Opacity(1.0);
+        }
+
         // Another page: only the page is replaced (the navigation keeps its selection marker
-        // gliding to the new entry), and its cards come in animated.
-        void SwitchPage()
+        // gliding to the new entry). As in Windows Settings the title changes at once, the old
+        // cards fade out quickly, and then the new ones rise into place (see Rise).
+        // The page to show next, made while the one before fades out.
+        mux::FrameworkElement MakePage(bool anim)
+        {
+            try { return mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), true, anim)).as<mux::FrameworkElement>(); }
+            catch (winrt::hresult_error const& e) { Log(L"settings: page XAML failed: %s", e.message().c_str()); }
+            return nullptr;
+        }
+
+        void ShowPage(mux::FrameworkElement page, bool anim)
         {
             if (!g.window) return;
             auto old = g.window.Content().try_as<mux::FrameworkElement>();
             auto nav = old ? Find<muxc::NavigationView>(old, L"Nav") : muxc::NavigationView{ nullptr };
-            if (!nav) return Build();
-            // Windows' "Animation effects" off: the page just appears.
-            BOOL anim = TRUE;
-            SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
-            mux::FrameworkElement page{ nullptr };
-            try { page = mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), true, anim != FALSE)).as<mux::FrameworkElement>(); }
-            catch (winrt::hresult_error const& e) { Log(L"settings: page XAML failed: %s", e.message().c_str()); return Build(); }
+            if (!nav || !page) return Build();
             auto body = anim ? Find<mux::UIElement>(page, L"PageBody") : mux::UIElement{ nullptr };
-            if (body) body.Translation({ 0.0f, 28.0f, 0.0f });
+            auto move = anim ? Find<mux::UIElement>(page, L"PageMove") : mux::UIElement{ nullptr };
+            if (body && move)
+            {
+                mux::Hosting::ElementCompositionPreview::SetIsTranslationEnabled(move, true);
+                mux::Hosting::ElementCompositionPreview::GetElementVisual(move).Properties().InsertVector3(L"Translation", { 0.0f, 120.0f, 0.0f });
+            }
+            else body = nullptr;
             g.wiring = true;
             g.builtPage = g.page;
             nav.Content(page);
             Wire(page);
-            page.Loaded([page, body](auto&&, auto&&)
+            // (Weak: the page's own handler holding it, or its child, would keep every page
+            // switched away from alive.)
+            winrt::weak_ref<mux::UIElement> weakBody{ body }, weakMove{ move };
+            page.Loaded([weakBody, weakMove](auto&& sender, auto&&)
             {
-                page.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [body]
-                {
-                    g.wiring = false;
-                    // Laid out and still invisible: now fade in and rise into place.
-                    if (body)
-                    {
-                        body.Opacity(1.0);
-                        body.Translation({ 0.0f, 0.0f, 0.0f });
-                    }
-                });
+                // Laid out and still invisible: now it comes in.
+                auto body = weakBody.get();
+                auto move = weakMove.get();
+                if (body && move) Rise(move, body);
+                auto page = sender.template as<mux::FrameworkElement>();
+                page.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { g.wiring = false; });
             });
+        }
+
+        // The page that comes next, waiting for the old one to fade out (see SwitchPage).
+        mux::FrameworkElement g_nextPage{ nullptr };
+
+        void SwitchPage()
+        {
+            if (!g.window) return;
+            // Picked again while it shows (selection raised twice): nothing to do.
+            if (g.page == g.builtPage && !(g.switchTimer && g.switchTimer.IsRunning())) return;
+            // Windows' "Animation effects" off: the page just appears.
+            BOOL anim = TRUE;
+            SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
+            auto root = g.window.Content().try_as<mux::FrameworkElement>();
+            auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
+            auto shown = nav ? nav.Content().try_as<mux::FrameworkElement>() : mux::FrameworkElement{ nullptr };
+            auto oldBody = shown ? Find<mux::UIElement>(shown, L"PageBody") : mux::UIElement{ nullptr };
+            if (!anim || !oldBody) return ShowPage(MakePage(anim != FALSE), anim != FALSE);
+            // As in Windows Settings: the title at once; the old cards fade out quickly; the new
+            // page (made meanwhile) once they are gone.
+            if (auto t = Find<muxc::TextBlock>(shown, L"PageTitle")) t.Text(g.data.GetNamedObject(L"strings", JsonObject()).GetNamedString(CurrentPage()->title, CurrentPage()->title));
+            mux::ScalarTransition fade;
+            fade.Duration(std::chrono::milliseconds(90));
+            oldBody.OpacityTransition(fade);
+            oldBody.Opacity(0.0);
+            if (!g.switchTimer)
+            {
+                g.switchTimer = g.window.DispatcherQueue().CreateTimer();
+                g.switchTimer.IsRepeating(false);
+                g.switchTimer.Tick([](auto&&, auto&&)
+                    {
+                        auto page = g_nextPage;
+                        g_nextPage = nullptr;
+                        ShowPage(page, true);
+                    });
+            }
+            g.switchTimer.Stop();
+            auto t0 = std::chrono::steady_clock::now();
+            g_nextPage = MakePage(true);
+            // What is left of the fade after making the page (at least a frame).
+            auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+            g.switchTimer.Interval(std::max(std::chrono::milliseconds(16), std::chrono::milliseconds(95) - spent));
+            g.switchTimer.Start();
         }
 
         void Build()
@@ -1748,7 +1850,8 @@ namespace dbx
             if (g.page == g.builtPage)
                 if (auto old = g.window.Content().try_as<mux::FrameworkElement>())
                     if (auto nav = Find<muxc::NavigationView>(old, L"Nav"))
-                        if (auto sv = nav.Content().try_as<muxc::ScrollViewer>()) scroll = sv.VerticalOffset();
+                        if (auto shown = nav.Content().try_as<mux::FrameworkElement>())
+                            if (auto sv = Find<muxc::ScrollViewer>(shown, L"Scroll")) scroll = sv.VerticalOffset();
             mux::FrameworkElement root{ nullptr };
             try { root = mux::Markup::XamlReader::Load(BuildXaml()).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: XAML failed: %s", e.message().c_str()); return; }
@@ -1763,12 +1866,17 @@ namespace dbx
                 focus = Find<muxc::Expander>(root, L"Box" + std::to_wstring(g.focusBox) + L"Exp");
             g.focusBox = 0;
             // Control events raised while the tree loads (initial selection) are not changes.
-            root.Loaded([root, scroll, focus](auto&&, auto&&)
+            winrt::weak_ref<mux::FrameworkElement> weakRoot{ root };
+            winrt::weak_ref<muxc::Expander> weakFocus{ focus };
+            root.Loaded([weakRoot, scroll, weakFocus](auto&&, auto&&)
             {
-                root.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [root, scroll, focus]
+                auto root = weakRoot.get();
+                if (!root) return;
+                root.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weakRoot, scroll, weakFocus]
                 {
-                    if (focus) focus.StartBringIntoView();
-                    else if (auto sv = Find<muxc::ScrollViewer>(root, L"Scroll")) sv.ChangeView(nullptr, scroll, nullptr, true);
+                    auto root = weakRoot.get();
+                    if (auto focus = weakFocus.get()) focus.StartBringIntoView();
+                    else if (auto sv = root ? Find<muxc::ScrollViewer>(root, L"Scroll") : muxc::ScrollViewer{ nullptr }) sv.ChangeView(nullptr, scroll, nullptr, true);
                     g.wiring = false;
                 });
             });
@@ -1797,7 +1905,13 @@ namespace dbx
             auto& wa = mi.rcWork;
             w = std::min<int>(w, wa.right - wa.left); h = std::min<int>(h, wa.bottom - wa.top);
             aw.MoveAndResize({ wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h });
-            g.window.Closed([](auto&&, auto&&) { g.window = nullptr; g.hwnd = nullptr; g.builtPage.clear(); TrimMemorySoon(); });
+            g.window.Closed([](auto&&, auto&&)
+                {
+                    if (g.switchTimer) g.switchTimer.Stop();
+                    g.switchTimer = nullptr;
+                    g_nextPage = nullptr;
+                    g.window = nullptr; g.hwnd = nullptr; g.builtPage.clear(); TrimMemorySoon();
+                });
         }
     }
 
@@ -1883,9 +1997,10 @@ namespace dbx
         if (auto pk = Find<muxc::ColorPicker>(root, L"Picker"))
             pk.ColorChanged([](auto&&, muxc::ColorChangedEventArgs const& e) { if (!gp.done) PickSend(Hex(e.NewColor()), false, false); });
         if (auto b = Find<muxc::Button>(root, L"Ok"))
-            b.Click([root](auto&&, auto&&)
+            b.Click([weakRoot = winrt::weak_ref<mux::FrameworkElement>(root)](auto&&, auto&&)
             {
-                auto pk = Find<muxc::ColorPicker>(root, L"Picker");
+                auto root = weakRoot.get();
+                auto pk = root ? Find<muxc::ColorPicker>(root, L"Picker") : muxc::ColorPicker{ nullptr };
                 if (pk && !gp.done) PickSend(Hex(pk.Color()), true, false);
                 gp.done = true;
                 if (gp.window) gp.window.Close();
@@ -2025,9 +2140,14 @@ namespace dbx
             if (auto win = gd.window) win.AppWindow().MoveAndResize({ wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h });
         };
         place(gd.text ? 216 : (body.empty() ? 160 : 196));
+        // Handlers hold the root weakly: a strong capture in an element's own handler (or a
+        // child's) is a cycle that would keep each closed dialog's tree alive.
+        winrt::weak_ref<mux::FrameworkElement> weakRoot{ root };
         // Its real height once laid out (the text wraps).
-        root.Loaded([root, place](auto&&, auto&&)
+        root.Loaded([weakRoot, place](auto&&, auto&&)
         {
+            auto root = weakRoot.get();
+            if (!root) return;
             root.Measure({ 440, std::numeric_limits<float>::infinity() });
             double h = root.DesiredSize().Height;
             if (h > 60) place(h);
@@ -2040,12 +2160,17 @@ namespace dbx
         });
         auto ok = Find<muxc::Button>(root, L"Ok");
         if (auto f = Find<muxc::TextBox>(root, L"Field"))
-            f.TextChanged([ok](auto&& s, auto&&) { auto t = s.template as<muxc::TextBox>(); if (ok && t) ok.IsEnabled(!Trimmed(t.Text().c_str()).empty()); });
-        if (ok) ok.Click([root](auto&&, auto&&) { DialogEnd(root, true); });
-        if (auto b = Find<muxc::Button>(root, L"Cancel"))
-            b.Click([root](auto&&, auto&&) { DialogEnd(root, false); });
-        root.KeyDown([root](auto&&, mux::Input::KeyRoutedEventArgs const& e)
         {
+            winrt::weak_ref<muxc::Button> weakOk{ ok };
+            f.TextChanged([weakOk](auto&& s, auto&&) { auto t = s.template as<muxc::TextBox>(); if (auto ok = weakOk.get(); ok && t) ok.IsEnabled(!Trimmed(t.Text().c_str()).empty()); });
+        }
+        if (ok) ok.Click([weakRoot](auto&&, auto&&) { if (auto root = weakRoot.get()) DialogEnd(root, true); });
+        if (auto b = Find<muxc::Button>(root, L"Cancel"))
+            b.Click([weakRoot](auto&&, auto&&) { if (auto root = weakRoot.get()) DialogEnd(root, false); });
+        root.KeyDown([weakRoot](auto&&, mux::Input::KeyRoutedEventArgs const& e)
+        {
+            auto root = weakRoot.get();
+            if (!root) return;
             if (e.Key() == winrt::Windows::System::VirtualKey::Escape) { e.Handled(true); DialogEnd(root, false); }
             else if (e.Key() == winrt::Windows::System::VirtualKey::Enter)
             {

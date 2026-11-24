@@ -261,6 +261,30 @@ impl App {
     /// Box `id` shows its icons as `view` at `size` ("" and 0: as the desktop). Not an undo step
     /// (as in File Explorer); a box too narrow for one column grows to fit it.
     pub fn set_box_view(&mut self, ids: &[u32], view: &str, size: u32) {
+        self.apply_box_view(ids, view, size);
+        log::info!("view of {} box(es): '{view}' {size}", ids.len());
+        self.layout_changed();
+    }
+
+    /// "Icons in all boxes": every box on every page.
+    pub fn set_all_box_views(&mut self, view: &str, size: u32) {
+        let shown = self.layout.page;
+        let mut n = 0;
+        for p in deskboxes_core::pages::ids(&self.layout) {
+            if p != shown && !deskboxes_core::pages::switch_to(&mut self.layout, p) {
+                continue;
+            }
+            let ids: Vec<u32> = self.layout.boxes.iter().map(|b| b.id).collect();
+            n += ids.len();
+            self.apply_box_view(&ids, view, size);
+            deskboxes_core::pages::switch_to(&mut self.layout, shown);
+        }
+        log::info!("view of all {n} box(es): '{view}' {size}");
+        self.layout_changed();
+    }
+
+    /// Boxes `ids` on the page shown get `view` at `size` (wide enough for one column of it).
+    fn apply_box_view(&mut self, ids: &[u32], view: &str, size: u32) {
         let bounds = self.work;
         for id in ids {
             let Some(b) = self.layout.boxes.iter_mut().find(|b| b.id == *id) else { continue };
@@ -285,8 +309,6 @@ impl App {
             }
             self.scroll_from.remove(id);
         }
-        log::info!("view of {} box(es): '{view}' {size}", ids.len());
-        self.layout_changed();
     }
 
     /// Ctrl + mouse wheel over a box: the next view in Explorer's order (details, list, then

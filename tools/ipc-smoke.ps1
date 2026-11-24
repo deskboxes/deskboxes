@@ -26,14 +26,16 @@ $many = Join-Path $fx 'many'; New-Item -ItemType Directory $many | Out-Null
 1..100 | ForEach-Object { Set-Content (Join-Path $many ("plik {0:D3}.txt" -f $_)) 'x' -NoNewline }
 
 $name = "deskboxes-host-smoke-$PID"
-Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Stop-Process -Force
+# Hosts running already (the real Deskboxes' menus) are left alone; only ours is stopped.
+$otherHosts = @(Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | ForEach-Object Id)
+function Our-Hosts { Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Where-Object { $otherHosts -notcontains $_.Id } }
 if ($elevated) { & $runAs --no-wait -- $Host_ --pipe $name | Out-Null } else { Start-Process $Host_ -ArgumentList '--pipe', $name | Out-Null }
 
 $pipe = [System.IO.Pipes.NamedPipeClientStream]::new('.', $name, [System.IO.Pipes.PipeDirection]::InOut)
 $results = [ordered]@{}
 try {
     $pipe.Connect(10000)
-    $hostProc = Get-Process deskboxes-shellhost | Select-Object -First 1
+    $hostProc = Our-Hosts | Select-Object -First 1
     $script:nextId = 1
     function Send-Msg([hashtable]$m) {
         $m.v = 1; if (-not $m.id) { $m.id = $script:nextId++ }
@@ -92,7 +94,7 @@ try {
 }
 finally {
     $pipe.Dispose()
-    Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Stop-Process -Force
+    Our-Hosts | Stop-Process -Force
     Remove-Item $fx -Recurse -Force -ErrorAction SilentlyContinue
 }
 $rows | Group-Object label | ForEach-Object {

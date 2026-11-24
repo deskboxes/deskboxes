@@ -157,6 +157,9 @@ pub struct PageState {
     /// Button ups that belong to a gesture just ended (1: left, 2: right).
     pub swallow_up: u8,
     pub tf: Option<IDWriteTextFormat>,
+    /// The pill's title laid out (shaped once, not per frame and per pointer move): (title, its
+    /// layout). The text format only changes with the DPI, which makes `tf` anew and clears it.
+    pub title_layout: std::cell::RefCell<Option<(String, r::TextLayout)>>,
     pub dot_tf: Option<IDWriteTextFormat>,
     /// The next menu shown is this (our own entries only: the page name's menu).
     pub menu_own: Option<Vec<serde_json::Value>>,
@@ -187,7 +190,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 /// Windows' "Animation effects" (off: pages fade instead of sliding).
-fn windows_animates() -> bool {
+pub(crate) fn windows_animates() -> bool {
     let mut on = BOOL(1);
     unsafe {
         let _ = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
@@ -277,6 +280,7 @@ impl App {
         if self.pages.pill.is_some() && self.pages.tf.is_none() {
             self.pages.tf = self.gpu.text_format_weight("Segoe UI Variable Display", 15.0, 600).or_else(|_| self.gpu.text_format("Segoe UI", 15.0, true)).ok();
             self.pages.dot_tf = self.gpu.text_format("Segoe UI", 11.0, false).ok();
+            *self.pages.title_layout.borrow_mut() = None;
         }
     }
 
@@ -299,12 +303,25 @@ impl App {
         }
     }
 
+    /// The page's title laid out in the pill's format (kept while the title stays).
+    fn pill_title(&self, title: &str) -> Option<r::TextLayout> {
+        let tf = self.pages.tf.as_ref()?;
+        let mut c = self.pages.title_layout.borrow_mut();
+        if let Some((t, l)) = c.as_ref() {
+            if t == title {
+                return Some(l.clone());
+            }
+        }
+        let l = self.gpu.label(tf, title, 600.0, 22.0, 1, false).ok()?;
+        *c = Some((title.to_string(), l.clone()));
+        Some(l)
+    }
+
     /// Where the page's name is shown now (its full size), if it is.
     pub fn page_pill_rect(&self) -> Option<Rect> {
         let p = self.pages.pill.as_ref()?;
-        let tf = self.pages.tf.as_ref()?;
         let title = self.page_title(self.layout.page);
-        let l = self.gpu.label(tf, &title, 600.0, 22.0, 1, false).ok()?;
+        let l = self.pill_title(&title)?;
         let now_w = (r::text_width(&l).ceil().max(dots_width(pg::count(&self.layout))) + 44.0).max(128.0);
         let w = match &p.name_from {
             Some((_, _, w0, t0)) => lerp(*w0, now_w, ease_out(t0.elapsed().as_secs_f32() / NAME_S)),
@@ -349,7 +366,7 @@ impl App {
             r::push_clip(dc, rf(rect.inflate(-6.0)));
             let name_y = rect.y + 8.0;
             let title = self.page_title(self.layout.page);
-            let l = self.gpu.label(tf, &title, 600.0, 22.0, 1, false)?;
+            let Some(l) = self.pill_title(&title) else { return Ok(()) };
             let nx = |l: &r::TextLayout| rect.x + (rect.w - r::text_width(l)) / 2.0;
             match &p.name_from {
                 Some((old, dir, _, t0)) if t0.elapsed().as_secs_f32() < NAME_S => {
@@ -1009,8 +1026,9 @@ impl App {
         let id = match pg::id_at(&self.layout, i as usize) {
             Some(id) => id,
             None => {
-                // One empty new page at a time.
-                if self.page_empty(self.layout.page) && self.pages.made == Some(self.layout.page) {
+                // One new page per drag: held on at the edge of the page it made, the drag stays
+                // (the box or icons carried along would make that page count as used).
+                if self.pages.made.is_some() && self.pages.made == Some(self.layout.page) {
                     return;
                 }
                 self.page_keep_before();
@@ -1166,6 +1184,10 @@ impl App {
         }
         if let Some(rest) = cmd.strip_prefix("dbx.pagebox:") {
             let Some(b) = box_id else { return };
+            if self.locks_of(b).position {
+                log::info!("box {b} is locked in place: not moved to another page");
+                return;
+            }
             match rest {
                 "new" => self.new_page_dialog(Some(b), vec![], false),
                 s => {
@@ -1181,6 +1203,11 @@ impl App {
         if let Some(rest) = cmd.strip_prefix("dbx.pageitems:") {
             let keys = self.sel.ordered(&self.order());
             if keys.is_empty() {
+                return;
+            }
+            // As a drag: icons out of a box whose icons are locked (or with everything locked) stay.
+            if !self.icons_movable(&keys, None) {
+                log::info!("icons locked: not moved to another page");
                 return;
             }
             match rest {
@@ -1314,6 +1341,9 @@ impl App {
         log::info!("dialog {id} {ask:?}: ok={ok}");
         match ask {
             Ask::NewPage { boxed, items, go } if ok && !value.is_empty() => {
+                // (Locks may have been turned on while the dialog was open.)
+                let boxed = boxed.filter(|b| !self.locks_of(*b).position);
+                let items = if self.icons_movable(&items, None) { items } else { vec![] };
                 let name = self.own_name(&value, pg::count(&self.layout) + 1);
                 let mut made = 0;
                 self.change_layout(|l, g| {
@@ -1327,6 +1357,14 @@ impl App {
                 });
                 if !items.is_empty() {
                     self.sel.clear();
+                }
+                // A new page with pages off (Settings' "New page"): pages come on, or the page
+                // shown would be the only one reachable.
+                if !self.settings.pages.enabled {
+                    log::info!("a page made with pages off: pages on");
+                    self.settings.pages.enabled = true;
+                    self.save_settings_soon();
+                    self.send_settings(false, None);
                 }
                 if go {
                     self.go_page(made);

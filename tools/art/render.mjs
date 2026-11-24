@@ -84,7 +84,10 @@ for (const s of scenes) {
     }
     const mp4 = path.join(RES, s + (th === 'light' ? '_l' : '') + '.mp4');
     execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-framerate', String(fps), '-i', path.join(dir, 'f%04d.png'), '-vf', `scale=${VW}:${VH}:flags=lanczos`,
-      '-c:v', 'libx264', '-preset', 'veryslow', '-crf', '26', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-movflags', '+faststart', '-an', mp4]);
+      // Level 3.1 with few reference frames: any H.264 decoder plays it (veryslow's 16 references
+      // made level 5.0 streams, which some PCs' decoders refused: no clips there).
+      '-c:v', 'libx264', '-preset', 'veryslow', '-refs', '4', '-bf', '2', '-crf', '26', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level:v', '3.1',
+      '-x264-params', 'vbv-maxrate=14000:vbv-bufsize=14000', '-movflags', '+faststart', '-an', mp4]);
     fs.rmSync(dir, { recursive: true, force: true });
     console.log(s, th, n, 'frames', Math.round(fs.statSync(mp4).size / 1024), 'KB');
   }

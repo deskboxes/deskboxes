@@ -16,7 +16,9 @@ use std::sync::Mutex;
 
 /// The folders shown now (lowercase): a watched folder that is no longer shown asks no rescans.
 static SHOWN: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static WATCHED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The folders watched for folder boxes (lowercase path): a watcher goes when no box shows its
+/// folder any more.
+static WATCHED: Mutex<Option<HashMap<String, deskboxes_shell::watch::Watch>>> = Mutex::new(None);
 
 const DIR: u32 = 0x10;
 /// Cloud files not on this PC (OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS): never listed
@@ -54,7 +56,8 @@ impl App {
     /// folder boxes from what is known.
     pub fn folder_sync(&mut self) {
         let mut want: Vec<String> = vec![];
-        for b in self.layout.boxes.iter().filter(|b| b.is_folder()) {
+        // Every page's folder boxes: their files stay known (search finds them from any page).
+        for (_, b) in deskboxes_core::pages::all_boxes(&self.layout).filter(|(_, b)| b.is_folder()) {
             for ti in 0..b.tabs.len() {
                 let f = b.tab_now(ti).to_string();
                 if !want.iter().any(|w| same(w, &f)) {
@@ -65,15 +68,20 @@ impl App {
         if want != self.folders_sent {
             *SHOWN.lock().unwrap() = want.iter().map(|w| w.to_lowercase()).collect();
             let mut watched = WATCHED.lock().unwrap();
-            let watched = watched.get_or_insert_with(HashSet::new);
+            let watched = watched.get_or_insert_with(HashMap::new);
+            // Folders no box shows any more: their watchers stop (thread, handle, buffer go).
+            let shown: HashSet<String> = want.iter().map(|w| w.to_lowercase()).collect();
+            watched.retain(|k, _| shown.contains(k));
             for w in &want {
                 let lw = w.to_lowercase();
-                if watched.insert(lw.clone()) {
-                    deskboxes_shell::watch::watch(vec![w.into()], move || {
-                        if SHOWN.lock().map(|s| s.contains(&lw)).unwrap_or(false) {
+                if !watched.contains_key(&lw) {
+                    let l2 = lw.clone();
+                    let watch = deskboxes_shell::watch::watch_one(w.into(), move || {
+                        if SHOWN.lock().map(|s| s.contains(&l2)).unwrap_or(false) {
                             crate::events::post(crate::events::Ev::Rescan);
                         }
                     });
+                    watched.insert(lw, watch);
                 }
             }
             log::info!("folder boxes show {} folder(s)", want.len());
@@ -197,7 +205,14 @@ impl App {
         if it.source != Source::Folder || !it.is_folder() {
             return None;
         }
-        let id = self.layout.boxes.iter().find(|b| b.is_folder() && b.contains(k).is_some())?.id;
+        // The folder box it was clicked in (the same folder can show in two boxes); otherwise
+        // the first that shows it in the tab it is on now (not a tab behind).
+        let shows = |b: &&BoxModel| b.is_folder() && b.tabs.get(b.active_tab).is_some_and(|t| t.items.contains(k));
+        let id = self
+            .item_box
+            .and_then(|id| self.layout.boxes.iter().find(|b| b.id == id).filter(shows))
+            .or_else(|| self.layout.boxes.iter().find(shows))?
+            .id;
         Some((id, it.parsing_name.clone()))
     }
 

@@ -1,2 +1,7 @@
 // The app icon (tools/make-icon.py draws it).
 1 ICON "deskboxes.ico"
+// Common controls 6 (deskboxes.manifest): the Rust programs only (embed_icon.rs defines
+// DESKBOXES_MANIFEST); the shell host's project makes its own manifest.
+#ifdef DESKBOXES_MANIFEST
+1 24 "deskboxes.manifest"
+#endif

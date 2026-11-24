@@ -27,6 +27,7 @@ impl Lang {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum S {
+    BadNameChars,
     NewBox,
     NewBoxTitle,
     RenameBox,
@@ -163,6 +164,8 @@ pub enum S {
 pub fn t(lang: Lang, s: S) -> &'static str {
     use S::*;
     match (lang, s) {
+        (Lang::Pl, BadNameChars) => "Nazwa pliku nie może zawierać żadnego z następujących znaków:\r\n\\ / : * ? \" < > |",
+        (Lang::En, BadNameChars) => "A file name can't contain any of the following characters:\r\n\\ / : * ? \" < > |",
         (Lang::Pl, NewBox) => "Utwórz &pole tutaj",
         (Lang::En, NewBox) => "Create &box here",
         (Lang::Pl, NewBoxTitle) => "Nowe pole",

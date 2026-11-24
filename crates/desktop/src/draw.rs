@@ -141,12 +141,21 @@ impl App {
         self.prepare();
         self.pages_before_frame();
         self.prepare_beside();
-        let Some(surf) = self.surf.take() else { return };
+        let Some(surf) = self.surf.take() else {
+            self.frame_ok = false;
+            return;
+        };
+        *self.paint_memo.borrow_mut() = Some(std::collections::HashMap::new());
         let res = surf.draw(self.scale, |dc| self.paint_frame(dc));
+        *self.paint_memo.borrow_mut() = None;
         self.surf = Some(surf);
-        if let Err(e) = res.and_then(|_| self.gpu.commit()) {
-            log::warn!("draw: {e}");
-        }
+        self.frame_ok = match res.and_then(|_| self.gpu.commit()) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("draw: {e}");
+                false
+            }
+        };
         self.stats.draw_ms_last = t.elapsed().as_secs_f64() * 1000.0;
         if self.draw_times.len() < 100_000 {
             self.draw_times.push(self.stats.draw_ms_last as f32);
@@ -671,7 +680,9 @@ impl App {
     fn paint_item(&self, dc: &Dc, k: &ItemKey, cell: Rect, th: &Theme, shadow: bool, opacity: f32, fx: crate::iconfx::IconFx, m: &crate::views::Metrics) -> r::R<()> {
         let Some(it) = self.items.get(k) else { return Ok(()) };
         // Searching: what does not match fades.
-        let opacity = opacity * self.search_alpha(k);
+        // Just appeared: fading in (and the icon growing, below).
+        let grow = self.appear_t(k);
+        let opacity = opacity * self.search_alpha(k) * grow;
         let (lw, full, row) = self.label_spec(k, cell, m);
         let (icon, label) = self.item_parts(k, cell, full, m);
         let sel = self.sel.is_selected(k);
@@ -693,7 +704,13 @@ impl App {
         // Blending in: the wallpaper's color behind the icon.
         let wall_c = (fx.blend > 0.0).then(|| self.wall_color_at(Pt { x: icon.x + icon.w / 2.0, y: icon.y + icon.h / 2.0 }));
         if let Some((bid, b)) = self.icon_bitmap(it, m) {
-            let dst = rf(fit_icon(b, icon));
+            let mut r0 = fit_icon(b, icon);
+            if grow < 1.0 {
+                let s = 0.65 + 0.35 * grow;
+                let (cx, cy) = (r0.x + r0.w / 2.0, r0.y + r0.h / 2.0);
+                r0 = Rect::new(cx - r0.w * s / 2.0, cy - r0.h * s / 2.0, r0.w * s, r0.h * s);
+            }
+            let dst = rf(r0);
             let own = 1.0 - fx.blend;
             if own > 0.002 {
                 match fx.tint.and_then(|(c, s)| self.fx_bitmap(bid, b, c, 0).map(|t| (t, s))) {

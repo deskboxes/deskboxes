@@ -33,6 +33,7 @@ pub const MANIFEST: &str = "install.json";
 pub const UNINSTALLER: &str = "uninstall.exe";
 pub const WATCHDOG: &str = "deskboxes-watchdog.exe";
 pub const CORE: &str = "deskboxes.exe";
+pub const SHELLHOST: &str = "deskboxes-shellhost.exe";
 
 // ---------------------------------------------------------------------------------------------
 // Log: %TEMP%\deskboxes-setup.log (the install folder and the data folders may be going away).
@@ -169,11 +170,6 @@ fn reg_hklm_string(key: &str, value: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
-    let n = |p: &Path| p.display().to_string().trim_end_matches('\\').to_lowercase();
-    n(a) == n(b)
-}
-
 fn show_menu_on_top() {
     deskboxes_shell::turnon::pin_modern_verb();
 }
@@ -275,10 +271,33 @@ fn image_path(pid: u32) -> Option<PathBuf> {
     }
 }
 
-/// Processes whose exe is inside `dir`.
+/// Whether two paths name the same folder, however spelled (letter case, short names, a
+/// trailing separator, a link to it). Paths that do not exist are compared as text.
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy()),
+        _ => a.to_string_lossy().trim_end_matches(['\\', '/']).eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/'])),
+    }
+}
+
+/// The programs Deskboxes runs from `dir`: the ones its install.json lists and its own known
+/// ones (a folder without install.json: an older or a development copy). Relative to `dir`.
+fn our_programs(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = read_manifest(dir).map(|m| m.files).unwrap_or_default();
+    names.extend([CORE, WATCHDOG, SHELLHOST, UNINSTALLER].map(String::from));
+    names.retain(|f| f.to_lowercase().ends_with(".exe"));
+    names.sort_by_key(|f| f.to_lowercase());
+    names.dedup_by_key(|f| f.to_lowercase());
+    names
+}
+
+/// Running Deskboxes programs from `dir` (only those: another program kept in the same folder
+/// is never stopped).
 fn processes_in(dir: &Path) -> Vec<u32> {
     use windows::Win32::System::Diagnostics::ToolHelp::*;
-    let dir_l = dir.to_string_lossy().to_lowercase();
+    let ours: Vec<PathBuf> = our_programs(dir).iter().map(|f| dir.join(f)).collect();
+    let names: std::collections::HashSet<String> = ours.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().to_lowercase()).collect();
+    let canon: Vec<String> = ours.iter().filter_map(|p| std::fs::canonicalize(p).ok()).map(|p| p.to_string_lossy().to_lowercase()).collect();
     let mut out = vec![];
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
@@ -286,10 +305,10 @@ fn processes_in(dir: &Path) -> Vec<u32> {
         let mut ok = Process32FirstW(snap, &mut e).is_ok();
         while ok {
             let name = String::from_utf16_lossy(&e.szExeFile[..e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0)]).to_lowercase();
-            if e.th32ProcessID != std::process::id() && name.ends_with(".exe") {
+            if e.th32ProcessID != std::process::id() && names.contains(&name) {
                 if let Some(p) = image_path(e.th32ProcessID) {
-                    let pl = p.to_string_lossy().to_lowercase();
-                    if pl.starts_with(&dir_l) && pl[dir_l.len()..].starts_with('\\') {
+                    let pl = std::fs::canonicalize(&p).map(|c| c.to_string_lossy().to_lowercase()).unwrap_or_else(|_| p.to_string_lossy().to_lowercase());
+                    if canon.contains(&pl) {
                         out.push(e.th32ProcessID);
                     }
                 }
@@ -322,8 +341,8 @@ fn wait_or_kill(pid: u32, wait_ms: u32) -> bool {
 
 /// Stop Deskboxes the way `deskboxes --restore-icons` does: WM_CLOSE to the watchdog (so it does
 /// not restart the core), then to the core (it restores the icons on a clean exit), terminating
-/// what does not exit. Then anything else still running from `dir` (the shell host). Finally make
-/// sure Explorer's icons are visible. Returns whether Deskboxes was running.
+/// what does not exit. Then Deskboxes' other programs still running from `dir` (the shell host).
+/// Finally make sure Explorer's icons are visible. Returns whether Deskboxes was running.
 pub fn stop_app(dir: Option<&Path>) -> Result<bool, Failure> {
     let mut was = false;
     unsafe {
@@ -371,42 +390,100 @@ pub fn stop_app(dir: Option<&Path>) -> Result<bool, Failure> {
 // ---------------------------------------------------------------------------------------------
 // Files.
 
-/// Write one file. A file in use cannot be replaced, but it can be renamed: move it aside as
-/// `<name>.old~N` (deleted at the end, or by the next setup run) and write the new one.
-fn write_file(p: &Path, data: &[u8], leftovers: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    match std::fs::write(p, data) {
-        Ok(()) => Ok(()),
-        Err(e) if p.exists() => {
-            for n in 0..100 {
-                let old = PathBuf::from(format!("{}.old~{n}", p.display()));
-                if old.exists() && std::fs::remove_file(&old).is_err() {
-                    continue;
-                }
-                if std::fs::rename(p, &old).is_ok() {
-                    leftovers.push(old);
-                    return std::fs::write(p, data);
-                }
-                break;
-            }
-            Err(e)
+/// Move `p` aside as `<name>.old~N`: a file in use cannot be replaced or deleted, but it can be
+/// renamed (deleted at the end, or by the next setup run). Returns where it went.
+fn move_aside(p: &Path) -> std::io::Result<PathBuf> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free .old~N name");
+    for n in 0..100 {
+        let old = PathBuf::from(format!("{}.old~{n}", p.display()));
+        if old.exists() && std::fs::remove_file(&old).is_err() {
+            continue;
         }
-        Err(e) => Err(e),
+        match std::fs::rename(p, &old) {
+            Ok(()) => return Ok(old),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Files an earlier setup moved aside (see `move_aside`): `<file>.old~N` for the files Deskboxes
+/// installs (`files`, relative to `dir`), nothing else.
+fn remove_old_leftovers(dir: &Path, files: &[String]) {
+    let mut by_dir: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> = Default::default();
+    for f in files {
+        let p = dir.join(f);
+        if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+            by_dir.entry(parent.to_path_buf()).or_default().insert(name.to_string_lossy().to_lowercase());
+        }
+    }
+    for (d, names) in by_dir {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let Some((base, n)) = name.rsplit_once(".old~") else { continue };
+            if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) && names.contains(base) && e.path().is_file() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 }
 
-fn remove_old_leftovers(dir: &Path) {
-    fn walk(d: &Path) {
-        let Ok(rd) = std::fs::read_dir(d) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p);
-            } else if p.to_string_lossy().contains(".old~") {
-                let _ = std::fs::remove_file(&p);
+/// Folders a setup unpacked into (`.deskboxes-setup-<pid>`) and did not get to remove.
+fn remove_old_staging(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(pid) = name.strip_prefix(STAGING) {
+            if !pid.is_empty() && pid.bytes().all(|c| c.is_ascii_digit()) && e.path().is_dir() {
+                let _ = std::fs::remove_dir_all(e.path());
             }
         }
     }
-    walk(dir);
+}
+
+const STAGING: &str = ".deskboxes-setup-";
+
+/// Put the unpacked files (`rel`, under `stage`) in place of the installed ones. Each installed
+/// file is moved aside first; if any step fails, everything done so far is put back. Returns the
+/// files moved aside (to delete once the install is through).
+fn replace_files(stage: &Path, dir: &Path, rel: &[String]) -> std::io::Result<Vec<PathBuf>> {
+    let mut done: Vec<(PathBuf, Option<PathBuf>)> = vec![];
+    let undo = |done: &[(PathBuf, Option<PathBuf>)]| {
+        for (dst, aside) in done.iter().rev() {
+            let _ = std::fs::remove_file(dst);
+            if let Some(a) = aside {
+                if let Err(e) = std::fs::rename(a, dst) {
+                    log(&format!("could not put back {}: {e}", dst.display()));
+                }
+            }
+        }
+    };
+    for f in rel {
+        let (src, dst) = (stage.join(f), dir.join(f));
+        let step = (|| -> std::io::Result<Option<PathBuf>> {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let aside = if dst.exists() { Some(move_aside(&dst)?) } else { None };
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                if let Some(a) = &aside {
+                    let _ = std::fs::rename(a, &dst);
+                }
+                return Err(e);
+            }
+            Ok(aside)
+        })();
+        match step {
+            Ok(aside) => done.push((dst, aside)),
+            Err(e) => {
+                log(&format!("replacing {} failed ({e}); putting the installed files back", dst.display()));
+                undo(&done);
+                return Err(e);
+            }
+        }
+    }
+    Ok(done.into_iter().filter_map(|(_, a)| a).collect())
 }
 
 /// Remove `dir` and its parents up to (not including) `stop` while they are empty.
@@ -591,34 +668,57 @@ pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Resu
     report(Report::Step(Step::Closing));
     report(Report::Fraction(0.0));
     let was_running = stop_app(Some(&o.dir))?;
-    if let Some(old) = &old {
-        if old.dir != o.dir {
-            let _ = stop_app(Some(&old.dir));
-        }
+    // (The same folder spelled differently is not another install.)
+    let moved = old.as_ref().is_some_and(|old| !same_dir(&old.dir, &o.dir));
+    if let Some(old) = old.as_ref().filter(|_| moved) {
+        let _ = stop_app(Some(&old.dir));
     }
     check_location(&o.dir)?;
-    remove_old_leftovers(&o.dir);
+    let mut ours: Vec<String> = read_manifest(&o.dir).map(|m| m.files).unwrap_or_default();
+    ours.extend(p.header.files.iter().map(|f| f.path.clone()));
+    ours.push(UNINSTALLER.into());
+    remove_old_leftovers(&o.dir, &ours);
+    remove_old_staging(&o.dir);
     report(Report::Fraction(0.04));
 
-    // 2. Files.
+    // 2. Files: all unpacked and checked in a folder beside the install first; only then do they
+    // replace the installed ones (put back if that fails part way). A damaged setup file or a
+    // full disk leaves the installed version as it was.
     report(Report::Step(Step::Copying));
     let total = p.header.total().max(1);
     let files_total = p.header.files.len();
-    let mut leftovers = vec![];
     let mut files_done = 0usize;
-    p.extract(
-        &o.dir,
-        |path, data| write_file(path, data, &mut leftovers),
-        |bytes| {
-            files_done += 1;
-            report(Report::Copy { files: files_done.min(files_total), files_total });
-            report(Report::Fraction(0.04 + 0.88 * bytes as f32 / total as f32));
-        },
-    )
-    .map_err(|e| Failure::Other(e.to_string()))?;
-    let me = std::env::current_exe().map_err(|e| Failure::Other(e.to_string()))?;
-    let un = crate::payload::program_bytes(&me).map_err(|e| Failure::Other(e.to_string()))?;
-    write_file(&o.dir.join(UNINSTALLER), &un, &mut leftovers).map_err(|e| Failure::Other(e.to_string()))?;
+    let stage = o.dir.join(format!("{STAGING}{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    let unpacked = (|| -> Result<(), String> {
+        std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+        p.extract(
+            &stage,
+            |path, data| std::fs::write(path, data),
+            |bytes| {
+                files_done += 1;
+                report(Report::Copy { files: files_done.min(files_total), files_total });
+                report(Report::Fraction(0.04 + 0.86 * bytes as f32 / total as f32));
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        let un = crate::payload::program_bytes(&me).map_err(|e| e.to_string())?;
+        std::fs::write(stage.join(UNINSTALLER), &un).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = unpacked {
+        let _ = std::fs::remove_dir_all(&stage);
+        log(&format!("unpacking failed: {e}; the installed files are unchanged"));
+        return Err(Failure::Other(e));
+    }
+    let un_len = std::fs::metadata(stage.join(UNINSTALLER)).map(|m| m.len()).unwrap_or(0);
+    let mut rel: Vec<String> = p.header.files.iter().map(|f| f.path.clone()).collect();
+    rel.push(UNINSTALLER.into());
+    let replaced = replace_files(&stage, &o.dir, &rel);
+    let _ = std::fs::remove_dir_all(&stage);
+    let leftovers = replaced.map_err(|e| Failure::Other(e.to_string()))?;
+    report(Report::Fraction(0.91));
 
     // Files of the previous version that this one no longer has.
     let new_files: std::collections::HashSet<String> = p.header.files.iter().map(|f| f.path.to_lowercase()).collect();
@@ -638,8 +738,8 @@ pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Resu
         let _ = std::fs::remove_file(l);
     }
     // Moved to another folder: the old one goes (only the files it listed).
-    if let Some(old) = &old {
-        if old.dir != o.dir && old.dir.join(MANIFEST).exists() {
+    if let Some(old) = old.as_ref().filter(|_| moved) {
+        if old.dir.join(MANIFEST).exists() {
             log(&format!("removing the previous install at {}", old.dir.display()));
             remove_files(&old.dir);
         }
@@ -665,7 +765,7 @@ pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Resu
     } else {
         remove_shortcut_if_ours(Some(&o.dir));
     }
-    let size: u64 = p.header.total() + un.len() as u64;
+    let size: u64 = p.header.total() + un_len;
     register_uninstall(&o.dir, &p.header.app_version, size).map_err(|e| Failure::Other(e.to_string()))?;
     report(Report::Fraction(0.97));
 
@@ -693,6 +793,7 @@ fn remove_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<String> = read_manifest(dir).map(|m| m.files).unwrap_or_default();
     files.push(MANIFEST.into());
     files.push(UNINSTALLER.into());
+    remove_old_staging(dir);
     for f in &files {
         let p = dir.join(f);
         if Some(&p) == me.as_ref() || !p.exists() {
@@ -710,7 +811,7 @@ fn remove_files(dir: &Path) -> Vec<PathBuf> {
             remove_empty_dirs(parent, dir);
         }
     }
-    remove_old_leftovers(dir);
+    remove_old_leftovers(dir, &files);
     let _ = std::fs::remove_dir(dir);
     failed
 }

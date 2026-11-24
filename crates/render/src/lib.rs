@@ -59,6 +59,36 @@ pub struct Gpu {
     labels: std::cell::RefCell<std::collections::HashMap<(usize, String, u32, u32, u32, bool), TextLayout>>,
 }
 
+/// Decode an image file into premultiplied BGRA pixels in memory, scaled by what `scale_for`
+/// returns for its pixel size (<= 1; WIC's Fant scaler). No graphics device needed, so it can run
+/// on another thread (COM initialized there) while the devices are made. Returns the pixels and
+/// the image's ORIGINAL pixel size.
+pub fn decode_image_cpu(path: &str, scale_for: impl FnOnce(u32, u32) -> f32) -> R<(IconImage, (u32, u32))> {
+    unsafe {
+        let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let p = HSTRING::from(path);
+        let dec = wic.CreateDecoderFromFilename(PCWSTR(p.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+        let frame = dec.GetFrame(0)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h)?;
+        let scale = scale_for(w, h).min(1.0);
+        let conv = wic.CreateFormatConverter()?;
+        let (sw, sh) = if scale < 0.999 {
+            let (sw, sh) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
+            let sc = wic.CreateBitmapScaler()?;
+            sc.Initialize(&frame, sw, sh, WICBitmapInterpolationModeFant)?;
+            conv.Initialize(&sc, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+            (sw, sh)
+        } else {
+            conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+            (w, h)
+        };
+        let mut bgra = vec![0u8; (sw as usize) * (sh as usize) * 4];
+        conv.CopyPixels(std::ptr::null(), sw * 4, &mut bgra)?;
+        Ok((IconImage { w: sw, h: sh, bgra }, (w, h)))
+    }
+}
+
 impl Gpu {
     pub fn new() -> R<Gpu> {
         unsafe {

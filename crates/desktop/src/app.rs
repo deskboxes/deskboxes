@@ -21,7 +21,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{EM_GETLINECOUNT, EM_GETSEL, EM_REPLACESEL, EM_SETMARGINS, EM_SETSEL, EM_UNDO};
+use windows::Win32::UI::Controls::{EM_GETLINECOUNT, EM_GETSEL, EM_HIDEBALLOONTIP, EM_REPLACESEL, EM_SETMARGINS, EM_SETSEL, EM_UNDO};
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -92,6 +92,8 @@ const ROLL_ANIM_S: f32 = 0.16;
 pub const GLIDE_S: f32 = 0.18;
 /// A deleted icon shrinking and fading out, s.
 pub const VANISH_S: f32 = 0.22;
+/// A new icon (a file made, a delete undone) growing and fading in, s.
+pub const APPEAR_S: f32 = 0.22;
 /// A box gliding the last few DIPs when it snaps to an edge (or lets go of one), s.
 const SNAP_GLIDE_S: f32 = 0.09;
 
@@ -290,12 +292,13 @@ pub struct BoxEdit {
 /// has it: the name wraps onto more lines, the field grows with it, the I-beam, arrows,
 /// selecting with the mouse, Ctrl+Z, the clipboard all work).
 pub struct ItemRename {
+    /// The field's frame (rounded, Fluent: see rename_frame_proc) and the text box in it.
+    pub frame: HWND,
     pub edit: HWND,
     pub key: ItemKey,
     pub since: Instant,
     font: HFONT,
     brush: HBRUSH,
-    dark: bool,
 }
 
 /// Box background blur presets for the box menu (DIPs).
@@ -369,6 +372,9 @@ pub struct App {
     pub settings_dirty: bool,
     /// Each tab's shown order (A–Z sorted), cached: see `az::Shown`.
     pub shown_cache: RefCell<HashMap<u32, crate::az::Shown>>,
+    /// While a frame is painted (nothing changes meanwhile): each tab's display order once,
+    /// without checking its fingerprint again (hashing every item) on each use.
+    pub paint_memo: RefCell<Option<HashMap<u32, (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>)>>>,
     pub bitmaps: HashMap<u32, Bitmap>,
     pub icon_imgs: HashMap<u32, IconImage>,
     pub layout: MonitorLayout,
@@ -399,6 +405,8 @@ pub struct App {
     /// position, monitor w, h), kept for making blur levels.
     pub wall_src: Option<(Option<(Bitmap, (u32, u32))>, deskboxes_render::Color, i32, u32, u32)>,
     pub wall_sig: String,
+    /// The wallpaper drawn: (file, position, color) for this monitor.
+    pub wall_used: (String, i32, u32),
     /// A small blurred copy of the wallpaper as pixels: w, h, BGRA, monitor px per sample (the
     /// color behind a blending icon).
     pub wall_grid: Option<(u32, u32, Vec<u8>, f32)>,
@@ -432,7 +440,7 @@ pub struct App {
     /// Windows' drag and drop could not start for this drag: ours, on the surface.
     ole_fallback: bool,
     /// Icons an undo is bringing back, and where they go (until they show up, 10 s at most).
-    returning: Option<(Instant, Vec<(ItemKey, Place, usize)>)>,
+    returning: Option<(Instant, Vec<(u32, ItemKey, Place, usize)>)>,
     /// Edit this icon's name once the layout is redrawn (it was just created).
     pub pending_rename: Option<ItemKey>,
     /// "New" chosen in a menu: when, where (point, box), and the icons there were before.
@@ -465,6 +473,8 @@ pub struct App {
     /// A title button's tooltip: text, where, since.
     pub btn_tip: Option<(String, Pt, Instant)>,
     pub vanishing: Vec<Vanish>,
+    /// Icons that have just appeared (see `APPEAR_S`), since when.
+    pub appearing: HashMap<ItemKey, Instant>,
     /// A moved box gliding into a snap: box, offset it is drawn at (from its rect) when the glide
     /// started, start; and the snap correction of the last move.
     pub snap_glide: Option<(u32, Pt, Instant)>,
@@ -483,6 +493,21 @@ pub struct App {
     /// No snapshot to show yet (first run): keep Explorer's icons until the first scan is drawn,
     /// so the desktop is never empty while the cold scan runs.
     pub hide_after_scan: bool,
+    /// The icon snapshot is out of date (items or icons changed since it was written).
+    pub snapshot_dirty: bool,
+    /// The snapshot being written (waited for on the way out).
+    pub snapshot_job: Option<std::thread::JoinHandle<()>>,
+    /// The page a drop or paste waiting for its files was made on.
+    pub pending_drop_page: Option<u32>,
+    /// The menu being shown is a replay of one a stuck shell host never showed (and the one
+    /// waited for is: `menu_wait_replay`).
+    pub replaying_menu: bool,
+    pub menu_wait_replay: bool,
+    /// The box of the icon last clicked (None: a loose one): which folder box a folder in it
+    /// opens in, when the same folder shows in two.
+    pub item_box: Option<u32>,
+    /// The last frame was drawn and committed (Explorer's icons are only hidden behind one).
+    pub frame_ok: bool,
     /// Sort into the default boxes after the first scan (a fresh install; see `template`).
     pub template_pending: bool,
     /// Every frame's draw time (ms), for the stats and the diagnostics overlay.
@@ -738,6 +763,15 @@ unsafe fn register_classes() {
         };
         RegisterClassExW(&wc);
     }
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(rename_frame_proc),
+        hInstance: hinst.into(),
+        lpszClassName: w!("DeskboxesRenameFrame"),
+        hCursor: LoadCursorW(None, IDC_IBEAM).unwrap_or_default(),
+        ..Default::default()
+    };
+    RegisterClassExW(&wc);
 }
 
 /// Create the surface window: a child of Progman covering the primary monitor (desktop mode),
@@ -752,7 +786,7 @@ unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Resu
             WS_EX_NOREDIRECTIONBITMAP,
             class_name(true),
             w!("Deskboxes"),
-            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            WS_CHILD | WS_CLIPSIBLINGS,
             pt.x,
             pt.y,
             mon.right - mon.left,
@@ -772,7 +806,7 @@ unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Resu
             WS_EX_NOREDIRECTIONBITMAP,
             class_name(false),
             w!("Deskboxes (fixture)"),
-            WS_POPUP | WS_VISIBLE | WS_BORDER,
+            WS_POPUP | WS_BORDER,
             mon.left + 80,
             mon.top + 60,
             w,
@@ -785,6 +819,67 @@ unsafe fn create_surface_window(desktop: bool, mon: RECT) -> windows::core::Resu
         let mut pt = POINT::default();
         let _ = ClientToScreen(hw, &mut pt);
         Ok((hw, pt))
+    }
+}
+
+/// The wallpaper read (from the registry) and decoded on a thread of its own, started first thing
+/// (`start_wallpaper_prefetch`); the first `load_wallpaper` takes it.
+struct WallPrefetch {
+    path: String,
+    pos: i32,
+    color: u32,
+    img: Option<(IconImage, (u32, u32))>,
+    ms: f64,
+}
+
+static WALL_PREFETCH: std::sync::Mutex<Option<std::thread::JoinHandle<WallPrefetch>>> = std::sync::Mutex::new(None);
+
+fn start_wallpaper_prefetch(mon: RECT) {
+    let (mw, mh) = ((mon.right - mon.left) as f32, (mon.bottom - mon.top) as f32);
+    let h = std::thread::spawn(move || {
+        let t = Instant::now();
+        let init = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+        let (mut path, mut pos, color) = wallpaper::from_registry();
+        if let Ok(p) = std::env::var("DESKBOXES_WALLPAPER") {
+            path = p;
+            pos = 4;
+        }
+        // Decoded at its on-screen size, never larger.
+        let img = if path.is_empty() {
+            None
+        } else {
+            deskboxes_render::decode_image_cpu(&path, |iw, ih| {
+                let r = deskboxes_render::wallpaper_rect(pos, iw as f32, ih as f32, mw, mh);
+                ((r.right - r.left) / iw as f32).max((r.bottom - r.top) / ih as f32)
+            })
+            .map_err(|e| log::warn!("wallpaper {path}: {e}"))
+            .ok()
+        };
+        if init.is_ok() {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+        WallPrefetch { path, pos, color, img, ms: t.elapsed().as_secs_f64() * 1000.0 }
+    });
+    if let Ok(mut g) = WALL_PREFETCH.lock() {
+        *g = Some(h);
+    }
+}
+
+/// How long ago this user signed in to Windows, s (for a start at sign-in: how long it took).
+fn seconds_since_sign_in() -> Option<f64> {
+    unsafe {
+        use windows::Win32::System::RemoteDesktop::*;
+        let mut buf = windows::core::PWSTR::null();
+        let mut n = 0u32;
+        WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), WTS_CURRENT_SESSION, WTSSessionInfo, &mut buf, &mut n).ok()?;
+        if buf.is_null() || (n as usize) < std::mem::size_of::<WTSINFOW>() {
+            return None;
+        }
+        let logon = (*(buf.0 as *const WTSINFOW)).LogonTime;
+        WTSFreeMemory(buf.0 as _);
+        let now = windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime();
+        let now = ((now.dwHighDateTime as i64) << 32) | now.dwLowDateTime as i64;
+        (logon > 0 && now > logon).then(|| (now - logon) as f64 / 1e7)
     }
 }
 
@@ -852,6 +947,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
+    // The wallpaper read and decoded on its own thread from here on: at sign-in that took most of
+    // the time before the first frame (2.4 s of 2.7 s on the dev PC), and nothing was on screen
+    // until it was done.
+    start_wallpaper_prefetch(primary_monitor().0);
+    let since_sign_in = if real_desktop { seconds_since_sign_in() } else { None };
     let desktop_mode = !args.window;
     let fixture = args.desktop_dir.clone();
     let lang = Lang::pick(&settings.language, windows::Win32::Globalization::GetUserDefaultUILanguage());
@@ -881,6 +981,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         }
     };
     log::info!("MEM after graphics devices: private/working set {:.1?} MB", mem_mb());
+    let t_devices = t0.elapsed().as_secs_f64() * 1000.0;
     let (mon_full, work_px) = primary_monitor();
     let (hwnd, origin_px) = match create_surface_window(desktop_mode, mon_full) {
         Ok(x) => x,
@@ -896,6 +997,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let _ = GetClientRect(hwnd, &mut cr);
     let (wpx, hpx) = ((cr.right - cr.left) as u32, (cr.bottom - cr.top) as u32);
     let surf = Surface::new(&gpu, hwnd, wpx, hpx).ok();
+    let t_window = t0.elapsed().as_secs_f64() * 1000.0;
     let size_dip = (wpx as f32 / scale, hpx as f32 / scale);
     let work = if desktop_mode {
         Rect::new(
@@ -937,8 +1039,17 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let az_bar_on_tf = gpu.text_format("Segoe UI", 11.5, true).expect("text format");
     let glyph_tf = gpu.text_format("Segoe Fluent Icons", 12.0, false).or_else(|_| gpu.text_format("Segoe MDL2 Assets", 12.0, false)).expect("text format");
     let line_h = gpu.label(&label_tf, "Ag", 200.0, 100.0, 1, true).map(|l| deskboxes_render::text_height(&l)).unwrap_or(font.1 * 1.33);
+    let t_text = t0.elapsed().as_secs_f64() * 1000.0;
     let topology = format!("primary-{}x{}-{}", mon_full.right - mon_full.left, mon_full.bottom - mon_full.top, dpi);
-    let lay = persist::load_layout(&paths.layouts, &topology).unwrap_or_default();
+    let lay = match persist::load_layout_checked(&paths.layouts, &topology) {
+        Ok(l) => l.unwrap_or_default(),
+        Err(e) => {
+            // Not overwritten unseen: a copy stays next to it (a newer version's layout, say).
+            let kept = persist::keep_unreadable(&persist::layout_path(&paths.layouts, &topology));
+            log::warn!("layout {topology} unreadable ({e}): starting empty; the file is kept as {kept:?}");
+            Default::default()
+        }
+    };
     let first_run = !persist::layout_path(&paths.layouts, &topology).exists();
     let template_pending = args.first_run_template || (fresh_install && first_run && args.desktop_dir.is_none());
     let seed: Vec<Item> = snap.as_ref().filter(|s| s.icon_px == icon_px).map(|s| s.items.clone()).unwrap_or_default();
@@ -987,6 +1098,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         prep_gen: u64::MAX,
         settings_dirty: false,
         shown_cache: RefCell::new(HashMap::new()),
+        paint_memo: RefCell::new(None),
         bitmaps: HashMap::new(),
         icon_imgs: HashMap::new(),
         layout: lay,
@@ -1011,6 +1123,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         backdrop_down: 4,
         wall_src: None,
         wall_sig: String::new(),
+        wall_used: Default::default(),
         wall_grid: None,
         fx_cache: RefCell::new(HashMap::new()),
         light,
@@ -1049,6 +1162,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         tab_grow: None,
         btn_tip: None,
         vanishing: vec![],
+        appearing: HashMap::new(),
         snap_glide: None,
         snap_delta: Pt { x: 0.0, y: 0.0 },
         hover_hdr: None,
@@ -1060,6 +1174,13 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         scanned_once: false,
         quitting: false,
         hide_after_scan: false,
+        snapshot_dirty: false,
+        snapshot_job: None,
+        pending_drop_page: None,
+        replaying_menu: false,
+        menu_wait_replay: false,
+        item_box: None,
+        frame_ok: false,
         template_pending,
         draw_times: Vec::new(),
         frame_marks: std::collections::VecDeque::new(),
@@ -1115,6 +1236,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         host_prefetch: None,
         seeded,
     };
+    let t_init = t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(s) = snap {
         app.stats.snapshot_items = s.items.len();
         for (i, img) in s.icons.into_iter().enumerate() {
@@ -1129,9 +1251,19 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         }
     }
     app.diag = app.args.diagnostics;
+    let t_snapshot = t0.elapsed().as_secs_f64() * 1000.0;
     app.load_wallpaper();
+    let t_wall = t0.elapsed().as_secs_f64() * 1000.0;
     app.draw();
+    // Shown only now, with its first frame: created visible, the empty surface covered the
+    // desktop (gray) until the first frame, seconds at sign-in.
+    let _ = ShowWindow(app.hwnd, if desktop_mode { SW_SHOWNA } else { SW_SHOW });
     app.stats.first_paint_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    log::info!(
+        "PHASE startup_steps devices={t_devices:.0} window={t_window:.0} text={t_text:.0} init={t_init:.0} snapshot={t_snapshot:.0} wallpaper={t_wall:.0} shown={:.0} (ms since start){}",
+        app.stats.first_paint_ms,
+        since_sign_in.map(|s| format!("; started {s:.1} s after sign-in")).unwrap_or_default()
+    );
     log::info!("MEM after first paint: private/working set {:.1?} MB", mem_mb());
     log::info!(
         "PHASE first_paint ms={:.1} snapshot_items={} desktop_mode={desktop_mode} dpi={dpi}",
@@ -1144,6 +1276,9 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     if desktop_mode && !app.args.no_hide && app.stats.snapshot_items == 0 {
         app.hide_after_scan = true;
         log::info!("no snapshot: native icons stay until the first scan is drawn");
+    } else if desktop_mode && !app.args.no_hide && !app.frame_ok {
+        app.hide_after_scan = true;
+        log::warn!("the first frame was not drawn: native icons stay until a scan is drawn");
     } else if desktop_mode && !app.args.no_hide {
         let th = Instant::now();
         let s = hide::set_hidden(true);
@@ -1191,35 +1326,59 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
 }
 
 impl App {
-    pub fn load_wallpaper(&mut self) {
+    /// This monitor's wallpaper from Explorer (`IDesktopWallpaper`): (file, position, color).
+    fn monitor_wallpaper(&self) -> (String, i32, u32) {
         let mons = wallpaper::monitors();
         let m = mons.iter().find(|m| m.rect.left == self.mon.left && m.rect.top == self.mon.top).or(mons.first()).cloned();
-        let (mw, mh) = ((self.mon.right - self.mon.left) as u32, (self.mon.bottom - self.mon.top) as u32);
         let (mut path, mut pos, color) = m.map(|m| (m.path, m.position, m.color)).unwrap_or_default();
         // DESKBOXES_WALLPAPER: a test copy on another picture (filled), for screenshots.
         if let Ok(p) = std::env::var("DESKBOXES_WALLPAPER") {
             path = p;
             pos = 4;
         }
+        (path, pos, color)
+    }
+
+    pub fn load_wallpaper(&mut self) {
+        let (mw, mh) = ((self.mon.right - self.mon.left) as u32, (self.mon.bottom - self.mon.top) as u32);
+        let t = Instant::now();
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        // At start: what the prefetch thread read and decoded (see `start_wallpaper_prefetch`).
+        let pre = WALL_PREFETCH.lock().ok().and_then(|mut g| g.take()).and_then(|h| h.join().ok());
+        let prefetched = pre.is_some();
+        let (path, pos, color, img, how) = match pre {
+            Some(p) => {
+                let img = p.img.and_then(|(im, o)| self.gpu.bitmap(&im).map_err(|e| log::warn!("wallpaper upload: {e}")).ok().map(|b| (b, o)));
+                let how = format!("prefetched in {:.0} ms, waited {:.0} ms", p.ms, ms(t));
+                (p.path, p.pos, p.color, img, how)
+            }
+            None => {
+                let (path, pos, color) = self.monitor_wallpaper();
+                let t_info = ms(t);
+                // Decoded at its on-screen size, never larger.
+                let img = if path.is_empty() {
+                    None
+                } else {
+                    let scale = self
+                        .gpu
+                        .image_size(&path)
+                        .map(|(iw, ih)| {
+                            let r = deskboxes_render::wallpaper_rect(pos, iw as f32, ih as f32, mw as f32, mh as f32);
+                            ((r.right - r.left) / iw as f32).max((r.bottom - r.top) / ih as f32)
+                        })
+                        .unwrap_or(1.0)
+                        .min(1.0);
+                    self.gpu.load_image_scaled(&path, scale).map_err(|e| log::warn!("wallpaper {path}: {e}")).ok()
+                };
+                let how = format!("info {t_info:.0} ms, decoded {:.0} ms", ms(t) - t_info);
+                (path, pos, color, img, how)
+            }
+        };
+        let t_draw = Instant::now();
         let bg = deskboxes_render::rgba((color & 0xff) as u8, ((color >> 8) & 0xff) as u8, ((color >> 16) & 0xff) as u8, 1.0);
         // We draw the wallpaper ourselves in both modes. On the desktop, Windows 11 (24H2+) paints
         // the wallpaper in a separate child of Progman that our full-screen surface covers, so it is
         // not visible through our transparent pixels (seen on 26300: a black desktop, 2026-11-19).
-        // Decoded at its on-screen size, never larger.
-        let img = if path.is_empty() {
-            None
-        } else {
-            let scale = self
-                .gpu
-                .image_size(&path)
-                .map(|(iw, ih)| {
-                    let r = deskboxes_render::wallpaper_rect(pos, iw as f32, ih as f32, mw as f32, mh as f32);
-                    ((r.right - r.left) / iw as f32).max((r.bottom - r.top) / ih as f32)
-                })
-                .unwrap_or(1.0)
-                .min(1.0);
-            self.gpu.load_image_scaled(&path, scale).map_err(|e| log::warn!("wallpaper {path}: {e}")).ok()
-        };
         self.wall = self
             .gpu
             .offscreen(mw, mh, |dc| unsafe {
@@ -1243,9 +1402,25 @@ impl App {
             .ok();
         self.fx_cache.borrow_mut().clear();
         self.wall_src = Some((img, bg, pos, mw, mh));
-        self.wall_sig = Self::wallpaper_sig();
+        if prefetched {
+            // Read from the registry, not from Explorer: Explorer's answer is checked a little
+            // later (`wallpaper_check`), when it is less busy and the desktop is on screen.
+            self.wall_sig = String::new();
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), T_WALLPAPER, 3000, None);
+            }
+        } else {
+            self.wall_sig = Self::wallpaper_sig();
+        }
+        let t_fx = ms(t_draw);
         self.ensure_backdrops();
-        log::info!("wallpaper '{path}' pos={pos} backdrops={}; MEM private/working set {:.1?} MB", self.backdrops.len(), mem_mb());
+        log::info!(
+            "wallpaper '{path}' pos={pos} backdrops={} ({how}; drawn and colors {t_fx:.0} ms, backdrops {:.0} ms); MEM private/working set {:.1?} MB",
+            self.backdrops.len(),
+            ms(t_draw) - t_fx,
+            mem_mb()
+        );
+        self.wall_used = (path, pos, color);
     }
 
     /// Blurred copies of the wallpaper for the blur levels in use, made from the decoded
@@ -1292,12 +1467,19 @@ impl App {
     /// The wallpaper may have changed: load it again if it did.
     pub fn wallpaper_check(&mut self) {
         let sig = Self::wallpaper_sig();
-        if sig != self.wall_sig {
-            log::info!("wallpaper changed");
-            self.load_wallpaper();
-            self.fx_cache.borrow_mut().clear();
-            self.invalidate();
+        if sig == self.wall_sig {
+            return;
         }
+        // The first check after a start that drew the wallpaper the registry names: Explorer's
+        // answer is the same one (the usual case), nothing to load again.
+        if self.wall_sig.is_empty() && self.monitor_wallpaper() == self.wall_used {
+            self.wall_sig = sig;
+            return;
+        }
+        log::info!("wallpaper changed");
+        self.load_wallpaper();
+        self.fx_cache.borrow_mut().clear();
+        self.invalidate();
     }
 
     pub fn invalidate(&mut self) {
@@ -1853,7 +2035,11 @@ impl App {
 
     /// Recompute where loose icons would settle with the dragged box where it is now.
     pub(crate) fn update_preview(&mut self) {
+        // Settling works on the page shown alone: the other pages are not copied along (on every
+        // pointer move of a box drag, with many full pages, that was most of the work).
+        let parked = std::mem::take(&mut self.layout.parked);
         let mut l = self.layout.clone();
+        self.layout.parked = parked;
         layout::settle(&mut l, &self.grid);
         self.preview_loose = Some(l.loose);
     }
@@ -1877,6 +2063,7 @@ impl App {
             || self.scroll_animating()
             || (matches!(self.drag, Drag::MoveBox { .. }) && self.move_t0.elapsed().as_secs_f32() < LIFT_S)
             || !self.vanishing.is_empty()
+            || !self.appearing.is_empty()
             || self.box_edit.as_ref().map(|e| e.since.elapsed().as_secs_f32() < EDIT_FADE_S).unwrap_or(false)
     }
 
@@ -1948,7 +2135,7 @@ impl App {
         }
     }
 
-    fn locks_of(&self, id: u32) -> deskboxes_core::model::BoxLocks {
+    pub(crate) fn locks_of(&self, id: u32) -> deskboxes_core::model::BoxLocks {
         self.box_by_id(id).map(|b| self.locks(b)).unwrap_or_default()
     }
 
@@ -2712,7 +2899,9 @@ impl App {
     /// Icons that appeared since the last scan (not ones dropped somewhere on purpose): sorted
     /// by the rules; with "keep sorted" every icon is.
     fn sort_new_items(&mut self, old: &BTreeSet<ItemKey>, dropped: &[ItemKey]) -> bool {
-        let appeared: BTreeSet<ItemKey> = if old.is_empty() {
+        // (The first scan with nothing known before: everything is "new", nothing appeared. A
+        // desktop scanned empty before is another thing: its first file did appear.)
+        let appeared: BTreeSet<ItemKey> = if old.is_empty() && !self.scanned_once {
             BTreeSet::new()
         } else {
             self.items.keys().filter(|k| !old.contains(*k) && !dropped.contains(*k)).cloned().collect()
@@ -2770,10 +2959,14 @@ impl App {
         self.write_scene();
     }
 
-    pub fn save_snapshot(&self) {
-        if !self.scanned_once {
+    /// The icon snapshot (for a fast next start), when its items or icons changed since it was
+    /// last written (a layout change alone does not touch it). Encoded and written off the UI
+    /// thread.
+    pub fn save_snapshot(&mut self) {
+        if !self.scanned_once || !self.snapshot_dirty {
             return;
         }
+        self.snapshot_dirty = false;
         // Icon ids are renumbered densely for the snapshot.
         let used: std::collections::HashSet<u32> = self.items.values().map(|i| i.icon).collect();
         let mut ids: Vec<u32> = self.icon_imgs.keys().copied().filter(|id| used.contains(id)).collect();
@@ -2799,8 +2992,18 @@ impl App {
                 .collect(),
             icons: ids.iter().map(|id| self.icon_imgs[id].clone()).collect(),
         };
-        if let Err(e) = persist::write_atomic(&self.paths.snapshot, &s.encode()) {
-            log::warn!("save snapshot: {e}");
+        let path = self.paths.snapshot.clone();
+        // (One write at a time: two would share the temporary file.)
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let r = std::thread::Builder::new().name("snapshot".into()).spawn(move || {
+            let _g = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = persist::write_atomic(&path, &s.encode()) {
+                log::warn!("save snapshot: {e}");
+            }
+        });
+        match r {
+            Ok(j) => self.snapshot_job = Some(j),
+            Err(e) => log::warn!("save snapshot: no thread: {e}"),
         }
     }
 
@@ -2823,7 +3026,11 @@ impl App {
             .layout
             .boxes
             .iter()
-            .map(|b| json!({ "id": b.id, "rect": px(b.rect), "tabs": b.tabs.iter().map(|t| json!({"title": t.title, "items": t.items.len()})).collect::<Vec<_>>(), "active": b.active_tab, "view": b.view, "icon_size": b.icon_size }))
+            .map(|b| {
+                let hl = self.header_layout(b);
+                let tabs: Vec<Value> = b.tabs.iter().enumerate().map(|(i, t)| json!({"title": t.title, "items": t.items.len(), "rect": hl.tabs.get(i).map(|r| px(*r))})).collect();
+                json!({ "id": b.id, "rect": px(b.rect), "tabs": tabs, "active": b.active_tab, "view": b.view, "icon_size": b.icon_size })
+            })
             .collect();
         let v = json!({ "items": items, "boxes": boxes, "scale": self.scale, "loose": self.layout.loose.len() });
         let _ = persist::write_atomic(p, serde_json::to_string_pretty(&v).unwrap_or_default().as_bytes());
@@ -2867,11 +3074,63 @@ impl App {
 
     pub fn vanish_animating(&mut self) -> bool {
         self.vanishing.retain(|v| v.t0.elapsed().as_secs_f32() < VANISH_S);
-        !self.vanishing.is_empty()
+        self.appearing.retain(|_, t0| t0.elapsed().as_secs_f32() < APPEAR_S);
+        !self.vanishing.is_empty() || !self.appearing.is_empty()
+    }
+
+    /// Icons this scan adds grow and fade in where they go (the mirror of `capture_vanishing`).
+    /// Not on the first scan, not for many at once, and not when the same scan removes icons
+    /// (a rename or a move shows as remove + add).
+    fn capture_appearing(&mut self, old: &BTreeSet<ItemKey>, first: bool) {
+        if first || !self.scanned_once || old.is_empty() || !self.settings.show_icons || !crate::pages::windows_animates() {
+            return;
+        }
+        if old.iter().any(|k| !self.items.contains_key(k)) {
+            return;
+        }
+        let added: Vec<ItemKey> = self.items.keys().filter(|k| !old.contains(*k)).cloned().collect();
+        if added.is_empty() || added.len() > 64 {
+            return;
+        }
+        let now = Instant::now();
+        for k in added {
+            self.appearing.insert(k, now);
+        }
+        crate::anim::set(true);
+        self.invalidate();
+    }
+
+    /// How far an appearing icon is (eased 0..1; 1 = there, or not appearing).
+    pub fn appear_t(&self, k: &ItemKey) -> f32 {
+        match self.appearing.get(k) {
+            Some(t0) => ease_out(t0.elapsed().as_secs_f32() / APPEAR_S),
+            None => 1.0,
+        }
+    }
+
+    /// Icon images no item uses any more (thumbnails of files gone or changed, a folder box's
+    /// last folder) go, on the CPU and the GPU: unless the worker may hand their id out again
+    /// (`keep`), or a size of one still used is made from them.
+    pub fn evict_icons(&mut self, keep: &[u32]) {
+        let mut live: std::collections::HashSet<u32> = keep.iter().copied().collect();
+        live.extend(self.items.values().map(|i| i.icon));
+        self.views.sized.retain(|(base, _), _| live.contains(base));
+        self.views.pending.retain(|(base, _)| live.contains(base));
+        live.extend(self.views.sized.values().copied());
+        let (n_img, n_bmp) = (self.icon_imgs.len(), self.bitmaps.len());
+        self.icon_imgs.retain(|id, _| live.contains(id));
+        self.bitmaps.retain(|id, _| live.contains(id));
+        let (d_img, d_bmp) = (n_img - self.icon_imgs.len(), n_bmp - self.bitmaps.len());
+        if d_img + d_bmp > 0 {
+            log::info!("icons let go: {d_img} image(s), {d_bmp} bitmap(s); {} / {} kept", self.icon_imgs.len(), self.bitmaps.len());
+            self.snapshot_dirty = true;
+        }
     }
 
     fn apply_scan(&mut self, items: Vec<Item>, icons: Vec<(u32, IconImage)>, native: Option<deskboxes_shell::view::NativeView>, ms: f64, first: bool) {
         let t = Instant::now();
+        // What the icon snapshot holds may have changed.
+        self.snapshot_dirty = true;
         if first && !self.seeded {
             // The worker numbers icons independently of an unusable snapshot: replace the table.
             self.bitmaps.clear();
@@ -2899,6 +3158,7 @@ impl App {
             new_items.insert(it.key.clone(), it);
         }
         self.items = new_items;
+        self.capture_appearing(&old, first);
         self.items_gen += 1;
         self.shown_cache.borrow_mut().clear();
         if renamed || first {
@@ -2934,12 +3194,15 @@ impl App {
                 let fresh: Vec<ItemKey> = present.iter().filter(|k| !old.contains(*k) && !self.known_before_drop.contains(*k)).cloned().collect();
                 dropped = fresh.clone();
                 if !fresh.is_empty() {
-                    match bx {
+                    // On the page it was dropped on, even if another is shown by now.
+                    let g = self.grid;
+                    let page = self.pending_drop_page.take().filter(|p| deskboxes_core::pages::index_of(&self.layout, *p).is_some()).unwrap_or(self.layout.page);
+                    deskboxes_core::pages::with_page(&mut self.layout, page, |l| match bx {
                         Some(id) => {
-                            layout::move_to_box(&mut self.layout, &fresh, id, None);
+                            layout::move_to_box(l, &fresh, id, None);
                         }
-                        None => layout::move_to_grid(&mut self.layout, &fresh, self.grid.cell_at(at), &self.grid),
-                    }
+                        None => layout::move_to_grid(l, &fresh, g.cell_at(at), &g),
+                    });
                     self.pending_drop = None;
                 }
             } else {
@@ -2971,7 +3234,7 @@ impl App {
         dropped.extend(back.iter().cloned());
         self.no_glide.extend(back);
         // A new icon named after "New": the rules sort it now.
-        let renamed_new = self.sort_after_rename.clone().filter(|k| self.rename.as_ref().map(|r| &r.key) != Some(k) && !old.is_empty());
+        let renamed_new = self.sort_after_rename.clone().filter(|k| self.rename.as_ref().map(|r| &r.key) != Some(k) && (self.scanned_once || !old.is_empty()));
         let changed = self.reconcile_pages(&present);
         let changed = self.sort_new_items(&old, &dropped) | changed;
         let changed = match renamed_new {
@@ -3020,6 +3283,10 @@ impl App {
         if first && self.hide_after_scan {
             self.hide_after_scan = false;
             self.draw();
+            if !self.frame_ok {
+                log::warn!("the first scan could not be drawn: Explorer's icons stay");
+                return;
+            }
             let th = Instant::now();
             let s = hide::set_hidden(true);
             self.stats.hide_ms = th.elapsed().as_secs_f64() * 1000.0;
@@ -3173,11 +3440,11 @@ impl App {
                 if self.settings.saved.in_menu {
                     // Saved layouts: save now, go back to one of the newest, or manage them.
                     let mut sv = vec![json!({ "id": "dbx.savenow", "text": t(self.lang, S::SaveLayoutNow), "glyph": "\u{E74E}" })];
-                    let list = self.saved_layouts();
+                    let list = self.newest_saved_ids(8);
                     if !list.is_empty() {
                         sv.push(json!({ "separator": true }));
-                        for s in list.iter().take(8) {
-                            sv.push(json!({ "id": format!("dbx.restore:{}", s.id), "text": s.when, "glyph": "\u{E81C}" }));
+                        for id in list {
+                            sv.push(json!({ "id": format!("dbx.restore:{id}"), "text": crate::saved::shown(id), "glyph": "\u{E81C}" }));
                         }
                     }
                     sv.push(json!({ "separator": true }));
@@ -3305,7 +3572,9 @@ impl App {
         // every desktop page (another page's: its name after it).
         let cur_page = self.layout.page;
         let page_names: HashMap<u32, String> = deskboxes_core::pages::ids(&self.layout).into_iter().map(|p| (p, self.page_title(p))).collect();
+        // (Not a folder box's: desktop icons never go into one.)
         let targets: Vec<Value> = deskboxes_core::pages::all_boxes(&self.layout)
+            .filter(|(_, b)| !b.is_folder())
             .flat_map(|(p, b)| {
                 let page = (p != cur_page).then(|| page_names.get(&p).cloned()).flatten();
                 b.tabs.iter().map(move |t| {
@@ -3685,8 +3954,9 @@ impl App {
             }
             ("default", "applyAll") => {
                 let st = self.settings.default_style.clone();
+                // Every page's boxes (one undo step).
                 self.change_layout(|l, _| {
-                    for b in l.boxes.iter_mut() {
+                    for b in l.boxes.iter_mut().chain(l.parked.values_mut().flat_map(|c| c.boxes.iter_mut())) {
                         b.style = st.clone();
                     }
                 });
@@ -3719,7 +3989,7 @@ impl App {
             ("rules", "add") => {
                 // A new rule for the first tab not yet used by a rule (or the first tab).
                 let used: Vec<u32> = self.layout.rules.iter().map(|r| r.target).collect();
-                let tabs: Vec<u32> = self.layout.boxes.iter().flat_map(|b| b.tabs.iter().map(|t| t.id)).collect();
+                let tabs: Vec<u32> = self.layout.boxes.iter().filter(|b| !b.is_folder()).flat_map(|b| b.tabs.iter().map(|t| t.id)).collect();
                 let target = tabs.iter().copied().find(|t| !used.contains(t)).or(tabs.first().copied()).unwrap_or(0);
                 self.change_layout(|l, _| {
                     deskboxes_core::rules::new_rule(l, "type", "documents", target);
@@ -3782,7 +4052,7 @@ impl App {
         let folder_items = items.iter().any(|p| self.items.values().any(|i| i.source == Source::Folder && i.parsing_name == *p));
         if !folder_items {
             v.push(json!({ "id": "dbx.boxfromsel", "text": t(self.lang, S::BoxFromSelection), "glyph": "\u{E8A9}", "placement": "beforeProperties" }));
-            if self.pages_on() {
+            if self.pages_on() && self.icons_movable(&self.sel.ordered(&self.order()), None) {
                 v.push(self.move_to_page_entry("dbx.pageitems:", Some("beforeProperties")));
             }
         }
@@ -3923,7 +4193,8 @@ impl App {
             { "separator": true },
             { "id": "dbx.lockall", "text": t(l, S::LockEverything), "checkable": true, "checked": self.settings.lock_all },
         ] }));
-        if self.pages_on() {
+        // (A box locked in place stays on its page too.)
+        if self.pages_on() && !self.locks(b).position {
             sub.push(self.move_to_page_entry("dbx.pagebox:", None));
         }
         sub.push(json!({ "separator": true }));
@@ -4039,6 +4310,7 @@ impl App {
                 log::info!("menu {id} asked for");
                 self.menu = Some((id, MenuCtx { at, hit, new_rect }));
                 self.menu_wait = Some((id, ask));
+                self.menu_wait_replay = self.replaying_menu;
                 unsafe {
                     SetTimer(Some(self.msg_hwnd), T_MENU_WAIT, MENU_WAIT_MS, None);
                 }
@@ -4065,7 +4337,13 @@ impl App {
         }
         let Some((id, ask)) = self.menu_wait.take() else { return };
         log::warn!("menu {id} not shown in {MENU_WAIT_MS} ms: the shell host is stuck; starting a new one");
-        self.menu_replay = Some((Instant::now(), ask));
+        // Shown again by the new host once; a menu that hangs that one too is let go (else one
+        // click could use up every host restart).
+        if std::mem::take(&mut self.menu_wait_replay) {
+            log::warn!("menu {id} was already a replay: not asked for again");
+        } else {
+            self.menu_replay = Some((Instant::now(), ask));
+        }
         self.menu = None;
         if let Some(c) = self.host_child.as_mut() {
             let _ = c.kill();
@@ -4078,6 +4356,10 @@ impl App {
             "ready" => {
                 self.stats.host_ready_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
                 log::info!("PHASE host_ready ms={:.1}", self.stats.host_ready_ms);
+                // Tests: Settings opened as soon as the host is there.
+                if self.args.open_settings {
+                    self.send_settings(true, None);
+                }
             }
             "shown" => {
                 log::info!("menu {} shown in {} ms", v["id"], v["ms"]);
@@ -4155,6 +4437,7 @@ impl App {
             "paste" | "pastelink" => {
                 let (x, y) = self.to_screen(at);
                 self.pending_drop = Some((Instant::now(), at, box_id));
+                self.pending_drop_page = Some(self.layout.page);
                 self.known_before_drop = self.items.keys().cloned().collect();
                 let _ = self.worker.send(Req::Paste {
                     folder: self.args.desktop_dir.as_ref().map(|d| d.display().to_string()),
@@ -4417,8 +4700,11 @@ impl App {
             c if c.starts_with("dbx.view:") || c.starts_with("dbx.allview:") => {
                 let (k, v) = c.split_once(':').unwrap_or(("", ""));
                 if let Some((view, size)) = crate::views::preset(v) {
-                    let ids: Vec<u32> = if k == "dbx.allview" { self.layout.boxes.iter().map(|b| b.id).collect() } else { box_id.into_iter().collect() };
-                    self.set_box_view(&ids, view, size);
+                    if k == "dbx.allview" {
+                        self.set_all_box_views(view, size);
+                    } else {
+                        self.set_box_view(&box_id.into_iter().collect::<Vec<_>>(), view, size);
+                    }
                 }
             }
             "iconsize.large" => self.set_icon_size(48),
@@ -4566,7 +4852,10 @@ impl App {
         self.labels.clear();
         self.label_bmps.clear();
         log::info!("icon size -> {dip} DIP ({} px)", self.icon_px);
-        let _ = self.worker.send(Req::IconSize { dip, px: self.icon_px });
+        // Explorer's desktop gets the size too only when this is the real desktop (a fixture
+        // or a window keeps it to itself).
+        let explorer = self.desktop_mode && self.args.desktop_dir.is_none();
+        let _ = self.worker.send(Req::IconSize { dip, px: self.icon_px, explorer });
         self.invalidate();
     }
 
@@ -4591,7 +4880,7 @@ impl App {
     /// and moves into folders, the Recycle Bin and renames on disk.
     fn undo(&mut self) {
         match self.hist.undo(&mut self.layout) {
-            Some(Step::Layout) => self.layout_changed(),
+            Some(Step::Layout) => self.layout_restored(),
             Some(Step::Files(s)) => self.run_file_step(s, true),
             None => {}
         }
@@ -4599,10 +4888,34 @@ impl App {
 
     fn redo(&mut self) {
         match self.hist.redo(&mut self.layout) {
-            Some(Step::Layout) => self.layout_changed(),
+            Some(Step::Layout) => self.layout_restored(),
             Some(Step::Files(s)) => self.run_file_step(s, false),
             None => {}
         }
+    }
+
+    /// The desktop's own items (not a folder box's), by name: what reconciliation places.
+    pub fn present_keys(&self) -> Vec<ItemKey> {
+        let mut v: Vec<&Item> = self.items.values().filter(|i| i.source != Source::Folder).collect();
+        v.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+        v.into_iter().map(|i| i.key.clone()).collect()
+    }
+
+    /// A layout from the undo history is back. It was saved before files came or went since:
+    /// they are placed or let go now, as a scan would. Pages it has come back with stay
+    /// reachable (an undone "turn pages off").
+    fn layout_restored(&mut self) {
+        if self.scanned_once {
+            let present = self.present_keys();
+            self.reconcile_pages(&present);
+        }
+        if deskboxes_core::pages::count(&self.layout) > 1 && !self.settings.pages.enabled {
+            log::info!("undo brought back {} pages: pages on again", deskboxes_core::pages::count(&self.layout));
+            self.settings.pages.enabled = true;
+            self.save_settings_soon();
+            self.send_settings(false, None);
+        }
+        self.layout_changed();
     }
 
     /// The menu's "Undo Move" / "Redo Delete" for a file step next ("" for a layout change: plain Undo).
@@ -4626,29 +4939,33 @@ impl App {
         let _ = self.worker.send(Req::UndoFiles { op: s.op, undo });
     }
 
-    /// A file operation went through: a new one goes into the undo history with where its icons
-    /// were; an undone or redone one keeps what really happened (new names, bin files).
-    pub fn on_file_done(&mut self, op: FileOp, undo: Option<bool>) {
-        if let Some(u) = undo {
-            self.hist.update_last(u, op);
-            return;
-        }
+    /// A new file operation went through: into the undo history with where its icons were (on
+    /// whichever page).
+    pub fn on_file_done(&mut self, op: FileOp) {
         let froms: Vec<String> = match &op {
-            FileOp::Moved(v) | FileOp::Recycled(v) => v.iter().map(|(a, _)| a.to_lowercase()).collect(),
+            FileOp::Moved(v) | FileOp::Recycled(v) => v.iter().map(|m| m.from.to_lowercase()).collect(),
             FileOp::Copied(_) | FileOp::Renamed(..) => vec![],
         };
         let mut places = vec![];
         for it in self.items.values().filter(|i| froms.contains(&i.parsing_name.to_lowercase())) {
-            if let Some(p) = layout::place_of(&self.layout, &it.key) {
-                let ix = match &p {
-                    Place::Box { box_id, .. } => self.box_by_id(*box_id).and_then(|b| b.contains(&it.key)).map(|(_, i)| i).unwrap_or(0),
-                    Place::Grid(_) => 0,
-                };
-                places.push((it.key.clone(), p, ix));
+            if let Some((page, p, ix)) = deskboxes_core::pages::find_item(&self.layout, &it.key) {
+                places.push((page, it.key.clone(), p, ix));
             }
         }
         log::info!("undo step: {op:?}, {} icon place(s)", places.len());
         self.hist.record_files(FileStep { op, places });
+    }
+
+    /// An undo or redo of a file operation finished: the history keeps what really went through
+    /// (new names, bin files), or offers the same step again if nothing did.
+    pub fn on_file_step_done(&mut self, op: Option<FileOp>, undo: bool) {
+        if op.is_none() {
+            log::warn!("{} of a file operation: nothing went through", if undo { "undo" } else { "redo" });
+            if undo {
+                self.returning = None;
+            }
+        }
+        self.hist.files_done(undo, op);
     }
 
     /// Icons an undo brought back (from a folder, the Recycle Bin): put at their old place.
@@ -4657,25 +4974,32 @@ impl App {
         if when.elapsed().as_secs() >= 10 {
             return vec![];
         }
-        let (mut back, rest): (Vec<_>, Vec<_>) = places.drain(..).partition(|(k, _, _)| present.contains(k) && !old.contains(k));
+        let (mut back, rest): (Vec<_>, Vec<_>) = places.drain(..).partition(|(_, k, _, _)| present.contains(k) && !old.contains(k));
         if !rest.is_empty() {
             self.returning = Some((when, rest));
         }
-        back.sort_by_key(|(_, _, ix)| *ix);
+        back.sort_by_key(|(_, _, _, ix)| *ix);
         if !back.is_empty() {
             log::info!("undo: {} icon(s) back in place", back.len());
         }
-        for (k, p, ix) in &back {
-            match p {
-                Place::Grid(c) => layout::move_to_grid_at(&mut self.layout, &[(k.clone(), *c)], &self.grid),
+        let g = self.grid;
+        for (page, k, p, ix) in &back {
+            // On the page it was on (a box's: the page that box is on now), whichever is shown.
+            let page = match p {
+                Place::Box { box_id, .. } => deskboxes_core::pages::page_of_box(&self.layout, *box_id).unwrap_or(*page),
+                Place::Grid(_) => *page,
+            };
+            let page = if deskboxes_core::pages::index_of(&self.layout, page).is_some() { page } else { self.layout.page };
+            deskboxes_core::pages::with_page(&mut self.layout, page, |l| match p {
+                Place::Grid(c) => layout::move_to_grid_at(l, &[(k.clone(), *c)], &g),
                 Place::Box { box_id, tab } => {
-                    if let Some(ti) = self.box_by_id(*box_id).and_then(|b| b.tabs.iter().position(|t| t.id == *tab)) {
-                        layout::move_to_tab(&mut self.layout, std::slice::from_ref(k), *box_id, ti, Some(*ix));
+                    if let Some(ti) = l.boxes.iter().find(|b| b.id == *box_id).and_then(|b| b.tabs.iter().position(|t| t.id == *tab)) {
+                        layout::move_to_tab(l, std::slice::from_ref(k), *box_id, ti, Some(*ix));
                     }
                 }
-            }
+            });
         }
-        back.into_iter().map(|(k, _, _)| k).collect()
+        back.into_iter().map(|(_, k, _, _)| k).collect()
     }
 
     // ---------------------------------------------------------------- rename
@@ -4715,20 +5039,37 @@ impl App {
             Some(dot) if dot > 0 && !it.is_folder() => text[..dot].encode_utf16().count(),
             _ => text.encode_utf16().count(),
         };
-        // A little wider than the icon's cell, under the icon, kept on the screen (a row view:
-        // over the name, to the row's end).
-        let fw = if m.row() { (cell.right() - label.x + 4.0).max(80.0) } else { cell.w + 16.0 };
-        let fx = (if m.row() { label.x - 4.0 } else { cell.x - 8.0 }).clamp(0.0, (self.size_dip.0 - fw).max(0.0));
-        let (x, y) = self.to_screen(Pt { x: fx, y: label.y - 3.0 });
+        // A Fluent text box (rounded, an accent line under it, Windows' padding: RENAME_PAD), a
+        // little wider than the icon's cell, its text where the name was (so nothing jumps), kept
+        // on the screen (a row view: over the name, to the row's end).
+        let (pl, pt) = (RENAME_PAD.0, RENAME_PAD.1);
+        let fw = if m.row() { (cell.right() - label.x + pl + 2.0).max(96.0) } else { cell.w + 2.0 * pl + 6.0 };
+        let fx = (if m.row() { label.x - pl - 1.0 } else { cell.x - pl - 3.0 }).clamp(0.0, (self.size_dip.0 - fw).max(0.0));
+        let (x, y) = self.to_screen(Pt { x: fx, y: label.y - pt - 1.0 });
         let w = (fw * self.scale).round() as i32;
         let dark = !self.light;
+        // As long as Windows lets a name be: 255 characters, and the whole path within MAX_PATH.
+        let limit = {
+            let p = std::path::Path::new(&it.parsing_name);
+            let parent = if it.parsing_name.starts_with("::") { None } else { p.parent().map(|d| d.to_string_lossy().encode_utf16().count()) };
+            let room = parent.map(|n| 259usize.saturating_sub(n + 1)).unwrap_or(255).min(255);
+            room.max(text.encode_utf16().count()).max(1)
+        };
         unsafe {
             let wt: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let s = self.scale;
+            let frame = match CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("DeskboxesRenameFrame"), w!(""), WS_POPUP | WS_CLIPCHILDREN, x, y, w, 24, Some(self.hwnd), None, None, None) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
             // Multi-line without horizontal scrolling: long names wrap, centred, as on Explorer's desktop.
-            let style = WS_POPUP | WS_BORDER | WINDOW_STYLE((if m.row() { ES_LEFT } else { ES_CENTER } | ES_MULTILINE | ES_AUTOVSCROLL) as u32);
-            let Ok(edit) = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("EDIT"), PCWSTR(wt.as_ptr()), style, x, y, w, 20, Some(self.hwnd), None, None, None) else {
+            let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE((if m.row() { ES_LEFT } else { ES_CENTER } | ES_MULTILINE | ES_AUTOVSCROLL) as u32);
+            let (ix, iy) = ((pl * s).round() as i32, (pt * s).round() as i32);
+            let Ok(edit) = CreateWindowExW(WINDOW_EX_STYLE(0), w!("EDIT"), PCWSTR(wt.as_ptr()), style, ix, iy, (w - 2 * ix).max(8), 20, Some(frame), None, None, None) else {
+                let _ = DestroyWindow(frame);
                 return;
             };
+            SendMessageW(edit, 0x00C5 /* EM_LIMITTEXT */, Some(WPARAM(limit)), Some(LPARAM(0)));
             let font = CreateFontW(
                 -((self.font.1 * self.scale).round() as i32),
                 0,
@@ -4756,16 +5097,22 @@ impl App {
                 ReleaseDC(Some(edit), dc);
                 tm.tmHeight.max(1)
             };
-            let m = (2.0 * self.scale).round() as usize;
-            SendMessageW(edit, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM((m | (m << 16)) as isize)));
+            SendMessageW(edit, EM_SETMARGINS, Some(WPARAM((EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize)), Some(LPARAM(0)));
             SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(sel_end as isize)));
-            let brush = CreateSolidBrush(COLORREF(if dark { 0x002B2B2B } else { 0x00FFFFFF }));
+            let look = RenameLook::new(dark, s);
+            let brush = CreateSolidBrush(COLORREF(look.bg));
             SetWindowLongPtrW(edit, GWLP_USERDATA, line_px as isize);
             RENAME_OLD_PROC.with(|o| o.set(SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_proc as *const () as isize)));
-            self.rename = Some(ItemRename { edit, key: k, since: Instant::now(), font, brush, dark });
+            RENAME_LOOK.with(|l| *l.borrow_mut() = Some((look, brush)));
+            RENAME_TIP.with(|t| *t.borrow_mut() = t_(self.lang, S::BadNameChars).encode_utf16().chain(std::iter::once(0)).collect());
+            // Rounded as Windows 11's own text boxes, with the outline of a control.
+            let corner = windows::Win32::Graphics::Dwm::DWMWCP_ROUNDSMALL;
+            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(frame, windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
+            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(frame, windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR, &look.stroke as *const _ as _, 4);
+            self.rename = Some(ItemRename { frame, edit, key: k, since: Instant::now(), font, brush });
             fit_rename(edit, line_px);
-            let _ = ShowWindow(edit, SW_SHOW);
-            let _ = SetForegroundWindow(edit);
+            let _ = ShowWindow(frame, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(frame);
             let _ = SetFocus(Some(edit));
         }
         // Its label under the field is not drawn meanwhile.
@@ -4885,7 +5232,10 @@ impl App {
                 let n = GetWindowTextLengthW(r.edit);
                 let mut buf = vec![0u16; n as usize + 1];
                 let got = GetWindowTextW(r.edit, &mut buf);
-                let _ = DestroyWindow(r.edit);
+                // (The tip about characters a name can't have goes with it.)
+                SendMessageW(r.edit, EM_HIDEBALLOONTIP, None, None);
+                let _ = DestroyWindow(r.frame);
+                RENAME_LOOK.with(|l| *l.borrow_mut() = None);
                 let _ = DeleteObject(r.font.into());
                 let _ = DeleteObject(r.brush.into());
                 String::from_utf16_lossy(&buf[..got as usize])
@@ -4982,6 +5332,9 @@ impl App {
             return;
         }
         let hit = self.hit_test(p);
+        if let Hit::Item { in_box, .. } = &hit {
+            self.item_box = *in_box;
+        }
         if self.search_click(p, &hit) {
             self.drag = Drag::None;
             return;
@@ -5494,8 +5847,15 @@ impl App {
     }
 
     pub fn drop_items(&mut self, keys: Vec<ItemKey>, start: Pt, cur: Pt) {
-        // Where the user drops icons is exact: no glide for them.
+        // Where the user drops icons is exact: no glide from where they were before the drag
+        // (see `settle_dropped` for the last bit from the drag image into place).
         self.no_glide.extend(keys.iter().cloned());
+        let let_go: Vec<(ItemKey, Pt)> = {
+            let cells = self.drag_cells();
+            keys.iter()
+                .filter_map(|k| cells.iter().find(|(x, _, _)| x == k).map(|(_, r, _)| (k.clone(), Pt { x: r.x + cur.x - start.x, y: r.y + cur.y - start.y })))
+                .collect()
+        };
         if let Some(key) = self.drop_onto_item(cur, &keys) {
             {
                 // Onto a folder or program: Windows' own drop (moves or opens with).
@@ -5611,6 +5971,44 @@ impl App {
                 self.change_layout(|l, g| layout::move_to_grid_at(l, &moves, g));
             }
         }
+        self.settle_dropped(&let_go);
+    }
+
+    /// Icons just dropped glide the last bit from where they were let go (the drag image showed
+    /// them there) into their places, instead of jumping; on the desktop and in boxes alike.
+    fn settle_dropped(&mut self, let_go: &[(ItemKey, Pt)]) {
+        if let_go.is_empty() || !crate::pages::windows_animates() {
+            return;
+        }
+        let now = Instant::now();
+        let cells = self.visible_cells();
+        let mut any = false;
+        for (k, p) in let_go {
+            let Some((_, r, bx)) = cells.iter().find(|(x, _, _)| x == k) else { continue };
+            // Far away (another page, scrolled out of sight) or already there: no glide.
+            let (dx, dy) = (r.x - p.x, r.y - p.y);
+            if dx.abs() < 0.5 && dy.abs() < 0.5 || dx.hypot(dy) > 600.0 {
+                continue;
+            }
+            match bx {
+                None => {
+                    self.glide_at.insert(k.clone(), Pt { x: r.x, y: r.y });
+                    self.glide.insert(k.clone(), (*p, now));
+                }
+                Some(id) => {
+                    let Some(b) = self.box_by_id(*id) else { continue };
+                    let c = Self::content_rect(b);
+                    let s = self.shown_scroll(*id);
+                    self.glide_boxes.insert(*id);
+                    self.box_glide_at.insert(k.clone(), Pt { x: r.x - c.x, y: r.y - c.y + s });
+                    self.box_glide.insert(k.clone(), (Pt { x: p.x - c.x, y: p.y - c.y + s }, now));
+                }
+            }
+            any = true;
+        }
+        if any {
+            self.invalidate();
+        }
     }
 
     fn on_rbutton_down(&mut self, p: Pt) {
@@ -5655,6 +6053,9 @@ impl App {
             let _ = ReleaseCapture();
         }
         let mut hit = self.hit_test(p);
+        if let Hit::Item { in_box, .. } = &hit {
+            self.item_box = *in_box;
+        }
         let new_rect = match drag {
             Drag::RightRubber { start, cur, scope } => {
                 // Icons the band selected: their menu (Explorer's). None: the menu of where it
@@ -5850,8 +6251,16 @@ impl App {
                     self.surf = Surface::new(&self.gpu, h, w, hh).map_err(|e| log::error!("surface: {e}")).ok();
                     let _ = windows::Win32::System::Ole::RegisterDragDrop(h, &crate::droptarget::DropTarget::create(h));
                     self.draw();
-                    if !self.args.no_hide {
-                        hide::set_hidden(true);
+                    if self.surf.is_some() && self.frame_ok {
+                        if !self.args.no_hide {
+                            hide::set_hidden(true);
+                        }
+                    } else {
+                        // Nothing on screen to show the icons: Explorer's own stay, and the
+                        // watchdog starts a fresh core (a nonzero exit is a crash to it).
+                        log::error!("no frame after the Explorer restart: restoring icons, exiting for a restart");
+                        hide::restore();
+                        PostQuitMessage(4);
                     }
                 }
                 Err(e) => {
@@ -5925,6 +6334,10 @@ impl App {
         self.end_rename(false);
         self.flush_settings();
         self.save();
+        // The snapshot is written on a thread of its own: finished before the process goes.
+        if let Some(j) = self.snapshot_job.take() {
+            let _ = j.join();
+        }
         if let Some(h) = &self.host {
             let _ = h.send("quit", json!({}));
         }
@@ -6110,18 +6523,10 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             }
             WM_APP_REFOCUS => {
                 if let Some(r) = app.rename.as_ref() {
-                    let _ = SetForegroundWindow(r.edit);
+                    let _ = SetForegroundWindow(r.frame);
                     let _ = SetFocus(Some(r.edit));
                 }
                 Some(LRESULT(0))
-            }
-            WM_CTLCOLOREDIT if is_surface && app.rename.as_ref().map(|r| r.edit.0 as isize == l.0).unwrap_or(false) => {
-                let r = app.rename.as_ref().unwrap();
-                let hdc = HDC(w.0 as _);
-                let (fg, bg) = if r.dark { (0x00FFFFFF, 0x002B2B2B) } else { (0x00000000, 0x00FFFFFF) };
-                SetTextColor(hdc, COLORREF(fg));
-                SetBkColor(hdc, COLORREF(bg));
-                Some(LRESULT(r.brush.0 as isize))
             }
             WM_CHAR if is_surface => {
                 if app.type_to_search(w.0 as u32) {
@@ -6196,9 +6601,11 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                             ms,
                             first,
                             resolved,
+                            keep,
                         } => {
                             app.stats.scan_resolved = resolved;
-                            app.apply_scan(items, icons, native, ms, first)
+                            app.apply_scan(items, icons, native, ms, first);
+                            app.evict_icons(&keep);
                         }
                         Ev::Rescan => {
                             SetTimer(Some(app.msg_hwnd), T_FS, 75, None);
@@ -6209,13 +6616,16 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                             if let Some((t0, ask)) = app.menu_replay.take() {
                                 if t0.elapsed().as_secs() < 20 {
                                     log::info!("showing the menu the old shell host did not");
+                                    app.replaying_menu = true;
                                     app.show_menu(ask.hit, ask.at, ask.keyboard, ask.new_rect);
+                                    app.replaying_menu = false;
                                 }
                             }
                         }
                         Ev::HostMsg(v) => app.on_host_msg(v),
                         Ev::InfoTip { key, text } => app.on_info_tip(key, text),
-                        Ev::FileDone { op, undo } => app.on_file_done(op, undo),
+                        Ev::FileDone { op } => app.on_file_done(op),
+                        Ev::FileStepDone { op, undo } => app.on_file_step_done(op, undo),
                         Ev::IconsAt { px, map, icons } => app.apply_sized_icons(px, map, icons),
                         Ev::Update => {
                             if app.host.is_some() && app.settings_sig() != app.settings_sent {
@@ -6491,22 +6901,155 @@ fn keep_taskbar_on_top() {
 
 thread_local! {
     static RENAME_OLD_PROC: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// The name field's colors and its background brush (one field at a time).
+    static RENAME_LOOK: RefCell<Option<(RenameLook, HBRUSH)>> = const { RefCell::new(None) };
+    /// What the tip says when a character a file name can't have is typed or pasted.
+    static RENAME_TIP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The name field as tall as its lines (one at least, twelve at most), as Explorer's grows.
+/// The name field's padding around its text (DIPs: sides, top, bottom with the accent line),
+/// as Windows 11's text boxes have, scaled to the icon labels' smaller font.
+const RENAME_PAD: (f32, f32, f32) = (7.0, 4.0, 6.0);
+
+/// The name field's colors, as Windows 11's text box in focus (COLORREF: 0x00BBGGRR).
+#[derive(Clone, Copy)]
+struct RenameLook {
+    bg: u32,
+    fg: u32,
+    stroke: u32,
+    accent: u32,
+    /// The accent line's height, px.
+    line: i32,
+}
+
+impl RenameLook {
+    fn new(dark: bool, scale: f32) -> Self {
+        let rgb = |r: u8, g: u8, b: u8| (b as u32) << 16 | (g as u32) << 8 | r as u32;
+        // The accent as Windows' controls use it: from the system's accent palette (light 3, 2,
+        // 1, the color, dark 1, 2, 3), its second lighter shade in the dark theme and first darker
+        // one in the light theme; made from the accent where there is no palette.
+        let pal = reg::get_binary(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentPalette").filter(|p| p.len() >= 28);
+        let accent = match pal {
+            Some(p) => {
+                let i = if dark { 4 } else { 16 };
+                rgb(p[i], p[i + 1], p[i + 2])
+            }
+            None => {
+                let (r, g, b) = accent();
+                let mix = |c: u8, to: u8, k: f32| (c as f32 + (to as f32 - c as f32) * k).round() as u8;
+                if dark { rgb(mix(r, 255, 0.45), mix(g, 255, 0.45), mix(b, 255, 0.45)) } else { rgb(mix(r, 0, 0.12), mix(g, 0, 0.12), mix(b, 0, 0.12)) }
+            }
+        };
+        RenameLook {
+            bg: if dark { rgb(0x1F, 0x1F, 0x1F) } else { rgb(0xFF, 0xFF, 0xFF) },
+            fg: if dark { rgb(0xFF, 0xFF, 0xFF) } else { rgb(0x1A, 0x1A, 0x1A) },
+            stroke: if dark { rgb(0x3A, 0x3A, 0x3A) } else { rgb(0xD9, 0xD9, 0xD9) },
+            accent,
+            // Two pixels at 100% over the outline's own bottom pixel (DWM draws it on top).
+            line: (2.0 * scale).round().max(1.0) as i32 + 1,
+        }
+    }
+}
+
+/// The name field's frame: its background, the accent line along the bottom (the outline and
+/// the rounded corners are DWM's), and the text box's colors.
+extern "system" fn rename_frame_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        let look = RENAME_LOOK.with(|v| *v.borrow());
+        match m {
+            WM_ERASEBKGND => return LRESULT(1),
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(h, &mut ps);
+                if let Some((lk, brush)) = look {
+                    let mut r = RECT::default();
+                    let _ = GetClientRect(h, &mut r);
+                    FillRect(dc, &r, brush);
+                    let line = CreateSolidBrush(COLORREF(lk.accent));
+                    let lr = RECT { top: r.bottom - lk.line, ..r };
+                    FillRect(dc, &lr, line);
+                    let _ = DeleteObject(line.into());
+                }
+                let _ = EndPaint(h, &ps);
+                return LRESULT(0);
+            }
+            WM_CTLCOLOREDIT => {
+                if let Some((lk, brush)) = look {
+                    let hdc = HDC(w.0 as _);
+                    SetTextColor(hdc, COLORREF(lk.fg));
+                    SetBkColor(hdc, COLORREF(lk.bg));
+                    return LRESULT(brush.0 as isize);
+                }
+            }
+            // A click on the padding: the caret stays in the text.
+            WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+            WM_LBUTTONDOWN => {
+                if let Some(e) = GetWindow(h, GW_CHILD).ok() {
+                    let _ = SetFocus(Some(e));
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+        DefWindowProcW(h, m, w, l)
+    }
+}
+
+/// The name field (and its frame) as tall as its lines (one at least, twelve at most), as
+/// Explorer's grows.
 fn fit_rename(edit: HWND, line_px: i32) {
     unsafe {
         let lines = SendMessageW(edit, EM_GETLINECOUNT, None, None).0.clamp(1, 12) as i32;
-        let mut wr = RECT::default();
-        let mut cr = RECT::default();
-        let _ = GetWindowRect(edit, &mut wr);
-        let _ = GetClientRect(edit, &mut cr);
-        let frame = (wr.bottom - wr.top) - (cr.bottom - cr.top);
-        let h = lines * line_px + 4 + frame;
-        if wr.bottom - wr.top != h {
-            let _ = SetWindowPos(edit, None, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        let Ok(frame) = GetParent(edit) else { return };
+        let scale = GetDpiForWindow(frame).max(96) as f32 / 96.0;
+        let (pt, pb) = ((RENAME_PAD.1 * scale).round() as i32, (RENAME_PAD.2 * scale).round() as i32);
+        let mut er = RECT::default();
+        let mut fr = RECT::default();
+        let _ = GetWindowRect(edit, &mut er);
+        let _ = GetWindowRect(frame, &mut fr);
+        let h = lines * line_px;
+        if er.bottom - er.top != h {
+            let _ = SetWindowPos(edit, None, 0, 0, er.right - er.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        let fh = pt + h + pb;
+        if fr.bottom - fr.top != fh {
+            let _ = SetWindowPos(frame, None, 0, 0, fr.right - fr.left, fh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = InvalidateRect(Some(frame), None, true);
         }
     }
+}
+
+/// Explorer's tip under the caret: the characters a file name can't have.
+fn rename_tip(edit: HWND) {
+    use windows::Win32::UI::Controls::{EDITBALLOONTIP, EM_SHOWBALLOONTIP, TTI_NONE};
+    unsafe {
+        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK);
+        RENAME_TIP.with(|t| {
+            let t = t.borrow();
+            if t.is_empty() {
+                return;
+            }
+            let empty = [0u16];
+            let tip = EDITBALLOONTIP { cbStruct: std::mem::size_of::<EDITBALLOONTIP>() as u32, pszTitle: PCWSTR(empty.as_ptr()), pszText: PCWSTR(t.as_ptr()), ttiIcon: TTI_NONE };
+            SendMessageW(edit, EM_SHOWBALLOONTIP, None, Some(LPARAM(&tip as *const _ as isize)));
+        });
+    }
+}
+
+/// What may go into a name from pasted text: its first line, without the characters a file
+/// name can't have (and whether any were left out).
+fn rename_paste_text(s: &str) -> (String, bool) {
+    let line = s.split(['\r', '\n']).find(|l| !l.trim().is_empty()).unwrap_or("");
+    let mut bad = false;
+    let out = line
+        .chars()
+        .filter(|c| {
+            let ok = !"\\/:*?\"<>|".contains(*c) && !c.is_control();
+            bad |= !ok;
+            ok
+        })
+        .collect();
+    (out, bad)
 }
 
 /// Windows' text box for an icon's name: Enter keeps the name, Esc goes back, no line breaks, no
@@ -6514,7 +7057,8 @@ fn fit_rename(edit: HWND, line_px: i32) {
 /// its lines and tells the core when it is done.
 extern "system" fn rename_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
-        let owner = GetWindow(h, GW_OWNER).unwrap_or_default();
+        // The core's window owns the field's frame.
+        let owner = GetParent(h).ok().and_then(|f| GetWindow(f, GW_OWNER).ok()).unwrap_or_default();
         let ctrl = key_down(VK_CONTROL);
         match m {
             WM_KEYDOWN if w.0 == VK_RETURN.0 as usize => {
@@ -6547,12 +7091,32 @@ extern "system" fn rename_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT
                 return LRESULT(0);
             }
             WM_CHAR if w.0 == 13 || w.0 == 10 || w.0 == 27 || w.0 == 0x7F || w.0 == 1 => return LRESULT(0),
-            // Characters no file name can have: refused, as Explorer does.
+            // Characters no file name can have: refused with Explorer's tip.
             WM_CHAR if char::from_u32(w.0 as u32).map(|c| "\\/:*?\"<>|".contains(c)).unwrap_or(false) => {
-                let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_OK);
+                rename_tip(h);
+                return LRESULT(0);
+            }
+            // Pasted: one line, without those characters (the tip says why some went).
+            WM_PASTE => {
+                if let Some(s) = deskboxes_shell::view::clipboard_text(owner.0 as isize) {
+                    let (text, bad) = rename_paste_text(&s);
+                    let wt: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                    SendMessageW(h, EM_REPLACESEL, Some(WPARAM(1)), Some(LPARAM(wt.as_ptr() as isize)));
+                    if bad {
+                        rename_tip(h);
+                    }
+                    fit_rename(h, rename_line_px(h));
+                }
                 return LRESULT(0);
             }
             WM_KILLFOCUS => {
+                // (The click went to the field's own frame: still editing.)
+                let to = HWND(w.0 as _);
+                if GetParent(h).map(|f| f == to).unwrap_or(false) {
+                    let _ = SetFocus(Some(h));
+                    return LRESULT(0);
+                }
+                SendMessageW(h, EM_HIDEBALLOONTIP, None, None);
                 let _ = PostMessageW(Some(owner), WM_APP_RENAME_END, WPARAM(2), LPARAM(0));
             }
             _ => {}

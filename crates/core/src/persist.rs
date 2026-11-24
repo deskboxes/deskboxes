@@ -19,8 +19,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path) // MoveFileExW(MOVEFILE_REPLACE_EXISTING) on Windows
 }
 
+/// A file that is there but cannot be read as this version reads it (damaged, or written by a
+/// newer version) is copied aside before the defaults used instead are ever saved over it:
+/// `<name>.unreadable-<unix time>.bak` next to it. Returns where it went.
+pub fn keep_unreadable(path: &Path) -> Option<PathBuf> {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let to = path.with_file_name(format!("{name}.unreadable-{secs}.bak"));
+    std::fs::copy(path, &to).ok()?;
+    Some(to)
+}
+
 pub fn load_settings(path: &Path) -> Settings {
-    let mut s: Settings = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut s: Settings = match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|_| {
+            keep_unreadable(path);
+            Settings::default()
+        }),
+        Err(_) => Settings::default(),
+    };
     if s.icons.fx_v < 2 {
         s.icons.tint_strength = 1.0;
         s.icons.fx_v = 2;
@@ -36,16 +53,28 @@ pub fn layout_path(dir: &Path, topology: &str) -> PathBuf {
     dir.join(format!("{topology}.json"))
 }
 
-/// Load the layout for a topology; an unknown schema is not guessed at (start fresh, keep the file).
+/// Load the layout for a topology; None when there is none or it cannot be read.
 pub fn load_layout(dir: &Path, topology: &str) -> Option<MonitorLayout> {
-    let b = std::fs::read(layout_path(dir, topology)).ok()?;
-    let l: Layout = serde_json::from_slice(&b).ok()?;
-    (l.schema == LAYOUT_SCHEMA).then_some(l.monitor).map(|mut m| {
-        for b in &mut m.boxes {
-            b.own_folders();
-        }
-        m
-    })
+    load_layout_checked(dir, topology).ok().flatten()
+}
+
+/// Load the layout for a topology: Ok(None) there is none yet; Err when there is one this
+/// version cannot read (damaged, or an unknown schema: not guessed at).
+pub fn load_layout_checked(dir: &Path, topology: &str) -> Result<Option<MonitorLayout>, String> {
+    let b = match std::fs::read(layout_path(dir, topology)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let l: Layout = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
+    if l.schema != LAYOUT_SCHEMA {
+        return Err(format!("schema {} (this version reads {LAYOUT_SCHEMA})", l.schema));
+    }
+    let mut m = l.monitor;
+    for b in &mut m.boxes {
+        b.own_folders();
+    }
+    Ok(Some(m))
 }
 
 pub fn save_layout(dir: &Path, topology: &str, m: &MonitorLayout) -> std::io::Result<()> {
@@ -74,21 +103,50 @@ pub fn today() -> String {
 }
 
 /// First change of each day: copy the current layout files to backups/YYYY-MM-DD/ and keep the
-/// newest 7 days.
+/// newest 7 days. The copies are made in a folder of their own and only become the day's backup
+/// when every one went through (a failed attempt is tried again at the next save); older days
+/// are only let go after that.
 pub fn backup_layouts_daily(layouts: &Path, backups: &Path) -> std::io::Result<bool> {
     let day = backups.join(today());
     if day.exists() {
         return Ok(false);
     }
-    std::fs::create_dir_all(&day)?;
-    if let Ok(rd) = std::fs::read_dir(layouts) {
-        for e in rd.flatten() {
-            if e.path().extension().map(|x| x == "json").unwrap_or(false) {
-                let _ = std::fs::copy(e.path(), day.join(e.file_name()));
+    std::fs::create_dir_all(backups)?;
+    let part = backups.join(format!("{}.part", today()));
+    let _ = std::fs::remove_dir_all(&part);
+    std::fs::create_dir_all(&part)?;
+    let copied = (|| -> std::io::Result<()> {
+        match std::fs::read_dir(layouts) {
+            Ok(rd) => {
+                for e in rd {
+                    let e = e?;
+                    if e.path().extension().map(|x| x == "json").unwrap_or(false) {
+                        std::fs::copy(e.path(), part.join(e.file_name()))?;
+                    }
+                }
+                Ok(())
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    })();
+    if let Err(e) = copied.and_then(|_| std::fs::rename(&part, &day)) {
+        let _ = std::fs::remove_dir_all(&part);
+        return Err(e);
+    }
+    // Only finished days count (a `.part` folder left by a crash goes too).
+    let mut days: Vec<PathBuf> = vec![];
+    for e in std::fs::read_dir(backups)?.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.extension().map(|x| x == "part").unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            days.push(p);
         }
     }
-    let mut days: Vec<PathBuf> = std::fs::read_dir(backups)?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     days.sort();
     while days.len() > 7 {
         let _ = std::fs::remove_dir_all(days.remove(0));

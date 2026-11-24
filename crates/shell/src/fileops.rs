@@ -202,9 +202,17 @@ fn run_logged(fo: &IFileOperation, fill: impl FnOnce(&IFileOperation) -> windows
         let cookie = fo.Advise(&sink)?;
         let r = fill(fo).and_then(|_| fo.PerformOperations());
         let _ = fo.Unadvise(cookie);
-        r?;
         let v = done.borrow().clone();
-        Ok(v)
+        match r {
+            Ok(()) => Ok(v),
+            // Stopped part way (cancelled, a file in use): what did go through still counts, so
+            // it can be undone.
+            Err(e) if !v.is_empty() => {
+                log::warn!("file operation stopped after {} item(s): {e}", v.len());
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -263,14 +271,29 @@ pub fn move_back(pairs: &[(String, String)], owner: isize, no_ui: bool) -> windo
     })
 }
 
-/// Take items back out of the Recycle Bin to where they were (`(original path, file in the
-/// Recycle Bin)`), as its Restore does: the file goes back and the bin's record of it goes.
-/// When the bin's file is not known, the newest one deleted from that path is taken. Returns
-/// what came back (original path, "").
-pub fn restore(items: &[(String, String)]) -> Vec<Done> {
+/// Take items back out of the Recycle Bin to where they were, as its Restore does: the file goes
+/// back and the bin's record of it goes. Only the very file that was deleted comes back: its
+/// recorded bin file (gone from the bin: not restored), or when that was not known, the file the
+/// bin has from that path with the same identity (`id`; with none known, the newest from there).
+/// Returns what came back, with its identity now at its old place (`from`).
+pub fn restore(items: &[deskboxes_core::layout::FileMove]) -> Vec<deskboxes_core::layout::FileMove> {
     let mut out = vec![];
-    for (orig, bin) in items {
-        let bin = if !bin.is_empty() && std::path::Path::new(bin).exists() { Some(std::path::PathBuf::from(bin)) } else { find_in_bin(orig) };
+    for m in items {
+        let orig = &m.from;
+        let bin = if !m.to.is_empty() {
+            let r = std::path::PathBuf::from(&m.to);
+            if !r.exists() {
+                log::warn!("restore: {} is no longer in the Recycle Bin", m.to);
+                continue;
+            }
+            if m.id.is_some() && crate::items::file_id(&m.to) != m.id {
+                log::warn!("restore: {} is another file now; left in the Recycle Bin", m.to);
+                continue;
+            }
+            Some(r)
+        } else {
+            find_in_bin(orig, m.id)
+        };
         let Some(r) = bin else {
             log::warn!("restore: {orig} is not in the Recycle Bin");
             continue;
@@ -288,7 +311,7 @@ pub fn restore(items: &[(String, String)]) -> Vec<Done> {
                     }
                 }
                 notify(orig, &r);
-                out.push(Done { from: orig.clone(), to: String::new() });
+                out.push(deskboxes_core::layout::FileMove::new(orig.clone(), String::new(), crate::items::file_id(orig)));
             }
             Err(e) => log::warn!("restore {orig}: {e}"),
         }
@@ -307,9 +330,10 @@ fn notify(back: &str, gone: &std::path::Path) {
     }
 }
 
-/// The newest file in this user's Recycle Bin on `orig`'s drive deleted from `orig`: read from
-/// the bin's records ($I files: version, size, deletion time, then the original path).
-fn find_in_bin(orig: &str) -> Option<std::path::PathBuf> {
+/// The file in this user's Recycle Bin on `orig`'s drive deleted from `orig` that is file `id`
+/// (unknown: the newest deleted from there): read from the bin's records ($I files: version,
+/// size, deletion time, then the original path).
+fn find_in_bin(orig: &str, id: Option<deskboxes_core::layout::FileId>) -> Option<std::path::PathBuf> {
     let drive: String = orig.chars().take(3).collect();
     let root = std::path::Path::new(&drive).join("$Recycle.Bin");
     let mut best: Option<(u64, std::path::PathBuf)> = None;
@@ -332,7 +356,7 @@ fn find_in_bin(orig: &str) -> Option<std::path::PathBuf> {
             let end = path.iter().position(|c| *c == 0).unwrap_or(path.len());
             let p = String::from_utf16_lossy(&path[..end]);
             let r = sid.path().join(format!("$R{rest}"));
-            if p.eq_ignore_ascii_case(orig) && r.exists() && best.as_ref().map(|(t, _)| when > *t).unwrap_or(true) {
+            if p.eq_ignore_ascii_case(orig) && r.exists() && id.map(|i| crate::items::file_id(&r.to_string_lossy()) == Some(i)).unwrap_or(true) && best.as_ref().map(|(t, _)| when > *t).unwrap_or(true) {
                 best = Some((when, r));
             }
         }

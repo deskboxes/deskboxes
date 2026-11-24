@@ -242,6 +242,26 @@ pub fn page_of_item(l: &MonitorLayout, k: &ItemKey) -> Option<u32> {
     l.parked.iter().find(|(_, c)| c.loose.contains_key(k) || c.boxes.iter().any(|b| b.contains(k).is_some())).map(|(id, _)| *id)
 }
 
+/// Where an icon is, on any page: (page, its place there, its position in its box tab).
+pub fn find_item(l: &MonitorLayout, k: &ItemKey) -> Option<(u32, Place, usize)> {
+    let look = |boxes: &[BoxModel], loose: &std::collections::BTreeMap<ItemKey, Cell>| -> Option<(Place, usize)> {
+        if let Some(c) = loose.get(k) {
+            return Some((Place::Grid(*c), 0));
+        }
+        boxes.iter().find_map(|b| b.contains(k).map(|(ti, ix)| (Place::Box { box_id: b.id, tab: b.tabs[ti].id }, ix)))
+    };
+    if let Some((p, ix)) = look(&l.boxes, &l.loose) {
+        return Some((l.page, p, ix));
+    }
+    l.parked.iter().find_map(|(id, c)| look(&c.boxes, &c.loose).map(|(p, ix)| (*id, p, ix)))
+}
+
+/// A tab rules and "new icons" can send icons to (on any page): a plain box's, not a folder
+/// box's (that shows a folder; desktop icons never go into it).
+pub fn sortable_tab(l: &MonitorLayout, tab: u32) -> Option<(u32, u32, usize)> {
+    all_boxes(l).filter(|(_, b)| !b.is_folder()).find_map(|(p, b)| b.tabs.iter().position(|t| t.id == tab).map(|i| (p, b.id, i)))
+}
+
 /// The page, box and tab index holding tab id `tab`, on any page.
 pub fn find_tab(l: &MonitorLayout, tab: u32) -> Option<(u32, u32, usize)> {
     all_boxes(l).find_map(|(p, b)| b.tabs.iter().position(|t| t.id == tab).map(|i| (p, b.id, i)))

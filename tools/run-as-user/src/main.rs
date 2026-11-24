@@ -151,6 +151,8 @@ fn main() {
         let mut pi = PROCESS_INFORMATION::default();
         let mut cl: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
         let cwd_h = cwd.as_ref().map(|c| HSTRING::from(c.as_str()));
+        let flags = CREATE_UNICODE_ENVIRONMENT | if out.is_some() { CREATE_NO_WINDOW } else { PROCESS_CREATION_FLAGS(0) };
+        let cwd_p = cwd_h.as_ref().map(|h| windows::core::PCWSTR(h.as_ptr())).unwrap_or(windows::core::PCWSTR::null());
         let r = CreateProcessWithTokenW(
             primary,
             CREATE_PROCESS_LOGON_FLAGS(0),
@@ -158,12 +160,21 @@ fn main() {
             Some(PWSTR(cl.as_mut_ptr())),
             // CREATE_NO_WINDOW: the cmd.exe wrapper used for --out must not show a console
             // window (it would cover the desktop in screenshot-based tests).
-            CREATE_UNICODE_ENVIRONMENT | if out.is_some() { CREATE_NO_WINDOW } else { PROCESS_CREATION_FLAGS(0) },
+            flags,
             None,
-            cwd_h.as_ref().map(|h| windows::core::PCWSTR(h.as_ptr())).unwrap_or(windows::core::PCWSTR::null()),
+            cwd_p,
             &si,
             &mut pi,
         );
+        // Not elevated (no SeImpersonatePrivilege): this process already runs at the user's own
+        // integrity, so the program is simply started from here.
+        let r = match r {
+            Err(e) if e.code() == ERROR_PRIVILEGE_NOT_HELD.to_hresult() => {
+                let mut cl: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
+                CreateProcessW(None, Some(PWSTR(cl.as_mut_ptr())), None, None, false, flags, None, cwd_p, &si, &mut pi)
+            }
+            r => r,
+        };
         if let Err(e) = r {
             eprintln!("run-as-user: CreateProcessWithTokenW failed: {e}");
             std::process::exit(4);

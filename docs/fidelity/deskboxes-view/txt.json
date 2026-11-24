@@ -1,6 +1,6 @@
 ﻿{
   "case": "txt",
-  "appearedMs": 770,
+  "appearedMs": 794,
   "rowPosition": "top",
   "row": [
     {
@@ -11,8 +11,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 247,
+      "x": 907,
+      "y": 312,
       "w": 56,
       "h": 48
     },
@@ -24,8 +24,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 808,
-      "y": 247,
+      "x": 972,
+      "y": 312,
       "w": 56,
       "h": 48
     },
@@ -37,8 +37,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 873,
-      "y": 247,
+      "x": 1037,
+      "y": 312,
       "w": 56,
       "h": 48
     },
@@ -50,8 +50,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 938,
-      "y": 247,
+      "x": 1102,
+      "y": 312,
       "w": 56,
       "h": 48
     },
@@ -63,8 +63,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 1003,
-      "y": 247,
+      "x": 1167,
+      "y": 312,
       "w": 56,
       "h": 48
     }
@@ -78,8 +78,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 304,
+      "x": 907,
+      "y": 369,
       "w": 316,
       "h": 32
     },
@@ -91,8 +91,8 @@
       "cls": "AppBarButton",
       "submenu": true,
       "enabled": true,
-      "x": 743,
-      "y": 336,
+      "x": 907,
+      "y": 401,
       "w": 316,
       "h": 32
     },
@@ -104,8 +104,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 368,
+      "x": 907,
+      "y": 433,
       "w": 316,
       "h": 32
     },
@@ -117,8 +117,8 @@
       "cls": "AppBarButton",
       "submenu": true,
       "enabled": true,
-      "x": 743,
-      "y": 400,
+      "x": 907,
+      "y": 465,
       "w": 316,
       "h": 32
     },
@@ -130,8 +130,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 432,
+      "x": 907,
+      "y": 497,
       "w": 316,
       "h": 32
     },
@@ -143,8 +143,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 464,
+      "x": 907,
+      "y": 529,
       "w": 316,
       "h": 32
     },
@@ -161,8 +161,8 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 505,
+      "x": 907,
+      "y": 570,
       "w": 316,
       "h": 32
     },
@@ -174,8 +174,8 @@
       "cls": "AppBarButton",
       "submenu": true,
       "enabled": true,
-      "x": 743,
-      "y": 537,
+      "x": 907,
+      "y": 602,
       "w": 316,
       "h": 32
     },
@@ -187,8 +187,8 @@
       "cls": "AppBarButton",
       "submenu": true,
       "enabled": true,
-      "x": 743,
-      "y": 569,
+      "x": 907,
+      "y": 634,
       "w": 316,
       "h": 32
     },
@@ -205,71 +205,11 @@
       "cls": "AppBarButton",
       "submenu": false,
       "enabled": true,
-      "x": 743,
-      "y": 610,
+      "x": 907,
+      "y": 675,
       "w": 316,
       "h": 32
     }
   ],
-  "escapeClosed": true,
-  "submenus": {
-    "openas": [
-      {
-        "name": "Notepad",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Visual Studio Code",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Search the Microsoft Store",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Choose another app",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      }
-    ],
-    "Windows.ExtensionsFlyout": [
-      {
-        "name": "Edit in Notepad",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Edit with Notepad++",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Unlock with File Locksmith",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Rename with PowerRename",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      },
-      {
-        "name": "Manage extensions",
-        "id": "",
-        "accel": "",
-        "submenu": false
-      }
-    ]
-  }
+  "escapeClosed": true
 }

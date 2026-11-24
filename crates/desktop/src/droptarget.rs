@@ -310,7 +310,10 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 }
             } else if cur.as_ref().map(|c| c.key() == "bg").unwrap_or(false) {
                 app.pending_drop = Some((std::time::Instant::now(), p, bx));
+                app.pending_drop_page = Some(app.layout.page);
                 app.known_before_drop = app.items.keys().cloned().collect();
+                // A page made for this drag stays: the files are still on their way.
+                app.page_dropped();
             }
             app.hit_desk = false;
             false

@@ -118,7 +118,9 @@ fn main() {
         deskboxes_shell::com_sta();
         let exe = std::env::current_exe().unwrap_or_default();
         let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-        let again = format!("{} --relaunched", args.join(" "));
+        let mut again: Vec<String> = args.iter().map(|a| quote_arg(a)).collect();
+        again.push("--relaunched".into());
+        let again = again.join(" ");
         match deskboxes_shell::launch::via_explorer(&exe, &again, &dir) {
             Ok(()) => {
                 log("started inside the menu package: started again through Explorer");
@@ -178,5 +180,47 @@ fn main() {
                 deskboxes_shell::hide::restore();
             }
         }
+    }
+}
+
+/// One argument for a Windows command line, quoted so `CommandLineToArgvW` (and the Rust
+/// runtime) give it back unchanged: spaces and quotes inside, backslashes before a quote.
+fn quote_arg(a: &str) -> String {
+    if !a.is_empty() && !a.contains([' ', '\t', '\n', '"']) {
+        return a.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for c in a.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_arg;
+
+    #[test]
+    fn quoting() {
+        assert_eq!(quote_arg("--window"), "--window");
+        assert_eq!(quote_arg(r"C:\Test Fixtures\Desktop"), r#""C:\Test Fixtures\Desktop""#);
+        assert_eq!(quote_arg(r"C:\Test Fixtures\"), r#""C:\Test Fixtures\\""#);
+        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_arg(""), r#""""#);
     }
 }
