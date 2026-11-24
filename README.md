@@ -60,22 +60,25 @@ Deskboxes only changes how your icons are shown. Your files stay where they are,
 
 ### Everything Deskboxes does
 
-- **Boxes.** Move, resize and snap boxes to screen edges and to each other. Each box has its own color, transparency, background blur, icon size and view (icons, list, details or tiles).
+- **Boxes.** Move, resize and snap boxes to screen edges and to each other. Each box has its own color, transparency, background blur, icon size and view (icons, list, details, tiles, or covers for games, with Steam's own cover art).
 - **Tabs.** Several groups of icons in one box. Drag a box onto another to combine them, or a tab out to make it a box.
 - **Roll-up.** A box docked at a screen edge can fold down to its title and open when you point at it.
 - **Sorting rules.** File type (documents, images, games, game launchers, installers and more), name, extension, shortcut target, age and size. "Sort now" tidies everything at once; on a new install Deskboxes suggests a set of boxes.
 - **A–Z index.** Keep a box in name order with a letter bar for jumping to a letter.
 - **Folder boxes.** A folder's files in a box, with navigation into subfolders and tabs.
 - **Desktop pages.** More desktops side by side; new files go to the page you're on or the first page.
+- **Several monitors.** Boxes and pages on every screen; drag between them. An unplugged screen's boxes wait on the main screen and go back when it returns.
 - **Boxes above windows.** A shortcut or a hot corner brings the boxes over your apps; drag from them into an app.
 - **Search.** Type anywhere on the desktop to find an icon.
 - **Hide all.** Double-click an empty spot to show only the wallpaper.
 - **Icon looks.** Tint icons, or let them blend into the wallpaper until you point at them.
 - **Saved layouts.** Save how your boxes are arranged and go back to it, or to any of the last seven days.
+- **Move to another PC.** Export boxes, pages, rules and settings to one file and import it on the new PC.
 - **Locks.** Stop boxes and icons from being moved or resized by accident.
 - **Privacy mode.** Hide icon names and pictures when someone is looking over your shoulder.
 - **Undo.** Ctrl+Z undoes layout changes and file moves, deletes, copies and renames. Ctrl+Y redoes them.
 - **Windows menus.** Right-clicking an icon or the desktop shows Windows' own menu, including the commands other apps add to it, plus Deskboxes' own.
+- **Accessible.** Narrator reads the boxes and icons; Tab and F6 move between boxes. Settings has a search box.
 - **English and Polish**, following the Windows display language.
 
 ## 📦 Installation
@@ -113,7 +116,7 @@ See the [release notes](https://github.com/deskboxes/deskboxes/releases) for wha
 
 ## 🛣 Roadmap
 
-Next up: support for several monitors (boxes on every screen, and an unplugged screen's boxes kept on a page), a cover view for the Games box, moving your settings to another PC, Narrator support, and search in Settings. Ideas and votes are welcome in [Discussions](https://github.com/deskboxes/deskboxes/discussions).
+What comes next is shaped by your ideas and votes: share them in [Discussions](https://github.com/deskboxes/deskboxes/discussions).
 
 ## ❤ Community
 
