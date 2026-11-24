@@ -331,7 +331,7 @@ impl App {
             None => now_w,
         };
         let cx = self.work.x + self.work.w / 2.0;
-        let y = self.work.y + 14.0;
+        let y = self.work.y + 14.0 + self.search_top_room();
         Some(Rect::new(((cx - w / 2.0) * self.scale).round() / self.scale, (y * self.scale).round() / self.scale, w, PILL_H))
     }
 

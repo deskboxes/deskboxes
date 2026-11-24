@@ -897,6 +897,11 @@ namespace dbx
             auto se = g.data.GetNamedObject(L"search", JsonObject());
             std::wstring x = Card(L"&#xE721;", Str(L"searchField"), Str(L"searchFieldDesc"), Toggle(L"SearchField", se.GetNamedBoolean(L"field", true)));
             x += Card(L"&#xE765;", Str(L"typeSearch"), Str(L"typeSearchDesc"), Toggle(L"TypeSearch", se.GetNamedBoolean(L"typeToSearch", true)));
+            x += Card(L"&#xE8FD;", Str(L"searchResults"), Str(L"searchResultsDesc"), Toggle(L"SearchResults", se.GetNamedBoolean(L"results", true)));
+            x += Card(L"&#xED1A;", Str(L"searchHideToggle"), Str(L"searchHideToggleDesc"), Toggle(L"SearchHideToggle", se.GetNamedBoolean(L"hideToggle", true)));
+            std::wstring pos = se.GetNamedString(L"position", L"bottom").c_str();
+            x += Card(L"&#xE8A0;", Str(L"searchPosition"), Str(L"searchPositionDesc"),
+                      L"<ComboBox x:Name=\"SearchPosition\" MinWidth=\"220\">" + Opt(L"bottom", Str(L"searchBottom"), pos != L"top") + Opt(L"top", Str(L"searchTop"), pos == L"top") + L"</ComboBox>");
             return x;
         }
 
@@ -1976,6 +1981,9 @@ namespace dbx
             // Search
             OnToggle(root, L"SearchField", L"search", L"field");
             OnToggle(root, L"TypeSearch", L"search", L"typeToSearch");
+            OnToggle(root, L"SearchResults", L"search", L"results");
+            OnToggle(root, L"SearchHideToggle", L"search", L"hideToggle");
+            OnCombo(root, L"SearchPosition", [](std::wstring v) { Send(L"search", 0, L"position", JsonValue::CreateStringValue(v)); });
             // Roll-up
             OnToggle(root, L"RollEdges", L"rollup", L"edges");
             OnToggle(root, L"RollDbl", L"rollup", L"doubleClick");

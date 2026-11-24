@@ -705,11 +705,20 @@ pub struct SearchSettings {
     pub field: bool,
     /// Typing on the desktop starts a search.
     pub type_to_search: bool,
+    /// The field opens into a list of what was found (with type filters and box actions).
+    pub results: bool,
+    /// The list offers "Hide the others" (icons that don't match vanish, the matches in each
+    /// box close up).
+    pub hide_toggle: bool,
+    /// "Hide the others" is on (kept from one search to the next).
+    pub hide: bool,
+    /// Where the field is: "bottom" or "top" of the screen.
+    pub position: String,
 }
 
 impl Default for SearchSettings {
     fn default() -> Self {
-        SearchSettings { field: true, type_to_search: true }
+        SearchSettings { field: true, type_to_search: true, results: true, hide_toggle: true, hide: false, position: "bottom".into() }
     }
 }
 

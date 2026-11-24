@@ -82,7 +82,9 @@ impl App {
     fn shown_checked(&self, b: &BoxModel, tab: &Tab) -> (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (self.items_gen, b.az, tab.items.len()).hash(&mut h);
+        // "Hide the others" while searching: only the matches, closed up.
+        let only = self.search_shown_filter(b);
+        (self.items_gen, b.az, tab.items.len(), only.map(|(g, _)| g)).hash(&mut h);
         tab.items.hash(&mut h);
         let fp = h.finish();
         if let Some(s) = self.shown_cache.borrow().get(&tab.id) {
@@ -90,7 +92,7 @@ impl App {
                 return (s.keys.clone(), s.firsts.clone());
             }
         }
-        let mut v: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k)).cloned().collect();
+        let mut v: Vec<ItemKey> = tab.items.iter().filter(|k| self.items.contains_key(*k) && only.is_none_or(|(_, set)| set.contains(*k))).cloned().collect();
         let mut firsts = vec![];
         if b.az {
             // StrCmpLogicalW (Explorer's order) on names converted once, not per comparison.

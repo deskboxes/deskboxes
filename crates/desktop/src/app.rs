@@ -1788,9 +1788,14 @@ impl App {
     /// Where a box is scrolled as drawn now (gliding to its scroll position).
     pub fn shown_scroll(&self, id: u32) -> f32 {
         let to = self.scroll.get(&id).copied().unwrap_or(0.0);
-        match self.scroll_from.get(&id) {
+        let s = match self.scroll_from.get(&id) {
             Some((from, t0)) if self.settings.extras.smooth_scroll => from + (to - from) * ease_out(t0.elapsed().as_secs_f32() / SCROLL_S),
             _ => to,
+        };
+        // "Hide the others" leaves fewer rows: never scrolled past them.
+        match self.box_by_id(id) {
+            Some(b) if self.search_hiding() => s.min(self.max_scroll(b)),
+            _ => s,
         }
     }
 
@@ -1812,7 +1817,7 @@ impl App {
     }
 
     pub fn max_scroll(&self, b: &BoxModel) -> f32 {
-        let n = b.active().map(|t| t.items.iter().filter(|k| self.items.contains_key(*k)).count()).unwrap_or(0);
+        let n = b.active().map(|t| self.shown_items(b, t).len()).unwrap_or(0);
         let rows = n.div_ceil(self.box_cols(b)) as f32;
         (rows * self.metrics(Some(b)).cell_h + 4.0 - Self::content_rect(b).h).max(0.0)
     }
@@ -2912,7 +2917,7 @@ impl App {
             return Hit::Empty;
         }
         for (k, c) in self.layout.loose.iter() {
-            if !self.items.contains_key(k) {
+            if !self.items.contains_key(k) || self.search_hides(k) {
                 continue;
             }
             let cell = self.grid.cell_rect(*c);
@@ -3642,7 +3647,7 @@ impl App {
 
     /// What the settings window shows that the layout can change (not the slider positions it
     /// sets itself, see `apply_setting`).
-    fn settings_sig(&self) -> String {
+    pub(crate) fn settings_sig(&self) -> String {
         let boxes: Vec<_> = self
             .layout
             .boxes
@@ -3720,7 +3725,7 @@ impl App {
             "tabs": { "style": self.settings.tabs.style, "hoverSwitch": self.settings.tabs.hover_switch, "combine": self.settings.tabs.combine },
             "az": { "letterBar": self.settings.az.letter_bar, "letterTags": self.settings.az.letter_tags },
             "icons": { "tint": self.settings.icons.tint, "tintStrength": self.settings.icons.tint_strength, "blend": self.settings.icons.blend, "blendStrength": self.settings.icons.blend_strength, "desktop": self.settings.icons.desktop, "blendBoxes": self.settings.icons.blend_boxes, "fullHover": self.settings.icons.full_on_hover, "fullActive": self.settings.icons.full_when_active },
-            "search": { "field": self.settings.search.field, "typeToSearch": self.settings.search.type_to_search },
+            "search": { "field": self.settings.search.field, "typeToSearch": self.settings.search.type_to_search, "results": self.settings.search.results, "hideToggle": self.settings.search.hide_toggle, "hide": self.settings.search.hide, "position": self.settings.search.position },
             "hide": { "doubleClick": self.settings.hide.double_click },
             "update": {
                 "auto": self.settings.update.auto,
@@ -3884,8 +3889,14 @@ impl App {
                 let on = val.as_bool().unwrap_or(true);
                 match k {
                     "field" => self.settings.search.field = on,
+                    "results" => self.settings.search.results = on,
+                    "hideToggle" => self.settings.search.hide_toggle = on,
+                    "hide" => self.set_search_hide(on),
+                    "position" => self.settings.search.position = if val.as_str() == Some("top") { "top".into() } else { "bottom".into() },
                     _ => self.settings.search.type_to_search = on,
                 }
+                self.sync_panel();
+                self.search.gen = self.search.gen.wrapping_add(1);
                 self.save_settings_soon();
                 self.settings_sent = self.settings_sig();
                 self.invalidate();
@@ -5409,6 +5420,9 @@ impl App {
         if self.above_click_outside(p) {
             return;
         }
+        if self.search_panel_down(p, dbl) {
+            return;
+        }
         if self.page_lbutton_down(p, dbl) {
             return;
         }
@@ -5831,7 +5845,7 @@ impl App {
             }
             return;
         }
-        if (self.on_pill(p) && !(self.search_query().trim().len() > 0 && p.x > self.pill_rect().right() - 34.0))
+        if (self.on_field(p) && !(self.search_query().trim().len() > 0 && p.x > self.pill_rect().right() - 34.0))
             || self.box_search_field().map(|(_, f)| f.contains(p) && p.x < f.right() - 26.0).unwrap_or(false)
         {
             unsafe {
@@ -6202,6 +6216,9 @@ impl App {
 
     fn on_wheel(&mut self, p: Pt, delta: i16, ctrl: bool) {
         self.hide_tip();
+        if self.search_panel_wheel(p, delta) {
+            return;
+        }
         // Alt+wheel: the pages.
         if self.page_wheel(delta) {
             return;
