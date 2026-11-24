@@ -3916,6 +3916,9 @@ impl App {
                     }
                 });
             }
+            ("transfer", k) => unsafe {
+                let _ = PostMessageW(Some(self.msg_hwnd), crate::events::WM_APP_TRANSFER, WPARAM((k == "import") as usize), LPARAM(0));
+            },
             ("saved", k) => {
                 let sid = v["box"].as_f64().unwrap_or(0.0) as u64;
                 match k {
@@ -6535,6 +6538,26 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
         if let Some((r, owner, title, start)) = req {
             if let Some(p) = crate::folderbox::pick_folder(owner, &title, &start) {
                 with(|app| app.apply_pick(r, &p));
+            }
+        }
+        return Some(Some(LRESULT(0)));
+    }
+    // Settings › Export / Import: Windows' file dialog, modal, outside the App's borrow too.
+    if m == crate::events::WM_APP_TRANSFER {
+        let import = w.0 == 1;
+        let req = with(|app| {
+            let l = app.lang;
+            let title = t(l, if import { S::ImportPickTitle } else { S::ExportPickTitle }).to_string();
+            let name = format!("Deskboxes {}", &crate::saved::shown(crate::saved::local_stamp())[..10]);
+            (app.hwnd, title, t(l, S::ExportFileType).to_string(), name)
+        });
+        if let Some((owner, title, kind, name)) = req {
+            if import {
+                if let Some(p) = crate::transfer::pick_open(owner, &title, &kind) {
+                    with(|app| app.ask_import(p));
+                }
+            } else if let Some(p) = crate::transfer::pick_save(owner, &title, &kind, &name) {
+                with(|app| app.exported(&p));
             }
         }
         return Some(Some(LRESULT(0)));

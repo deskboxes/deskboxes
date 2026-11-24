@@ -48,6 +48,7 @@ mod search;
 mod textedit;
 mod tuck;
 mod template;
+mod transfer;
 mod views;
 mod worker;
 
@@ -249,6 +250,7 @@ fn main() {
     }
     allow_dark_dialogs();
     let code = app::run(args, paths, t0);
+    transfer::respawn_if_wanted();
     log::logger().flush();
     std::process::exit(code);
 }

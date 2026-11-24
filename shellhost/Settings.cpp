@@ -862,6 +862,10 @@ namespace dbx
             };
             list(L"list", L"savedList", true);
             list(L"backups", L"backupsList", false);
+            // Everything to one file, and back (another PC).
+            x += Section(Str(L"transfer"));
+            x += Card(L"&#xEDE1;", Str(L"exportAll"), Str(L"exportAllDesc"), L"<Button x:Name=\"ExportAll\" Content=\"" + Str(L"exportButton") + L"\" MinWidth=\"120\"/>");
+            x += Card(L"&#xE8B5;", Str(L"importAll"), Str(L"importAllDesc"), L"<Button x:Name=\"ImportAll\" Content=\"" + Str(L"importButton") + L"\" MinWidth=\"120\"/>");
             return x;
         }
 
@@ -1706,6 +1710,8 @@ namespace dbx
             }
             // Saved layouts
             OnClick(root, L"SaveNow", L"saved", 0, L"now");
+            OnClick(root, L"ExportAll", L"transfer", 0, L"export");
+            OnClick(root, L"ImportAll", L"transfer", 0, L"import");
             OnToggle(root, L"SavedMenu", L"saved", L"inMenu");
             for (const wchar_t* k : { L"list", L"backups" })
                 for (auto const& e : g.data.GetNamedObject(L"saved", JsonObject()).GetNamedArray(k, JsonArray()))
@@ -2140,10 +2146,14 @@ namespace dbx
         if (gd.text) x += L"<TextBox x:Name=\"Field\" Text=\"" + s(L"value") + L"\" PlaceholderText=\"" + s(L"placeholder") + L"\" MaxLength=\"60\" Margin=\"0,4,0,0\"/>";
         x += LR"(</StackPanel>
 <Grid x:Name="Band" Grid.Row="1" Padding="24" ColumnSpacing="8" Background="{ThemeResource LayerOnMicaBaseAltFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,1,0,0">
-<Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-<Button x:Name="Ok" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Stretch" Content=")" + s(L"ok") + LR"("/>
-<Button x:Name="Cancel" Grid.Column="1" HorizontalAlignment="Stretch" Content=")" + s(L"cancel") + LR"("/>
-</Grid></Grid>)";
+<Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>)";
+        // No cancel text: a message, with OK alone (on the right, as a ContentDialog's).
+        if (s(L"cancel").empty())
+            x += LR"(<Button x:Name="Ok" Grid.Column="1" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Stretch" Content=")" + s(L"ok") + LR"("/>)";
+        else
+            x += LR"(<Button x:Name="Ok" Style="{StaticResource AccentButtonStyle}" HorizontalAlignment="Stretch" Content=")" + s(L"ok") + LR"("/>
+<Button x:Name="Cancel" Grid.Column="1" HorizontalAlignment="Stretch" Content=")" + s(L"cancel") + LR"("/>)";
+        x += LR"(</Grid></Grid>)";
         mux::FrameworkElement root{ nullptr };
         try { root = mux::Markup::XamlReader::Load(x).as<mux::FrameworkElement>(); }
         catch (winrt::hresult_error const& e) { Log(L"dialog: XAML failed: %s", e.message().c_str()); DialogSend(false, L""); return; }

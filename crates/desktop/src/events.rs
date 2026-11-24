@@ -16,6 +16,8 @@ pub const WM_APP_REFOCUS: u32 = WM_APP + 3;
 pub const WM_APP_RENAME_END: u32 = WM_APP + 6;
 /// Open the folder picker asked for (folder boxes), outside the App's borrow.
 pub const WM_APP_PICKFOLDER: u32 = WM_APP + 7;
+/// Settings › Export (wParam 0) or Import (1): the file dialog, outside the App's borrow.
+pub const WM_APP_TRANSFER: u32 = WM_APP + 9;
 /// The wheel turned while something is dragged over a box (from the drag's mouse hook).
 pub const WM_APP_DRAGWHEEL: u32 = WM_APP + 8;
 /// The wallpaper settings in the registry changed (see `watch_wallpaper`).

@@ -14,7 +14,7 @@ pub struct SavedLayout {
     pub boxes: usize,
 }
 
-fn local_stamp() -> u64 {
+pub fn local_stamp() -> u64 {
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     ((t.wYear as u64 * 100 + t.wMonth as u64) * 100 + t.wDay as u64) * 1_000_000 + (t.wHour as u64 * 100 + t.wMinute as u64) * 100 + t.wSecond as u64
 }
@@ -50,7 +50,7 @@ pub fn shown(id: u64) -> String {
 }
 
 impl App {
-    fn saved_dir(&self) -> PathBuf {
+    pub fn saved_dir(&self) -> PathBuf {
         self.paths.layouts.parent().map(|p| p.join("saved")).unwrap_or_else(|| self.paths.layouts.join("saved")).join(&self.topology)
     }
 

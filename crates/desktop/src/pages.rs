@@ -1134,6 +1134,10 @@ pub enum Ask {
     Merge,
     /// A screen was disconnected (`screens.rs`): "Show page" shows the first of its pages.
     ScreenGone(Option<u32>),
+    /// Import this export file (`transfer.rs`).
+    Import(std::path::PathBuf),
+    /// A message with only OK.
+    Info,
 }
 
 impl App {
@@ -1244,7 +1248,7 @@ impl App {
 
     /// Ask in a Fluent dialog of the shell host's (`ShowDialog`); the answer comes back to
     /// `on_dialog`.
-    fn open_dialog(&mut self, ask: Ask, mut body: serde_json::Value) {
+    pub(crate) fn open_dialog(&mut self, ask: Ask, mut body: serde_json::Value) {
         let Some(h) = self.host.clone() else {
             log::warn!("dialog asked for before the shell host is ready");
             return;
@@ -1444,6 +1448,7 @@ impl App {
                 }
                 self.next_screen_notice();
             }
+            Ask::Import(path) if ok => self.import_all(&path),
             _ => {}
         }
         self.invalidate();
