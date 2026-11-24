@@ -165,10 +165,16 @@ both sets for more than one frame.
 
 | Path | Trigger |
 |---|---|
-| Clean exit / "Disable Deskboxes" | core |
+| Clean exit / "Disable Deskboxes" | core (not when it starts again right away: sign-out with the autostart intact, an update that relaunches) |
 | Crash, hang > 6 s, abnormal exit | watchdog (waits on the process handle; hang = `SendMessageTimeout(WM_NULL)` to the core's window every 3 s; on recovery the core re-hides) |
 | `deskboxes --restore-icons` | panic command: asks a running core to quit, kills it after 2 s, restores |
 | `deskboxes --uninstall` | restore + remove the Run entry |
+
+**Sign-out and shutdown keep them hidden** (2026-11-24). On `WM_ENDSESSION` the core saves and exits without
+restoring when its autostart is intact, and the watchdog takes the core's end during `WM_QUERYENDSESSION`/
+`WM_ENDSESSION` for the session ending, not a crash (no restore, no restart, no hang check). Before, the watchdog
+restored the icons as the session ended, so Explorer drew them at the next sign-in before Deskboxes started. An
+update that starts Deskboxes again (`--update --launch`) keeps them hidden too; the installer restores them if it fails.
 
 **Never stuck with an empty desktop:**
 1. **At session end** (`WM_QUERYENDSESSION`) the core checks that its autostart is intact. The Run value must exist,

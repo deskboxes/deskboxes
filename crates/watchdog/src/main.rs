@@ -20,6 +20,10 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 static mut STOP: bool = false;
+/// Windows is signing out or shutting down: the core ending now is not a crash. The core itself
+/// decides whether Explorer's icons come back (they stay hidden when it starts again at sign-in,
+/// so Explorer never draws them before Deskboxes).
+static mut ENDING: bool = false;
 
 fn log(msg: &str) {
     let dir = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Deskboxes").join("logs");
@@ -34,6 +38,15 @@ extern "system" fn wndproc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if m == WM_CLOSE {
             STOP = true;
+            return LRESULT(0);
+        }
+        if m == WM_QUERYENDSESSION {
+            ENDING = true;
+            return LRESULT(1);
+        }
+        if m == WM_ENDSESSION {
+            // wParam 0: the end was called off.
+            ENDING = wp.0 != 0;
             return LRESULT(0);
         }
         DefWindowProcW(h, m, wp, lp)
@@ -69,6 +82,7 @@ enum Outcome {
     Crashed(u32),
     Hung,
     Stopped,
+    SessionEnd,
 }
 
 fn supervise(child: &mut std::process::Child) -> Outcome {
@@ -82,11 +96,15 @@ fn supervise(child: &mut std::process::Child) -> Outcome {
         if unsafe { STOP } {
             return Outcome::Stopped;
         }
+        if r == WAIT_OBJECT_0 && unsafe { ENDING } {
+            return Outcome::SessionEnd;
+        }
         if r == WAIT_OBJECT_0 {
             let code = child.wait().map(|s| s.code().unwrap_or(1) as u32).unwrap_or(1);
             return if code == 0 { Outcome::Clean } else { Outcome::Crashed(code) };
         }
-        if last_check.elapsed() >= Duration::from_secs(3) {
+        // (While the session ends the core is busy saving: not a hang.)
+        if last_check.elapsed() >= Duration::from_secs(3) && !unsafe { ENDING } {
             last_check = Instant::now();
             if let Some(h) = core_window(pid) {
                 let ok = unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 6000, None) };
@@ -167,6 +185,10 @@ fn main() {
             }
             Outcome::Stopped => {
                 log("stop requested (WM_CLOSE); not restarting");
+                break;
+            }
+            Outcome::SessionEnd => {
+                log("the session is ending: the core is gone; Explorer's icons left as it left them");
                 break;
             }
             Outcome::Crashed(code) => {

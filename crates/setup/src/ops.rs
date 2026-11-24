@@ -344,6 +344,12 @@ fn wait_or_kill(pid: u32, wait_ms: u32) -> bool {
 /// what does not exit. Then Deskboxes' other programs still running from `dir` (the shell host).
 /// Finally make sure Explorer's icons are visible. Returns whether Deskboxes was running.
 pub fn stop_app(dir: Option<&Path>) -> Result<bool, Failure> {
+    stop_app_keep(dir, false)
+}
+
+/// `stop_app`, leaving Explorer's icons hidden when `keep_hidden` (an update that starts
+/// Deskboxes again right after: Explorer would only show its icons for a moment).
+fn stop_app_keep(dir: Option<&Path>, keep_hidden: bool) -> Result<bool, Failure> {
     let mut was = false;
     unsafe {
         for class in [w!("DeskboxesWatchdog"), w!("DeskboxesCore")] {
@@ -382,8 +388,12 @@ pub fn stop_app(dir: Option<&Path>) -> Result<bool, Failure> {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    let s = hide::restore();
-    log(&format!("stop_app: was running={was}, icons {s:?}"));
+    if keep_hidden {
+        log(&format!("stop_app: was running={was}, Explorer's icons left as they are (Deskboxes starts again)"));
+    } else {
+        let s = hide::restore();
+        log(&format!("stop_app: was running={was}, icons {s:?}"));
+    }
     Ok(was)
 }
 
@@ -662,16 +672,28 @@ pub struct InstallOptions {
 }
 
 pub fn install(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report)) -> Result<bool, Failure> {
+    // An update that starts Deskboxes again keeps Explorer's icons hidden throughout; they come
+    // back if it fails or Deskboxes is not started.
+    let keep = o.update && o.launch;
+    let r = install_steps(p, o, report, keep);
+    if keep && !matches!(r, Ok(true)) {
+        let s = hide::restore();
+        log(&format!("update not finished ({r:?}): Explorer's icons back {s:?}"));
+    }
+    r
+}
+
+fn install_steps(p: &Payload, o: &InstallOptions, report: &dyn Fn(Report), keep: bool) -> Result<bool, Failure> {
     log(&format!("install {} to {} (autostart={}, start menu={}, launch={})", p.header.app_version, o.dir.display(), o.autostart, o.start_menu, o.launch));
     let old = installed();
     // 1. Close Deskboxes (it may be running from here, from an older folder, or a development build).
     report(Report::Step(Step::Closing));
     report(Report::Fraction(0.0));
-    let was_running = stop_app(Some(&o.dir))?;
+    let was_running = stop_app_keep(Some(&o.dir), keep)?;
     // (The same folder spelled differently is not another install.)
     let moved = old.as_ref().is_some_and(|old| !same_dir(&old.dir, &o.dir));
     if let Some(old) = old.as_ref().filter(|_| moved) {
-        let _ = stop_app(Some(&old.dir));
+        let _ = stop_app_keep(Some(&old.dir), keep);
     }
     check_location(&o.dir)?;
     let mut ours: Vec<String> = read_manifest(&o.dir).map(|m| m.files).unwrap_or_default();

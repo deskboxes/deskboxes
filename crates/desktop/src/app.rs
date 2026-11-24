@@ -506,6 +506,9 @@ pub struct App {
     pub stats: Stats,
     pub scanned_once: bool,
     pub quitting: bool,
+    /// Leave Explorer's icons hidden on the way out: Deskboxes comes straight back (the session
+    /// ends with the autostart intact, or an update installs and starts it again).
+    pub keep_hidden: bool,
     /// No snapshot to show yet (first run): keep Explorer's icons until the first scan is drawn,
     /// so the desktop is never empty while the cold scan runs.
     pub hide_after_scan: bool,
@@ -1227,6 +1230,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         stats: Stats::default(),
         scanned_once: false,
         quitting: false,
+        keep_hidden: false,
         hide_after_scan: false,
         snapshot_dirty: false,
         snapshot_job: None,
@@ -3947,7 +3951,11 @@ impl App {
                 }
                 "now" => crate::update::check_now(),
                 "install" => {
-                    if crate::update::install_pending(&self.paths.update, self.args.desktop_dir.is_none() && !self.args.window) {
+                    let relaunch = self.args.desktop_dir.is_none() && !self.args.window;
+                    if crate::update::install_pending(&self.paths.update, relaunch) {
+                        // The installer starts Deskboxes again: Explorer's icons stay hidden
+                        // through it (it shows them if the update fails).
+                        self.keep_hidden = relaunch;
                         unsafe {
                             let _ = PostMessageW(Some(self.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
@@ -6473,6 +6481,16 @@ impl App {
         }
     }
 
+    /// The session is ending (WM_ENDSESSION): everything saved, and Explorer's icons left hidden
+    /// when Deskboxes starts again at sign-in (so Explorer never shows them first), or shown
+    /// when it would not (`on_query_end_session`).
+    fn on_end_session(&mut self) {
+        let back = self.desktop_mode && !self.args.no_hide && autostart::intact();
+        log::info!("session ends: saving; Explorer's icons {}", if back { "stay hidden" } else { "shown" });
+        self.keep_hidden = back;
+        self.shutdown();
+    }
+
     pub fn shutdown(&mut self) {
         if self.quitting {
             return;
@@ -6493,7 +6511,9 @@ impl App {
         if let Some(mut c) = self.host_child.take() {
             let _ = c.wait_timeout_ms(1500);
         }
-        if self.desktop_mode && !self.args.no_hide {
+        if self.desktop_mode && !self.args.no_hide && self.keep_hidden {
+            log::info!("exit: Explorer's icons stay hidden (Deskboxes starts again)");
+        } else if self.desktop_mode && !self.args.no_hide {
             let s = hide::restore();
             log::info!("exit: native icons restored {s:?}");
         }
@@ -6968,6 +6988,12 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             WM_QUERYENDSESSION => {
                 app.on_query_end_session();
                 Some(LRESULT(1))
+            }
+            // wParam 0: the end was called off.
+            WM_ENDSESSION if w.0 != 0 => {
+                app.on_end_session();
+                PostQuitMessage(0);
+                Some(LRESULT(0))
             }
             WM_CLOSE if h == app.msg_hwnd => {
                 app.shutdown();
