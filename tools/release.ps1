@@ -58,7 +58,7 @@ if ($LASTEXITCODE) { throw 'build failed' }
 # 3. The release files.
 $out = Join-Path $root 'out\Release\release'
 New-Item -ItemType Directory -Force $out | Out-Null
-Get-ChildItem $out | Remove-Item -Force
+Get-ChildItem $out | Remove-Item -Recurse -Force
 $setup = Join-Path $out 'DeskboxesSetup.exe'
 Copy-Item (Join-Path $root 'out\Release\DeskboxesSetup.exe') $setup
 $f = Get-Item $setup
