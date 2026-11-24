@@ -49,6 +49,7 @@ mod textedit;
 mod tuck;
 mod template;
 mod transfer;
+mod uia;
 mod views;
 mod worker;
 

@@ -617,6 +617,7 @@ impl App {
             for h in std::iter::once(old_main).chain(old.iter().skip(1).map(|s| s.hwnd)) {
                 if IsWindow(Some(h)).as_bool() {
                     let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
+                    crate::uia::forget(h);
                     let _ = DestroyWindow(h);
                 }
             }

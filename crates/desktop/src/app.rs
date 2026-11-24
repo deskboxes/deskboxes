@@ -6274,6 +6274,28 @@ impl App {
                     }
                 }
             }
+            // Tab, Shift+Tab, F6: the first icon of the next (previous) box, the desktop's own
+            // icons first, then the boxes as they read, top to bottom.
+            VK_TAB | VK_F6 => {
+                let cells = self.visible_cells();
+                let mut boxes: Vec<&BoxModel> = self.layout.boxes.iter().collect();
+                boxes.sort_by(|a, b| (a.rect.y, a.rect.x).partial_cmp(&(b.rect.y, b.rect.x)).unwrap_or(std::cmp::Ordering::Equal));
+                let mut groups: Vec<Option<u32>> = std::iter::once(None).chain(boxes.iter().map(|b| Some(b.id))).collect();
+                groups.retain(|g| cells.iter().any(|c| c.2 == *g));
+                if groups.is_empty() {
+                    return true;
+                }
+                let cur = self.focus_cell().and_then(|(k, _)| cells.iter().find(|c| c.0 == k).map(|c| c.2));
+                let n = groups.len();
+                let j = match cur.and_then(|c| groups.iter().position(|g| *g == c)) {
+                    None => 0,
+                    Some(i) if shift => (i + n - 1) % n,
+                    Some(i) => (i + 1) % n,
+                };
+                if let Some(k) = cells.iter().find(|c| c.2 == groups[j]).map(|c| c.0.clone()) {
+                    self.sel.select_only(&k);
+                }
+            }
             VK_HOME | VK_END => {
                 let k = if vk == VK_HOME { order.first() } else { order.last() }.cloned();
                 if let Some(k) = k {
@@ -6541,6 +6563,13 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             }
         }
         return Some(Some(LRESULT(0)));
+    }
+    // A screen reader asking for the window's elements (`uia`): answered from their copy, never
+    // waiting for the App.
+    if m == WM_GETOBJECT {
+        if let Some(r) = crate::uia::get_object(h, w, l) {
+            return Some(Some(r));
+        }
     }
     // Settings › Export / Import: Windows' file dialog, modal, outside the App's borrow too.
     if m == crate::events::WM_APP_TRANSFER {

@@ -140,6 +140,7 @@ impl App {
         let mine = self.draw_screen_only();
         crate::anim::set(mine || others);
         self.note_long_animation(mine || others, mine);
+        crate::uia::update(self);
     }
 
     /// Frames at the refresh rate for half a minute on end are a stuck animation (a screen's held
