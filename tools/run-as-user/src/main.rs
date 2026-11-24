@@ -1,6 +1,6 @@
 //! `run-as-user [--no-wait] [--out <file>] [--cwd <dir>] -- <program> [args...]`
 //!
-//! Test-harness tool. Claude Code runs this project's automated tests from an ELEVATED
+//! Test-harness tool. The automated tests may run from an ELEVATED
 //! terminal, but Deskboxes must be tested at normal user integrity (UIPI blocks drag
 //! and drop between elevated windows and Explorer; shell behaviour differs too).
 //!

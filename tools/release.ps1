@@ -95,7 +95,7 @@ if (-not $Publish) {
 git add Cargo.toml Cargo.lock
 git diff --cached --quiet
 if ($LASTEXITCODE) {
-    git commit -q -m "Deskboxes $Version" -m 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>'
+    git commit -q -m "Deskboxes $Version"
 }
 git tag -a "v$Version" -m "Deskboxes $Version"
 git push -q origin main "v$Version"
