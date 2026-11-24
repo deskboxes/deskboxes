@@ -1,7 +1,9 @@
 // Record art.html's scenes with headless Chrome (DevTools protocol, its own throwaway profile in %TEMP%):
 //   out\NAME_THEME.png      the still (frame 0) at full size, for export.py
-//   res\settings\NAME[_l].mp4  the clip (scenes with a duration), 1280x720 H.264, played on hover in Settings and at the top of its page
-// node tools/art/render.mjs [scene ...] [--themes dark,light] [--no-clips] [--fps 30]
+//   res\settings\NAME[_l].mp4  the clip (scenes with a duration), 1280x720 H.264, played at the top of its page in Settings
+//   res\settings\t_NAME[_l].mp4  the same at the Home tile's size (440x248, as t_NAME.jpg), played on hover over the tile
+// node tools/art/render.mjs [scene ...] [--themes dark,light] [--no-clips] [--tiles-only] [--fps 30]
+// (--tiles-only: only the tile clips, the page clips kept as they are)
 // Needs Chrome and ffmpeg on PATH.
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -11,12 +13,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const A = path.dirname(fileURLToPath(import.meta.url));
 const RES = path.resolve(A, '..', '..', 'res', 'settings');
+// The scenes with a Home tile (as in export.py), which get a tile-sized clip too.
+const TILES = new Set(['tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy', 'pages']);
 const ALL = ['home', 'boxes', 'look', 'icons', 'tabs', 'rollup', 'rules', 'az', 'blend', 'colors', 'folder', 'above', 'hide', 'saved', 'search', 'locks', 'privacy', 'pages'];
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf(n); return i < 0 ? d : args.splice(i, 2)[1]; };
 const themes = opt('--themes', 'dark,light').split(',');
 const fps = +opt('--fps', '30');
 const noClips = args.includes('--no-clips') ? args.splice(args.indexOf('--no-clips'), 1) : false;
+const tilesOnly = args.includes('--tiles-only') ? args.splice(args.indexOf('--tiles-only'), 1) : false;
 const scenes = args.length ? args : ALL;
 const VW = 1280, VH = 720;
 
@@ -82,14 +87,24 @@ for (const s of scenes) {
       fs.writeFileSync(path.join(dir, `f${String(i).padStart(4, '0')}.png`), Buffer.from(f.data, 'base64'));
       if (process.env.ART_TIME) console.log('frame', t1 - t0, 'paint', t2 - t1, 'shot', Date.now() - t2);
     }
-    const mp4 = path.join(RES, s + (th === 'light' ? '_l' : '') + '.mp4');
-    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-framerate', String(fps), '-i', path.join(dir, 'f%04d.png'), '-vf', `scale=${VW}:${VH}:flags=lanczos`,
-      // Level 3.1 with few reference frames: any H.264 decoder plays it (veryslow's 16 references
-      // made level 5.0 streams, which some PCs' decoders refused: no clips there).
-      '-c:v', 'libx264', '-preset', 'veryslow', '-refs', '4', '-bf', '2', '-crf', '26', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level:v', '3.1',
+    const suf = th === 'light' ? '_l' : '';
+    // Level 3.1 with few reference frames: any H.264 decoder plays it (veryslow's 16 references
+    // made level 5.0 streams, which some PCs' decoders refused: no clips there).
+    const enc = (w, h, crf, mp4) => execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-framerate', String(fps), '-i', path.join(dir, 'f%04d.png'), '-vf', `scale=${w}:${h}:flags=lanczos`,
+      '-c:v', 'libx264', '-preset', 'veryslow', '-refs', '4', '-bf', '2', '-crf', String(crf), '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level:v', '3.1',
       '-x264-params', 'vbv-maxrate=14000:vbv-bufsize=14000', '-movflags', '+faststart', '-an', mp4]);
+    const mp4 = path.join(RES, s + suf + '.mp4');
+    if (!tilesOnly) enc(VW, VH, 26, mp4);
+    // A tile's own clip: the player shrinking the big one to a tile blurred it (it showed softer
+    // than the tile's picture); this one is drawn about 1:1 (2:1 at 100% scaling).
+    let tile = '';
+    if (TILES.has(s)) {
+      const t = path.join(RES, 't_' + s + suf + '.mp4');
+      enc(440, 248, 18, t);
+      tile = `, tile ${Math.round(fs.statSync(t).size / 1024)} KB`;
+    }
     fs.rmSync(dir, { recursive: true, force: true });
-    console.log(s, th, n, 'frames', Math.round(fs.statSync(mp4).size / 1024), 'KB');
+    console.log(s, th, n, 'frames', Math.round(fs.statSync(mp4).size / 1024), 'KB' + tile);
   }
 }
 ws.close();

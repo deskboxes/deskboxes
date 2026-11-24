@@ -1044,11 +1044,15 @@ namespace dbx
                 // open the page) has its own column in the title row, so it never covers the
                 // description however the text wraps (it was placed over the tile at a fixed spot and
                 // ran into the description with larger text, round 10).
+                // The tile's own clip, at its picture's size (the page's big one, shrunk by the player,
+                // came out softer than the picture); the big one where a tile has none.
+                std::wstring clip = std::wstring(L"t_") + t.pic;
+                if (!HasClip(clip.c_str())) clip = t.pic;
                 x += L"<Grid x:Name=\"TileG_" + tag + L"\" Margin=\"0,0,8,8\">"
                      L"<Button x:Name=\"Tile_" + tag + L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\""
                      L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\"/>"
                      L"<Grid Margin=\"1\"><Grid.RowDefinitions><RowDefinition Height=\"123\"/><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
-                     L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0", t.pic, L"t_" + tag) + L"</Grid>"
+                     L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0", clip.c_str(), L"t_" + tag) + L"</Grid>"
                      L"<Grid Grid.Row=\"1\" Margin=\"14,10,10,0\" ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
                      L"<TextBlock Text=\"" + Str(t.title) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" VerticalAlignment=\"Center\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/>";
                 if (t.scope)
@@ -1604,9 +1608,17 @@ namespace dbx
         // Polled, for the player says nothing when a frame arrives; `want` going false
         // (the pointer left) stops it. The timer is kept in the clip's state: a timer nothing holds
         // is released at once and never ticks (the clips then played unseen).
+        //
+        // A new player first plays a little off its place (about a pixel lower and smaller) and
+        // moves into it half a second in, then keeps it. So a clip plays once under its picture
+        // before it is first shown (`warming`), long enough to settle, and goes back to its start;
+        // a play wanted meanwhile begins when that ends.
+        constexpr auto kClipSettle = std::chrono::milliseconds(900);
         struct ClipState
         {
             bool want = false;
+            bool warming = false;                              // the unseen first play runs
+            bool warm = false;                                 // done, for this player
             int ticks = 0;
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{ nullptr };
             // The picture over the video (Still_KEY in Pic).
@@ -1634,17 +1646,42 @@ namespace dbx
                     {
                         auto st = ws.lock();
                         auto e = weak.get();
+                        auto mp = e ? e.MediaPlayer() : nullptr;
                         // (Up to ~30 s: a first clip can be slow to open on a slow PC.)
-                        if (!st || !e || !st->want || ++st->ticks > 1000) { t.Stop(); return; }
-                        auto mp = e.MediaPlayer();
-                        if (!mp) return;
+                        if (!st || !mp || ++st->ticks > 1000 || (!st->want && !st->warming))
+                        {
+                            if (st && st->warming && mp) mp.Pause();
+                            if (st) st->warming = false;
+                            t.Stop();
+                            return;
+                        }
                         auto s = mp.PlaybackSession();
                         // First the video turns visible under the picture (a video element that
                         // was transparent takes a few frames to show again: the picture fading
                         // at once let the page show through); then the picture fades.
+                        bool runs = s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(40);
+                        if (st->warming)
+                        {
+                            if (runs)
+                                if (auto p = st->player.get()) p.Opacity(1.0);
+                            if (s.Position() < kClipSettle) return;
+                            st->warming = false;
+                            st->warm = true;
+                            s.Position(std::chrono::seconds(0));
+                            if (!st->want)
+                            {
+                                mp.Pause();
+                                t.Stop();
+                                return;
+                            }
+                            // Wanted meanwhile: it goes on, shown from its start.
+                            st->ticks = 0;
+                            st->shownAt = -1;
+                            return;
+                        }
                         if (st->shownAt < 0)
                         {
-                            if (s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(40))
+                            if (runs)
                             {
                                 if (auto p = st->player.get()) p.Opacity(1.0);
                                 st->shownAt = st->ticks;
@@ -1688,6 +1725,15 @@ namespace dbx
             return false;
         }
 
+        // Play a new player's clip once under its picture (see ClipState), unless it was.
+        void WarmClip(muxc::MediaPlayerElement const& e, std::shared_ptr<ClipState> st)
+        {
+            if (st->warm || st->warming) return;
+            st->warming = true;
+            e.MediaPlayer().Play();
+            RevealClip(e, st);
+        }
+
         // Start (or restart from the beginning) a feature's clip on its element; see WireClip.
         void StartClip(muxc::MediaPlayerElement const& e, const std::wstring& clip, std::shared_ptr<ClipState> want)
         {
@@ -1701,6 +1747,12 @@ namespace dbx
             if (!LoadClip(e, clip)) return;
             want->want = true;
             want->Cover(true);
+            // Not settled yet: it plays when that is done.
+            if (!want->warm)
+            {
+                WarmClip(e, want);
+                return;
+            }
             auto mp = e.MediaPlayer();
             if (mp.PlaybackSession().Position() > std::chrono::milliseconds(0))
                 mp.PlaybackSession().Position(std::chrono::seconds(0));
@@ -1713,7 +1765,7 @@ namespace dbx
         // a feature's own page (`autoplay`) it plays from the start for as long as the page shows.
         // The picture over it fades out once it runs. Nothing plays when Windows' animation effects
         // are off. The player is made when it first plays and kept out of the system's media controls.
-        void WireClip(mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el, bool autoplay = false)
+        void WireClip(mux::FrameworkElement const& root, mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el, bool autoplay = false)
         {
             if (!hover || !el) return;
             std::wstring tag = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
@@ -1733,7 +1785,9 @@ namespace dbx
                     auto vis = mux::Hosting::ElementCompositionPreview::GetElementVisual(frame);
                     vis.Clip(vis.Compositor().CreateRectangleClip(0, 0, (float)e.ActualWidth(), (float)e.ActualHeight(), { rt, rt }, { rt, rt }, { rb, rb }, { rb, rb }));
                 });
-            auto still = el.FindName(L"Still_" + std::wstring(el.Name()).substr(5)).try_as<mux::UIElement>();
+            // Looked up from the page: the player's own FindName searches its template and found
+            // nothing, so no clip was ever wired (0.1.5 and before).
+            auto still = Find<mux::UIElement>(root, L"Still_" + std::wstring(el.Name()).substr(5));
             if (!still) return;
             mux::ScalarTransition fade;
             fade.Duration(std::chrono::milliseconds(autoplay ? 260 : 160));
@@ -1744,8 +1798,9 @@ namespace dbx
             auto stop = [weak, want]
             {
                 want->want = false;
-                if (want->timer) want->timer.Stop();
                 want->Cover(true);
+                if (want->warming) return;                     // it pauses when settled
+                if (want->timer) want->timer.Stop();
                 auto e = weak.get();
                 if (!e) return;
                 if (auto mp = e.MediaPlayer()) mp.Pause();
@@ -1756,12 +1811,15 @@ namespace dbx
                     auto e = weak.get();
                     if (!e) return;
                     if (autoplay) StartClip(e, clip, want);
-                    else if (winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) LoadClip(e, clip);
+                    else if (winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled() && LoadClip(e, clip)) WarmClip(e, want);
                 });
             // The page went (another one was picked, or the window closed): let the file go.
-            el.Unloaded([weak, stop](auto&&, auto&&)
+            el.Unloaded([weak, stop, want](auto&&, auto&&)
                 {
+                    want->warming = false;
                     stop();
+                    // The next player (LoadClip makes one when shown again) settles anew.
+                    want->warm = false;
                     if (auto e = weak.get())
                         if (auto mp = e.MediaPlayer()) mp.Source(nullptr);
                 });
@@ -1850,8 +1908,8 @@ namespace dbx
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
-                WireClip(Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<muxc::MediaPlayerElement>(root, L"Clip_t_" + std::wstring(t.page)));
-            WireClip(Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"), true);
+                WireClip(root, Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<muxc::MediaPlayerElement>(root, L"Clip_t_" + std::wstring(t.page)));
+            WireClip(root, Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"), true);
             if (auto tiles = Find<muxc::VariableSizedWrapGrid>(root, L"Tiles"))
                 tiles.SizeChanged([](winrt::Windows::Foundation::IInspectable const& s, mux::SizeChangedEventArgs const& e)
                     {
