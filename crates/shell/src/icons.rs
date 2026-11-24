@@ -80,12 +80,37 @@ pub fn folder_image(parsing: &str, px: u32) -> Option<IconImage> {
         // flattened (no alpha, or on black), e.g. while its thumbnail cache is still being built at
         // sign-in; drawn as is, the folder sits in a black box. The caller falls back to the plain
         // folder icon instead.
-        if !had_alpha || !see_through_corners(&img) {
-            log::info!("folder picture without transparency for {parsing}; using the icon");
+        if !had_alpha || !see_through_corners(&img) || forced_flat() {
+            log::info!("folder picture without transparency for {parsing}; using the icon for now");
+            FLAT.lock().unwrap_or_else(|p| p.into_inner()).push(parsing.to_string());
             return None;
         }
         Some(img)
     }
+}
+
+/// Folders whose picture came back flattened since `take_flat` was last called: worth asking for
+/// again once Windows has its thumbnail ready.
+static FLAT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The folders `folder_image` turned down since the last call.
+pub fn take_flat() -> Vec<String> {
+    std::mem::take(&mut *FLAT.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Tests (debug builds only): `DBX_TEST_FLAT_FOLDERS=n` takes the first n folder pictures for
+/// flattened ones.
+fn forced_flat() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LEFT: AtomicI64 = AtomicI64::new(i64::MIN);
+    if LEFT.load(Ordering::Relaxed) == i64::MIN {
+        let n = std::env::var("DBX_TEST_FLAT_FOLDERS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let _ = LEFT.compare_exchange(i64::MIN, n, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    LEFT.fetch_sub(1, Ordering::Relaxed) > 0
 }
 
 /// Whether at least three of the four corner pixels are mostly transparent.

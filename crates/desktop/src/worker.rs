@@ -525,6 +525,10 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
     let mut sized: HashMap<u32, IconCache> = HashMap::new();
     let mut first = true;
     let mut batch: Vec<Req> = Vec::new();
+    // Folders whose picture Windows handed back flattened (`icons::take_flat`): how often each
+    // was asked for again, and when the next rescan asks.
+    let mut flat_tries: HashMap<String, usize> = HashMap::new();
+    let mut retry_at: Option<Instant> = None;
     loop {
         // An STA must pump: shell drop targets and the copy engine call back into this
         // apartment (the data object lives here) from their own threads.
@@ -537,8 +541,14 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
             }
         }
         if batch.is_empty() {
+            if retry_at.is_some_and(|t| Instant::now() >= t) {
+                retry_at = None;
+                log::info!("asking again for {} folder picture(s)", flat_tries.len());
+                post(Ev::Rescan);
+            }
+            let wait = retry_at.map_or(INFINITE, |t| t.saturating_duration_since(Instant::now()).as_millis().min(u32::MAX as u128 - 1) as u32);
             let h = [HANDLE(ev as _)];
-            if unsafe { MsgWaitForMultipleObjectsEx(Some(&h), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) } == WAIT_FAILED {
+            if unsafe { MsgWaitForMultipleObjectsEx(Some(&h), wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE) } == WAIT_FAILED {
                 log::error!("worker wait failed");
                 return;
             }
@@ -755,6 +765,19 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                     log::info!("drop {} item(s) on {target}: {r:?}", paths.len());
                     post(Ev::Rescan);
                 }
+            }
+        }
+        // Folder pictures Windows handed back flattened: their plain folder icon stands in, and a
+        // later scan asks again (forgotten here, so it is made anew), after 10 s, 30 s, 2 and
+        // 10 minutes; Windows is usually still building the folder's thumbnail.
+        const RETRY_S: [u64; 4] = [10, 30, 120, 600];
+        for p in icons::take_flat() {
+            let n = flat_tries.entry(p.clone()).or_insert(0);
+            if let Some(&s) = RETRY_S.get(*n) {
+                *n += 1;
+                cache.remove(&p);
+                let at = Instant::now() + std::time::Duration::from_secs(s);
+                retry_at = Some(retry_at.map_or(at, |t| t.min(at)));
             }
         }
     }
