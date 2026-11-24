@@ -787,6 +787,8 @@ pub fn settings_strings(lang: Lang) -> Vec<(&'static str, &'static str)> {
         ("backupsList", s("Daily backups (the last seven days)", "Kopie dzienne (ostatnie siedem dni)")),
         ("noSaved", s("Nothing here yet.", "Na razie nic tu nie ma.")),
         ("transfer", s("Move to another PC", "Przenoszenie na inny komputer")),
+        ("findPlaceholder", s("Find a setting", "Znajdź ustawienie")),
+        ("findNone", s("No results", "Brak wyników")),
         ("exportAll", s("Export everything", "Eksportuj wszystko")),
         ("exportAllDesc", s("Boxes, pages, rules, saved layouts and settings in one file", "Pola, strony, reguły, zapisane układy i ustawienia w jednym pliku")),
         ("exportButton", s("Export…", "Eksportuj…")),

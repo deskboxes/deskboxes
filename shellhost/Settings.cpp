@@ -35,6 +35,17 @@ namespace dbx
             // A page switch waiting for the old page to fade out (kept here: a timer nothing
             // holds is released at once and never ticks).
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer switchTimer{ nullptr };
+            // Finding a setting (the box at the top of the navigation): every page's cards and
+            // headings, gathered by building the pages' text once (`indexing`).
+            struct Entry { std::wstring page, title, desc; bool isPage = false; };
+            std::vector<Entry> index;
+            bool indexing = false;
+            std::wstring indexPage;
+            std::vector<Entry> hits;          // the suggestions shown, in their order
+            std::wstring findTitle;           // a card to bring into view once its page is shown
+            int findTries = 0;
+            winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer findTimer{ nullptr };
+            winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer flashTimer{ nullptr };
         };
         State g;
 
@@ -55,6 +66,16 @@ namespace dbx
             return o;
         }
 
+        // Esc's text back (for showing it outside XAML markup, and for comparing).
+        std::wstring Unesc(std::wstring s)
+        {
+            const std::pair<const wchar_t*, const wchar_t*> ents[] = { { L"&lt;", L"<" }, { L"&gt;", L">" }, { L"&quot;", L"\"" }, { L"&apos;", L"'" }, { L"&amp;", L"&" } };
+            for (auto const& [from, to] : ents)
+                for (size_t i = s.find(from); i != std::wstring::npos; i = s.find(from, i + wcslen(to)))
+                    s.replace(i, wcslen(from), to);
+            return s;
+        }
+
         std::wstring Str(const wchar_t* key)
         {
             auto s = g.data.GetNamedObject(L"strings", JsonObject());
@@ -69,6 +90,7 @@ namespace dbx
         // One settings card: optional glyph, title and description on the left, control right.
         std::wstring Card(const std::wstring& glyph, const std::wstring& title, const std::wstring& desc, const std::wstring& control)
         {
+            if (g.indexing) g.index.push_back({ g.indexPage, Unesc(title), Unesc(desc) });
             std::wstring x = LR"(<Border Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="{StaticResource ControlCornerRadius}" Padding="16,10" MinHeight="64">
   <Grid ColumnSpacing="16"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>)";
             if (!glyph.empty()) x += L"<FontIcon Glyph=\"" + glyph + L"\" FontSize=\"20\" VerticalAlignment=\"Center\"/>";
@@ -81,6 +103,7 @@ namespace dbx
 
         std::wstring Section(const std::wstring& title)
         {
+            if (g.indexing) g.index.push_back({ g.indexPage, Unesc(title), L"" });
             return L"<TextBlock Text=\"" + title + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" Margin=\"1,24,0,6\"/>";
         }
 
@@ -1157,6 +1180,7 @@ namespace dbx
 <Grid x:Name="TitleBar" Height="48" Background="Transparent"><StackPanel Orientation="Horizontal" Spacing="12" Margin="16,0,0,0" VerticalAlignment="Center">
 <Image Source="ms-appx:///deskboxes.png" Width="16" Height="16"/><TextBlock Text=")" + Str(L"title") + LR"(" Style="{StaticResource CaptionTextBlockStyle}" VerticalAlignment="Center"/></StackPanel></Grid>
 <NavigationView x:Name="Nav" Grid.Row="1" PaneDisplayMode="Left" IsBackButtonVisible="Collapsed" IsSettingsVisible="False" IsPaneToggleButtonVisible="False" OpenPaneLength="250" IsTitleBarAutoPaddingEnabled="False">
+<NavigationView.AutoSuggestBox><AutoSuggestBox x:Name="Find" PlaceholderText=")" + Str(L"findPlaceholder") + LR"(" QueryIcon="Find" AutomationProperties.Name=")" + Str(L"findPlaceholder") + LR"("/></NavigationView.AutoSuggestBox>
 <NavigationView.MenuItems>)";
             auto item = [cur](const Page& p)
             {
@@ -1333,10 +1357,204 @@ namespace dbx
             if (nav)
                 for (auto const& o : nav.MenuItems())
                     if (auto it = o.try_as<muxc::NavigationViewItem>())
-                        if (winrt::unbox_value_or<winrt::hstring>(it.Tag(), L"") == tag) { nav.SelectedItem(it); return; }
+                        if (winrt::unbox_value_or<winrt::hstring>(it.Tag(), L"") == tag)
+                        {
+                            // (An entry under Look stayed marked as selected beside the new one.)
+                            for (auto const& p : nav.MenuItems())
+                                if (auto grp = p.try_as<muxc::NavigationViewItem>())
+                                    for (auto const& c : grp.MenuItems())
+                                        if (auto ci = c.try_as<muxc::NavigationViewItem>()) ci.IsSelected(false);
+                            nav.SelectedItem(it);
+                            return;
+                        }
             for (auto const& p : kPages)
                 if (tag == p.tag && p.group) g.lookOpen = true;
             g.window.DispatcherQueue().TryEnqueue([] { Build(); });
+        }
+
+        // ------------------------------------------------------------ finding a setting
+
+        std::wstring Lower(std::wstring s)
+        {
+            if (!s.empty()) CharLowerBuffW(s.data(), (DWORD)s.size());
+            return s;
+        }
+
+        const wchar_t* PageTitleKey(const std::wstring& tag)
+        {
+            for (auto const& p : kPages)
+                if (tag == p.tag) return p.title;
+            return L"";
+        }
+
+        // Every page's cards and headings (Home's tiles only lead to pages: left out).
+        void BuildIndex()
+        {
+            g.index.clear();
+            g.indexing = true;
+            for (auto const& p : kPages)
+            {
+                if (std::wstring(p.tag) == L"home") continue;
+                g.indexPage = p.tag;
+                g.index.push_back({ p.tag, Unesc(Str(p.title)), L"", true });
+                try { p.build(); }
+                catch (...) {}
+            }
+            g.indexing = false;
+        }
+
+        // What a suggestion says: the setting, and its page after it.
+        std::wstring Label(const State::Entry& e)
+        {
+            return e.isPage ? e.title : e.title + L"  ·  " + Unesc(Str(PageTitleKey(e.page)));
+        }
+
+        // Settings whose words have all of the query's words in them (names first, then pages,
+        // then descriptions), at most 12, each once.
+        std::vector<State::Entry> Search(const std::wstring& query)
+        {
+            std::vector<std::wstring> words;
+            {
+                std::wstring q = Lower(query), w;
+                for (wchar_t c : q + L" ")
+                    if (iswspace(c)) { if (!w.empty()) words.push_back(w); w.clear(); }
+                    else w += c;
+            }
+            std::vector<State::Entry> out;
+            if (words.empty()) return out;
+            if (g.index.empty()) BuildIndex();
+            std::vector<std::pair<int, size_t>> ranked;
+            for (size_t i = 0; i < g.index.size(); i++)
+            {
+                auto const& e = g.index[i];
+                std::wstring title = Lower(e.title), all = title + L" " + Lower(e.desc) + L" " + Lower(Unesc(Str(PageTitleKey(e.page))));
+                bool every = std::all_of(words.begin(), words.end(), [&](auto const& w) { return all.find(w) != std::wstring::npos; });
+                if (!every) continue;
+                bool inTitle = std::all_of(words.begin(), words.end(), [&](auto const& w) { return title.find(w) != std::wstring::npos; });
+                int rank = title.rfind(words[0], 0) == 0 ? 0 : inTitle ? 1 : e.isPage ? 2 : 3;
+                ranked.push_back({ rank, i });
+            }
+            std::stable_sort(ranked.begin(), ranked.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+            std::set<std::wstring> seen;
+            for (auto const& [rank, i] : ranked)
+            {
+                auto const& e = g.index[i];
+                if (e.title.empty() || !seen.insert(e.page + L"|" + e.title).second) continue;
+                out.push_back(e);
+                if (out.size() == 12) break;
+            }
+            return out;
+        }
+
+        muxc::TextBlock FindText(mux::DependencyObject const& o, const std::wstring& text)
+        {
+            if (auto t = o.try_as<muxc::TextBlock>(); t && t.Text() == text) return t;
+            int n = mux::Media::VisualTreeHelper::GetChildrenCount(o);
+            for (int i = 0; i < n; i++)
+                if (auto t = FindText(mux::Media::VisualTreeHelper::GetChild(o, i), text)) return t;
+            return nullptr;
+        }
+
+        // The card being looked for, once its page is there: brought into view and outlined in
+        // the accent color for a moment. False while the page is not there yet.
+        bool ShowFound()
+        {
+            if (g.findTitle.empty()) return true;
+            if (!g.window || g.builtPage != g.page) return false;
+            auto root = g.window.Content().try_as<mux::FrameworkElement>();
+            auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
+            auto page = nav ? nav.Content().try_as<mux::FrameworkElement>() : mux::FrameworkElement{ nullptr };
+            auto body = page ? Find<mux::FrameworkElement>(page, L"PageBody") : mux::FrameworkElement{ nullptr };
+            auto text = body ? FindText(body, g.findTitle) : muxc::TextBlock{ nullptr };
+            if (!text) return false;
+            g.findTitle.clear();
+            // Its card: the Border around it (a heading has none).
+            muxc::Border card{ nullptr };
+            for (mux::DependencyObject o = mux::Media::VisualTreeHelper::GetParent(text); o && o != body; o = mux::Media::VisualTreeHelper::GetParent(o))
+                if ((card = o.try_as<muxc::Border>())) break;
+            mux::UIElement target = card ? card.as<mux::UIElement>() : text.as<mux::UIElement>();
+            mux::BringIntoViewOptions opt;
+            opt.AnimationDesired(true);
+            opt.VerticalAlignmentRatio(0.3);
+            target.StartBringIntoView(opt);
+            if (card)
+            {
+                auto oldBrush = card.BorderBrush();
+                auto oldThick = card.BorderThickness();
+                auto accent = winrt::Windows::UI::ViewManagement::UISettings().GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Accent);
+                card.BorderBrush(mux::Media::SolidColorBrush(accent));
+                card.BorderThickness(mux::ThicknessHelper::FromUniformLength(2));
+                winrt::weak_ref<muxc::Border> weak{ card };
+                if (g.flashTimer) g.flashTimer.Stop();
+                g.flashTimer = g.window.DispatcherQueue().CreateTimer();
+                g.flashTimer.Interval(std::chrono::milliseconds(1800));
+                g.flashTimer.IsRepeating(false);
+                g.flashTimer.Tick([weak, oldBrush, oldThick](auto&&, auto&&)
+                {
+                    if (auto c = weak.get()) { c.BorderBrush(oldBrush); c.BorderThickness(oldThick); }
+                });
+                g.flashTimer.Start();
+            }
+            return true;
+        }
+
+        // A suggestion chosen: its page, then its card.
+        void OpenFound(const State::Entry& e)
+        {
+            Log(L"settings: found '%s' on %s", e.title.c_str(), e.page.c_str());
+            g.findTitle = e.isPage ? L"" : e.title;
+            g.findTries = 0;
+            if (e.page != g.builtPage) GoTo(e.page);
+            if (g.findTitle.empty() || ShowFound()) return;
+            if (!g.findTimer)
+            {
+                g.findTimer = g.window.DispatcherQueue().CreateTimer();
+                g.findTimer.Interval(std::chrono::milliseconds(80));
+                g.findTimer.Tick([](auto&&, auto&&)
+                {
+                    // (The page fades in over a moment; given up after a few seconds.)
+                    if (ShowFound() || ++g.findTries > 50) { g.findTimer.Stop(); g.findTitle.clear(); }
+                });
+            }
+            g.findTimer.Start();
+        }
+
+        void WireFind(mux::FrameworkElement const& root)
+        {
+            auto f = Find<muxc::AutoSuggestBox>(root, L"Find");
+            if (!f) return;
+            f.TextChanged([](muxc::AutoSuggestBox const& s, muxc::AutoSuggestBoxTextChangedEventArgs const& e)
+            {
+                if (e.Reason() != muxc::AutoSuggestionBoxTextChangeReason::UserInput) return;
+                g.hits = Search(s.Text().c_str());
+                auto items = winrt::single_threaded_vector<winrt::Windows::Foundation::IInspectable>();
+                for (auto const& h : g.hits) items.Append(winrt::box_value(winrt::hstring(Label(h))));
+                if (g.hits.empty() && !s.Text().empty()) items.Append(winrt::box_value(winrt::hstring(Unesc(Str(L"findNone")))));
+                s.ItemsSource(items);
+            });
+            f.QuerySubmitted([](muxc::AutoSuggestBox const& s, muxc::AutoSuggestBoxQuerySubmittedEventArgs const& e)
+            {
+                int pick = g.hits.empty() ? -1 : 0;
+                if (auto c = e.ChosenSuggestion())
+                {
+                    std::wstring t = winrt::unbox_value_or<winrt::hstring>(c, L"").c_str();
+                    pick = -1;
+                    for (size_t i = 0; i < g.hits.size(); i++)
+                        if (Label(g.hits[i]) == t) pick = (int)i;
+                }
+                if (pick < 0) return;
+                auto hit = g.hits[pick];
+                s.Text(L"");
+                s.ItemsSource(nullptr);
+                OpenFound(hit);
+            });
+            // Going through the suggestions with the arrow keys puts the setting's name in the box.
+            f.SuggestionChosen([](muxc::AutoSuggestBox const& s, muxc::AutoSuggestBoxSuggestionChosenEventArgs const& e)
+            {
+                std::wstring t = winrt::unbox_value_or<winrt::hstring>(e.SelectedItem(), L"").c_str();
+                for (auto const& h : g.hits)
+                    if (Label(h) == t) { s.Text(winrt::hstring(h.title)); return; }
+            });
         }
 
         // A clip's file as a file:/// URI, anything but letters, digits and -._~: escaped (a space
@@ -1550,6 +1768,7 @@ namespace dbx
                         double item = std::floor(width / n);
                         if (std::abs(w.ItemWidth() - item) > 0.5) w.ItemWidth(item);
                     });
+            WireFind(root);
             if (auto nav = Find<muxc::NavigationView>(root, L"Nav"))
                 nav.SelectionChanged([](auto&&, muxc::NavigationViewSelectionChangedEventArgs const& e)
                 {
