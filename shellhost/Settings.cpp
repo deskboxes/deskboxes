@@ -940,9 +940,13 @@ namespace dbx
         // WireClip plays over the picture while the pointer is on it; its first frame is the picture.
         std::wstring Pic(const std::wstring& name, const std::wstring& size, const wchar_t* corner = L"8", const wchar_t* clip = nullptr, const std::wstring& key = L"")
         {
-            auto img = [&](const wchar_t* theme, const std::wstring& file)
-            { return std::wstring(L"<ResourceDictionary x:Key=\"") + theme + L"\"><BitmapImage x:Key=\"Pic\" UriSource=\"ms-appx:///settings/" + file + L".jpg\"/></ResourceDictionary>"; };
             bool anim = HasClip(clip);
+            // With a clip, the picture is its first frame and is loaded at its own size (440 wide
+            // on a tile, 1280 on a page), as the clip's frames are, so both are scaled the same
+            // way (see ClipDevice); without, Windows loads it at the size it shows at.
+            std::wstring decode = !anim ? L"" : name.rfind(L"t_", 0) == 0 ? L" DecodePixelWidth=\"440\"" : L" DecodePixelWidth=\"1280\"";
+            auto img = [&](const wchar_t* theme, const std::wstring& file)
+            { return std::wstring(L"<ResourceDictionary x:Key=\"") + theme + L"\"><BitmapImage x:Key=\"Pic\" UriSource=\"ms-appx:///settings/" + file + L".jpg\"" + decode + L"/></ResourceDictionary>"; };
             // The picture; with a clip, it lies over the video (named Still_KEY) covering exactly
             // what the video does (inside the outline, which is drawn apart over both), so nothing
             // moves when one gives way to the other.
@@ -952,17 +956,12 @@ namespace dbx
                    L"</ResourceDictionary.ThemeDictionaries></ResourceDictionary></Border.Resources>"
                    L"<Border.Background><ImageBrush ImageSource=\"{ThemeResource Pic}\" Stretch=\"UniformToFill\" AlignmentY=\"Center\"/></Border.Background></Border>";
             if (!anim) return x;
-            // The corners go to WireClip in the tag (video is not clipped by a CornerRadius): CLIP;top;bottom.
-            // The video stays shown under the picture all along: a video element that turns visible
-            // shows black until its next frame (the flash on hover), so the picture fades instead.
-            std::wstring c = corner;
-            std::wstring top = c.substr(0, c.find(L',')), bottom = c.find(L',') == std::wstring::npos ? c : c.substr(c.rfind(L',') + 1);
-            // The video is transparent until it has a frame to show (ClipState::Cover): before
-            // that it is black, which showed while the picture over it was still being decoded.
+            // The clip's frames (Clip_KEY, its name in the tag) in a brush like the picture's,
+            // under it: transparent until a frame of it shows (see WireClip).
             return L"<Grid x:Name=\"ClipG_" + key + L"\" " + size + L">" +
                    L"<Border Margin=\"1\" CornerRadius=\"" + corner + L"\" Background=\"{ThemeResource CardBackgroundFillColorSecondaryBrush}\"/>"
-                   L"<Grid Margin=\"1\" IsHitTestVisible=\"False\"><MediaPlayerElement x:Name=\"Clip_" + key + L"\" Tag=\"" + clip + L";" + top + L";" + bottom + L"\" Stretch=\"UniformToFill\""
-                   L" Opacity=\"0\" AreTransportControlsEnabled=\"False\" AutoPlay=\"False\"/></Grid>" + x +
+                   L"<Border x:Name=\"Clip_" + key + L"\" Tag=\"" + clip + L"\" Margin=\"1\" CornerRadius=\"" + corner + L"\" IsHitTestVisible=\"False\" Opacity=\"0\">"
+                   L"<Border.Background><ImageBrush Stretch=\"UniformToFill\" AlignmentY=\"Center\"/></Border.Background></Border>" + x +
                    L"<Border IsHitTestVisible=\"False\" CornerRadius=\"" + corner + L"\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\"/></Grid>";
         }
 
@@ -1603,91 +1602,153 @@ namespace dbx
             return u;
         }
 
-        // Show a clip that was just started from its beginning, once it runs (a frame in, so no
-        // visible jump from the picture, which is its first frame): the picture over it fades out.
-        // Polled, for the player says nothing when a frame arrives; `want` going false
-        // (the pointer left) stops it. The timer is kept in the clip's state: a timer nothing holds
-        // is released at once and never ticks (the clips then played unseen).
-        //
-        // A new player first plays a little off its place (about a pixel lower and smaller) and
-        // moves into it half a second in, then keeps it. So a clip plays once under its picture
-        // before it is first shown (`warming`), long enough to settle, and goes back to its start;
-        // a play wanted meanwhile begins when that ends.
-        constexpr auto kClipSettle = std::chrono::milliseconds(900);
+        // The feature clips. A player's own video element drew its video in a way of its own
+        // (softer than the picture over it, half a pixel off, and a first play off its place
+        // until half a second in), so the switch from picture to video showed. So the player
+        // only decodes (a frame server), each frame is copied out at the clip's own size and
+        // shown as an image in the same kind of brush as the picture, which is loaded at its
+        // own size too (DecodePixelWidth in Pic): both are scaled the same way, and the picture,
+        // which is the clip's first frame (tools/art/export.py), and that frame look the same.
+
+        // (From windows.graphics.directx.direct3d11.interop.h, whose ABI namespace Windows clashes
+        // with winrt's in this project's other files.)
+        extern "C" HRESULT __stdcall CreateDirect3D11SurfaceFromDXGISurface(IDXGISurface* dgxiSurface, void** graphicsSurface);
+
+        // The device the frames are copied on (one for all clips; the players use it from their
+        // own threads).
+        ID3D11Device* ClipDevice()
+        {
+            static winrt::com_ptr<ID3D11Device> dev = []
+            {
+                winrt::com_ptr<ID3D11Device> d;
+                for (auto type : { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP })
+                    if (SUCCEEDED(D3D11CreateDevice(nullptr, type, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, d.put(), nullptr, nullptr)))
+                        break;
+                if (auto mt = d.try_as<ID3D10Multithread>()) mt->SetMultithreadProtected(TRUE);
+                return d;
+            }();
+            return dev.get();
+        }
+
+        // A surface of the clip's size that a frame is copied to.
+        winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface ClipSurface(UINT w, UINT h)
+        {
+            auto dev = ClipDevice();
+            if (!dev || !w || !h) return nullptr;
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = w;
+            d.Height = h;
+            d.MipLevels = 1;
+            d.ArraySize = 1;
+            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            winrt::com_ptr<ID3D11Texture2D> tex;
+            if (FAILED(dev->CreateTexture2D(&d, nullptr, tex.put()))) return nullptr;
+            winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface s{ nullptr };
+            if (FAILED(CreateDirect3D11SurfaceFromDXGISurface(tex.as<IDXGISurface>().get(), winrt::put_abi(s)))) return nullptr;
+            return s;
+        }
+
+        // A clip on its element (Clip_KEY in Pic: a Border whose ImageBrush shows the frames) and
+        // the picture over it (Still_KEY), which fades once the clip shows its first frame and
+        // comes back when it stops. Polled, as a frame shows apart from the player's state. The
+        // timer is kept here: a timer nothing holds is released at once and never ticks.
         struct ClipState
         {
             bool want = false;
-            bool warming = false;                              // the unseen first play runs
-            bool warm = false;                                 // done, for this player
             int ticks = 0;
+            int shownAt = -1;                                  // the tick the video showed, -1 before
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{ nullptr };
-            // The picture over the video (Still_KEY in Pic).
+            winrt::Microsoft::UI::Dispatching::DispatcherQueue queue{ nullptr };
             winrt::weak_ref<mux::UIElement> still;
-            // The video itself: transparent until it has shown a frame (before that it is black,
-            // which showed through while the picture over it was still loading).
             winrt::weak_ref<mux::UIElement> player;
-            // The tick the video was made visible (under the picture), -1 before.
-            int shownAt = -1;
+            winrt::Windows::Media::Playback::MediaPlayer mp{ nullptr };
+            mux::Media::Imaging::SoftwareBitmapSource frames{ nullptr };
+            // Used from the player's threads: the surface (made once the clip's size is known),
+            // a frame being copied, and which play (`play`, counted up by each start) the frame
+            // on show is from.
+            std::mutex lock;
+            winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface surface{ nullptr };
+            std::atomic<bool> busy{ false };
+            std::atomic<int> play{ 0 };
+            std::atomic<int> shownPlay{ -1 };
             void Cover(bool on)
             {
                 if (auto s = still.get()) s.Opacity(on ? 1.0 : 0.0);
             }
         };
 
-        void RevealClip(winrt::weak_ref<muxc::MediaPlayerElement> weak, std::shared_ptr<ClipState> st)
+        // The player's frame, copied out and put on the clip's element (one at a time; a frame
+        // that comes meanwhile is skipped).
+        void ShowFrame(std::weak_ptr<ClipState> ws)
         {
-            namespace wmp = winrt::Windows::Media::Playback;
+            namespace wgi = winrt::Windows::Graphics::Imaging;
+            auto st = ws.lock();
+            if (!st || st->busy.exchange(true)) return;
+            auto done = [ws] { if (auto st = ws.lock()) st->busy = false; };
+            try
+            {
+                winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface surface{ nullptr };
+                {
+                    std::lock_guard<std::mutex> l(st->lock);
+                    surface = st->surface;
+                }
+                auto mp = st->mp;
+                if (!surface || !mp) { done(); return; }
+                int play = st->play;
+                mp.CopyFrameToVideoSurface(surface);
+                auto copy = wgi::SoftwareBitmap::CreateCopyFromSurfaceAsync(surface, wgi::BitmapAlphaMode::Premultiplied);
+                copy.Completed([ws, play, done](auto const& op, winrt::Windows::Foundation::AsyncStatus status)
+                    {
+                        auto st = ws.lock();
+                        if (!st) return;
+                        if (status != winrt::Windows::Foundation::AsyncStatus::Completed) { done(); return; }
+                        auto bmp = op.GetResults();
+                        bool queued = st->queue.TryEnqueue([ws, play, bmp, done]
+                            {
+                                auto st = ws.lock();
+                                if (!st) return;
+                                try
+                                {
+                                    st->frames.SetBitmapAsync(bmp).Completed([ws, play, done](auto&&, auto&&)
+                                        {
+                                            if (auto st = ws.lock()) st->shownPlay = play;
+                                            done();
+                                        });
+                                }
+                                catch (...) { done(); }
+                            });
+                        if (!queued) done();
+                    });
+            }
+            catch (winrt::hresult_error const&) { done(); }
+        }
+
+        void RevealClip(std::shared_ptr<ClipState> st)
+        {
             if (!st->timer)
             {
                 st->timer = g.window.DispatcherQueue().CreateTimer();
                 st->timer.Interval(std::chrono::milliseconds(30));
                 std::weak_ptr<ClipState> ws = st;
-                st->timer.Tick([weak, ws](winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& t, auto&&)
+                st->timer.Tick([ws](winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& t, auto&&)
                     {
                         auto st = ws.lock();
-                        auto e = weak.get();
-                        auto mp = e ? e.MediaPlayer() : nullptr;
                         // (Up to ~30 s: a first clip can be slow to open on a slow PC.)
-                        if (!st || !mp || ++st->ticks > 1000 || (!st->want && !st->warming))
-                        {
-                            if (st && st->warming && mp) mp.Pause();
-                            if (st) st->warming = false;
-                            t.Stop();
-                            return;
-                        }
-                        auto s = mp.PlaybackSession();
-                        // First the video turns visible under the picture (a video element that
-                        // was transparent takes a few frames to show again: the picture fading
-                        // at once let the page show through); then the picture fades.
-                        bool runs = s.PlaybackState() == wmp::MediaPlaybackState::Playing && s.Position() >= std::chrono::milliseconds(40);
-                        if (st->warming)
-                        {
-                            if (runs)
-                                if (auto p = st->player.get()) p.Opacity(1.0);
-                            if (s.Position() < kClipSettle) return;
-                            st->warming = false;
-                            st->warm = true;
-                            s.Position(std::chrono::seconds(0));
-                            if (!st->want)
-                            {
-                                mp.Pause();
-                                t.Stop();
-                                return;
-                            }
-                            // Wanted meanwhile: it goes on, shown from its start.
-                            st->ticks = 0;
-                            st->shownAt = -1;
-                            return;
-                        }
+                        if (!st || !st->want || ++st->ticks > 1000) { t.Stop(); return; }
+                        // A frame of this play is on the element (under the picture): the
+                        // picture fades a moment later.
                         if (st->shownAt < 0)
                         {
-                            if (runs)
+                            if (st->shownPlay == st->play)
                             {
                                 if (auto p = st->player.get()) p.Opacity(1.0);
                                 st->shownAt = st->ticks;
                             }
                         }
-                        else if (st->ticks - st->shownAt >= 4)
+                        else if (st->ticks - st->shownAt >= 2)
                         {
                             st->Cover(false);
                             t.Stop();
@@ -1700,42 +1761,53 @@ namespace dbx
             st->timer.Start();
         }
 
-        // The clip's player on its element, made (paused, on the first frame) if it has none yet:
-        // the element comes with an empty player of its own; ours is the one with a source.
-        bool LoadClip(muxc::MediaPlayerElement const& e, const std::wstring& clip)
+        // The clip's player, made (paused, at the start) if it has none or let its file go.
+        bool LoadClip(mux::FrameworkElement const& e, const std::wstring& clip, std::shared_ptr<ClipState> st)
         {
             namespace wmp = winrt::Windows::Media::Playback;
-            if (auto had = e.MediaPlayer(); had && had.Source()) return true;
+            if (st->mp && st->mp.Source()) return true;
             std::wstring file = ExeDir() + L"\\settings\\" + clip + (e.ActualTheme() == mux::ElementTheme::Light ? L"_l" : L"") + L".mp4";
             if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
             try
             {
-                wmp::MediaPlayer mp;
-                mp.CommandManager().IsEnabled(false);
-                mp.IsMuted(true);
-                mp.IsLoopingEnabled(true);
-                mp.AutoPlay(false);
-                mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f)
-                    { Log(L"settings: clip %s failed (%d, 0x%08X): %s", clip.c_str(), (int)f.Error(), (unsigned)f.ExtendedErrorCode().value, f.ErrorMessage().c_str()); });
-                e.SetMediaPlayer(mp);
-                mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(FileUri(file))));
+                if (!st->mp)
+                {
+                    auto brush = e.try_as<muxc::Border>() ? e.as<muxc::Border>().Background().try_as<mux::Media::ImageBrush>() : nullptr;
+                    if (!brush) return false;
+                    st->queue = g.window.DispatcherQueue();
+                    st->frames = mux::Media::Imaging::SoftwareBitmapSource();
+                    brush.ImageSource(st->frames);
+                    wmp::MediaPlayer mp;
+                    mp.CommandManager().IsEnabled(false);
+                    mp.IsMuted(true);
+                    mp.IsLoopingEnabled(true);
+                    mp.AutoPlay(false);
+                    mp.IsVideoFrameServerEnabled(true);
+                    std::weak_ptr<ClipState> ws = st;
+                    mp.MediaFailed([clip](auto&&, wmp::MediaPlayerFailedEventArgs const& f)
+                        { Log(L"settings: clip %s failed (%d, 0x%08X): %s", clip.c_str(), (int)f.Error(), (unsigned)f.ExtendedErrorCode().value, f.ErrorMessage().c_str()); });
+                    mp.MediaOpened([ws, clip](wmp::MediaPlayer const& m, auto&&)
+                        {
+                            auto st = ws.lock();
+                            if (!st) return;
+                            auto s = m.PlaybackSession();
+                            std::lock_guard<std::mutex> l(st->lock);
+                            if (st->surface) return;
+                            st->surface = ClipSurface(s.NaturalVideoWidth(), s.NaturalVideoHeight());
+                            if (!st->surface) Log(L"settings: clip %s: no surface for %ux%u", clip.c_str(), s.NaturalVideoWidth(), s.NaturalVideoHeight());
+                        });
+                    mp.VideoFrameAvailable([ws](auto&&, auto&&) { ShowFrame(ws); });
+                    st->mp = mp;
+                }
+                st->mp.Source(winrt::Windows::Media::Core::MediaSource::CreateFromUri(winrt::Windows::Foundation::Uri(FileUri(file))));
                 return true;
             }
             catch (winrt::hresult_error const& x) { Log(L"settings: clip %s: %s", clip.c_str(), x.message().c_str()); }
             return false;
         }
 
-        // Play a new player's clip once under its picture (see ClipState), unless it was.
-        void WarmClip(muxc::MediaPlayerElement const& e, std::shared_ptr<ClipState> st)
-        {
-            if (st->warm || st->warming) return;
-            st->warming = true;
-            e.MediaPlayer().Play();
-            RevealClip(e, st);
-        }
-
         // Start (or restart from the beginning) a feature's clip on its element; see WireClip.
-        void StartClip(muxc::MediaPlayerElement const& e, const std::wstring& clip, std::shared_ptr<ClipState> want)
+        void StartClip(mux::FrameworkElement const& e, const std::wstring& clip, std::shared_ptr<ClipState> st)
         {
             if (!winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled())
             {
@@ -1744,90 +1816,64 @@ namespace dbx
                 told = true;
                 return;
             }
-            if (!LoadClip(e, clip)) return;
-            want->want = true;
-            want->Cover(true);
-            // Not settled yet: it plays when that is done.
-            if (!want->warm)
-            {
-                WarmClip(e, want);
-                return;
-            }
-            auto mp = e.MediaPlayer();
-            if (mp.PlaybackSession().Position() > std::chrono::milliseconds(0))
-                mp.PlaybackSession().Position(std::chrono::seconds(0));
-            mp.Play();
-            RevealClip(e, want);
+            if (!LoadClip(e, clip, st)) return;
+            st->want = true;
+            st->Cover(true);
+            ++st->play;
+            auto s = st->mp.PlaybackSession();
+            if (s.Position() > std::chrono::milliseconds(0))
+                s.Position(std::chrono::seconds(0));
+            st->mp.Play();
+            RevealClip(st);
         }
 
-        // A feature's clip (see Pic), muted and looping over the picture, which is its first frame.
-        // On a tile it plays while the pointer is on `hover` and goes when it leaves; at the top of
-        // a feature's own page (`autoplay`) it plays from the start for as long as the page shows.
-        // The picture over it fades out once it runs. Nothing plays when Windows' animation effects
-        // are off. The player is made when it first plays and kept out of the system's media controls.
-        void WireClip(mux::FrameworkElement const& root, mux::FrameworkElement const& hover, muxc::MediaPlayerElement const& el, bool autoplay = false)
+        // A feature's clip (see Pic), muted and looping under the picture, which is its first
+        // frame. On a tile it plays while the pointer is on `hover` and goes when it leaves; at
+        // the top of a feature's own page (`autoplay`) it plays from the start for as long as the
+        // page shows. Nothing plays when Windows' animation effects are off. The player is kept
+        // out of the system's media controls.
+        void WireClip(mux::FrameworkElement const& root, mux::FrameworkElement const& hover, mux::FrameworkElement const& el, bool autoplay = false)
         {
             if (!hover || !el) return;
-            std::wstring tag = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
-            size_t a = tag.find(L';'), b = tag.rfind(L';');
-            if (a == std::wstring::npos || a == b) return;
-            std::wstring clip = tag.substr(0, a);
-            float rt = std::max(0.f, (float)_wtof(tag.substr(a + 1, b - a - 1).c_str()) - 1), rb = std::max(0.f, (float)_wtof(tag.substr(b + 1).c_str()) - 1);
-            winrt::weak_ref<muxc::MediaPlayerElement> weak = el;
-            // The corners are cut on the frame around the player (an element with an
-            // OpacityTransition gives no composition visual), found once it is laid out.
-            el.SizeChanged([weak, rt, rb](auto&&, auto&&)
-                {
-                    auto e = weak.get();
-                    if (!e) return;
-                    auto frame = mux::Media::VisualTreeHelper::GetParent(e).try_as<mux::UIElement>();
-                    if (!frame) return;
-                    auto vis = mux::Hosting::ElementCompositionPreview::GetElementVisual(frame);
-                    vis.Clip(vis.Compositor().CreateRectangleClip(0, 0, (float)e.ActualWidth(), (float)e.ActualHeight(), { rt, rt }, { rt, rt }, { rb, rb }, { rb, rb }));
-                });
-            // Looked up from the page: the player's own FindName searches its template and found
-            // nothing, so no clip was ever wired (0.1.5 and before).
+            std::wstring clip = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
+            if (clip.empty()) return;
+            winrt::weak_ref<mux::FrameworkElement> weak = el;
+            // Looked up from the page: the player element's own FindName searched its template
+            // and found nothing, so no clip was ever wired (0.1.5 and before).
             auto still = Find<mux::UIElement>(root, L"Still_" + std::wstring(el.Name()).substr(5));
             if (!still) return;
             mux::ScalarTransition fade;
             fade.Duration(std::chrono::milliseconds(autoplay ? 260 : 160));
             still.OpacityTransition(fade);
-            auto want = std::make_shared<ClipState>();
-            want->still = still;
-            want->player = el;
-            auto stop = [weak, want]
+            auto st = std::make_shared<ClipState>();
+            st->still = still;
+            st->player = el;
+            auto stop = [st]
             {
-                want->want = false;
-                want->Cover(true);
-                if (want->warming) return;                     // it pauses when settled
-                if (want->timer) want->timer.Stop();
-                auto e = weak.get();
-                if (!e) return;
-                if (auto mp = e.MediaPlayer()) mp.Pause();
+                st->want = false;
+                st->Cover(true);
+                if (st->timer) st->timer.Stop();
+                if (st->mp) st->mp.Pause();
             };
             // Shown: a page's own clip plays; a tile's is loaded, so a pointer on it starts it at once.
-            el.Loaded([weak, clip, want, autoplay](auto&&, auto&&)
+            el.Loaded([weak, clip, st, autoplay](auto&&, auto&&)
                 {
                     auto e = weak.get();
                     if (!e) return;
-                    if (autoplay) StartClip(e, clip, want);
-                    else if (winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled() && LoadClip(e, clip)) WarmClip(e, want);
+                    if (autoplay) StartClip(e, clip, st);
+                    else if (winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) LoadClip(e, clip, st);
                 });
             // The page went (another one was picked, or the window closed): let the file go.
-            el.Unloaded([weak, stop, want](auto&&, auto&&)
+            el.Unloaded([st, stop](auto&&, auto&&)
                 {
-                    want->warming = false;
                     stop();
-                    // The next player (LoadClip makes one when shown again) settles anew.
-                    want->warm = false;
-                    if (auto e = weak.get())
-                        if (auto mp = e.MediaPlayer()) mp.Source(nullptr);
+                    if (st->mp) st->mp.Source(nullptr);
                 });
             if (autoplay) return;
             // The tile's button marks pointer events handled, so these listen to handled ones too.
-            auto play = [weak, clip, want](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
+            auto play = [weak, clip, st](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&)
                 {
-                    if (auto e = weak.get()) StartClip(e, clip, want);
+                    if (auto e = weak.get()) StartClip(e, clip, st);
                 };
             hover.AddHandler(mux::UIElement::PointerEnteredEvent(), winrt::box_value(mux::Input::PointerEventHandler(play)), true);
             auto leave = [stop](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&) { stop(); };
@@ -1908,8 +1954,8 @@ namespace dbx
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
-                WireClip(root, Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<muxc::MediaPlayerElement>(root, L"Clip_t_" + std::wstring(t.page)));
-            WireClip(root, Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<muxc::MediaPlayerElement>(root, L"Clip_hero"), true);
+                WireClip(root, Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<mux::FrameworkElement>(root, L"Clip_t_" + std::wstring(t.page)));
+            WireClip(root, Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<mux::FrameworkElement>(root, L"Clip_hero"), true);
             if (auto tiles = Find<muxc::VariableSizedWrapGrid>(root, L"Tiles"))
                 tiles.SizeChanged([](winrt::Windows::Foundation::IInspectable const& s, mux::SizeChangedEventArgs const& e)
                     {

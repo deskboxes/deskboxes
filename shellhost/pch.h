@@ -1,6 +1,8 @@
 #pragma once
 #include <windows.h>
 #include <unknwn.h>
+#include <d3d11.h>
+#include <dxgi.h>
 #include <restrictederrorinfo.h>
 #include <hstring.h>
 #include <shellapi.h>
@@ -51,6 +53,8 @@
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <winrt/Windows.Graphics.Imaging.h>
 #include <winrt/Microsoft.UI.Composition.h>
 #include <winrt/Microsoft.UI.Xaml.Hosting.h>
 #include <winrt/Windows.System.h>
