@@ -32,6 +32,9 @@ namespace dbx
             long long focusBox = 0;          // box to bring into view on the next build
             bool lookOpen = false;           // the Look entry is open in the navigation
             std::wstring lastSig;            // the data last built, without the download progress
+            std::wstring shownXaml;          // the shown page's markup (standalone), see Refresh
+            std::wstring stringsSig;         // the strings it was built with (a new language: build anew)
+            bool moved = false;              // cards moved in from another XAML document (see Refresh)
             // A page switch waiting for the old page to fade out (kept here: a timer nothing
             // holds is released at once and never ticks).
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer switchTimer{ nullptr };
@@ -1165,16 +1168,18 @@ namespace dbx
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
             x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
                  L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>"
-                 L"<ScrollViewer x:Name=\"Scroll\" Grid.Row=\"1\">";
+                 L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\">";
             // In a Grid: straight in the ScrollViewer, a page narrower than MaxWidth was placed by
             // its own width and then stretched, so it sat off to the right in a wide window.
-            x += L"<Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
+            // (PageMove inside a plain Grid: the ScrollView drives its content's composition visual, and
+            // Rise moves PageMove's; one element's visual for both crashed the window.)
+            x += L"<Grid><Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
             x += animate ? L" Opacity=\"0\">" : L">";
             if (animate)
                 x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.083\"/></StackPanel.OpacityTransition>";
             if (cur->hero) x += Hero(cur);
             x += cur->build();
-            return x + L"</StackPanel></Grid></ScrollViewer></Grid>";
+            return x + L"</StackPanel></Grid></Grid></ScrollView></Grid>";
         }
 
         std::wstring BuildXaml()
@@ -1235,9 +1240,21 @@ namespace dbx
             g.send(o);
         }
 
+        // A named element by walking the tree: for cards moved in from another XAML document
+        // (Refresh), whose names their new page's FindName does not know.
+        mux::DependencyObject FindNamed(mux::DependencyObject const& o, const std::wstring& name)
+        {
+            if (auto fe = o.try_as<mux::FrameworkElement>(); fe && fe.Name() == name) return o;
+            int n = mux::Media::VisualTreeHelper::GetChildrenCount(o);
+            for (int i = 0; i < n; i++)
+                if (auto r = FindNamed(mux::Media::VisualTreeHelper::GetChild(o, i), name)) return r;
+            return nullptr;
+        }
+
         template <class T> T Find(mux::FrameworkElement const& root, const std::wstring& name)
         {
             auto o = root.FindName(name);
+            if (!o && g.moved) o = FindNamed(root, name);
             return o ? o.try_as<T>() : T{ nullptr };
         }
 
@@ -1759,6 +1776,47 @@ namespace dbx
                 hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(leave)), true);
         }
 
+        // The mouse wheel on a page: as far per notch as Windows' wheel setting says (3 lines:
+        // 200 px, about what Windows Settings scrolls; ScrollView's own step was a fifth of that), gliding there quickly; notches that
+        // come fast add up instead of restarting from where the glide is. Touchpads and Ctrl keep
+        // ScrollView's own handling. On the scroller's content, which sees the wheel before the
+        // scroller does; the scroller is looked up then (Refresh moves content between pages).
+        void WireWheel(mux::FrameworkElement const& root)
+        {
+            auto sv = Find<muxc::ScrollView>(root, L"Scroll");
+            auto content = sv ? sv.Content().try_as<mux::UIElement>() : mux::UIElement{ nullptr };
+            if (!content) return;
+            sv.ScrollAnimationStarting([](auto&&, muxc::ScrollingScrollAnimationStartingEventArgs const& a)
+                {
+                    if (auto kf = a.Animation().try_as<winrt::Microsoft::UI::Composition::Vector3KeyFrameAnimation>())
+                        kf.Duration(std::chrono::milliseconds(200));
+                });
+            struct Glide { double target = 0; std::chrono::steady_clock::time_point at{}; };
+            auto glide = std::make_shared<Glide>();
+            content.PointerWheelChanged([glide](winrt::Windows::Foundation::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e)
+                {
+                    if (e.Pointer().PointerDeviceType() != winrt::Microsoft::UI::Input::PointerDeviceType::Mouse) return;
+                    if ((e.KeyModifiers() & winrt::Windows::System::VirtualKeyModifiers::Control) != winrt::Windows::System::VirtualKeyModifiers::None) return;
+                    auto pt = e.GetCurrentPoint(s.as<mux::UIElement>());
+                    if (pt.Properties().IsHorizontalMouseWheel()) return;
+                    muxc::ScrollView sv{ nullptr };
+                    for (auto o = mux::Media::VisualTreeHelper::GetParent(s.as<mux::DependencyObject>()); o && !sv; o = mux::Media::VisualTreeHelper::GetParent(o))
+                        sv = o.try_as<muxc::ScrollView>();
+                    if (!sv) return;
+                    UINT lines = 3;
+                    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                    double step = lines == WHEEL_PAGESCROLL ? sv.ViewportHeight() * 0.9 : 200.0 / 3.0 * lines;
+                    double delta = -pt.Properties().MouseWheelDelta() / 120.0 * step;
+                    auto now = std::chrono::steady_clock::now();
+                    bool gliding = now - glide->at < std::chrono::milliseconds(260);
+                    double from = gliding ? glide->target : sv.VerticalOffset();
+                    glide->target = std::clamp(from + delta, 0.0, std::max(0.0, sv.ScrollableHeight()));
+                    glide->at = now;
+                    sv.ScrollTo(sv.HorizontalOffset(), glide->target, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Enabled, muxc::ScrollingSnapPointsMode::Ignore));
+                    e.Handled(true);
+                });
+        }
+
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
@@ -1774,6 +1832,7 @@ namespace dbx
                         if (std::abs(w.ItemWidth() - item) > 0.5) w.ItemWidth(item);
                     });
             WireFind(root);
+            WireWheel(root);
             if (auto nav = Find<muxc::NavigationView>(root, L"Nav"))
                 nav.SelectionChanged([](auto&&, muxc::NavigationViewSelectionChangedEventArgs const& e)
                 {
@@ -2036,6 +2095,8 @@ namespace dbx
             else body = nullptr;
             g.wiring = true;
             g.builtPage = g.page;
+            g.moved = false;
+            g.shownXaml = PageXaml(CurrentPage(), true, false);
             nav.Content(page);
             Wire(page);
             // (Weak: the page's own handler holding it, or its child, would keep every page
@@ -2095,6 +2156,154 @@ namespace dbx
             g.switchTimer.Start();
         }
 
+
+        // ------------------------------------------------------------ refreshing in place
+        // The core sends the data again after every change (one made here, or on the desktop).
+        // Building the window anew for that lost the scroll position, the focus and the clip,
+        // and blinked: the page is updated where it is instead. Values the controls show are set
+        // on them; only a page that changed its shape (a rule added, a box gone) gets new cards,
+        // in the same scroller, so it stays where it was scrolled to.
+
+        // A page's markup without what its controls show (switches, checks, picks, sliders,
+        // typed text, open groups, named texts): equal for two pages whose controls can be set
+        // from one to the other.
+        std::wstring Shape(const std::wstring& x)
+        {
+            static const std::pair<const wchar_t*, const wchar_t*> kValues[] = {
+                { L"<ToggleSwitch ", L" IsOn=\"" }, { L"<CheckBox ", L" IsChecked=\"" }, { L"<ComboBoxItem ", L" IsSelected=\"" },
+                { L"<Expander ", L" IsExpanded=\"" }, { L"<Slider ", L" Value=\"" }, { L"<TextBox ", L" Text=\"" }, { L"<TextBlock x:Name=", L" Text=\"" } };
+            std::wstring o;
+            o.reserve(x.size());
+            size_t i = 0;
+            while (i < x.size())
+            {
+                size_t lt = x.find(L'<', i);
+                size_t gt = lt == std::wstring::npos ? lt : x.find(L'>', lt);
+                if (gt == std::wstring::npos) { o.append(x, i, std::wstring::npos); break; }
+                o.append(x, i, lt - i);
+                std::wstring tag = x.substr(lt, gt - lt + 1);
+                for (auto const& [el, attr] : kValues)
+                    if (tag.compare(0, wcslen(el), el) == 0)
+                        for (size_t p; (p = tag.find(attr)) != std::wstring::npos;)
+                        {
+                            size_t q = tag.find(L'"', p + wcslen(attr));
+                            if (q == std::wstring::npos) break;
+                            tag.erase(p, q + 1 - p);
+                        }
+                o += tag;
+                i = gt + 1;
+            }
+            return o;
+        }
+
+        // The pick a combo box's markup makes (-1: none).
+        int Picked(muxc::ComboBox const& c)
+        {
+            auto items = c.Items();
+            for (uint32_t i = 0; i < items.Size(); i++)
+                if (auto it = items.GetAt(i).try_as<muxc::ComboBoxItem>(); it && it.IsSelected()) return (int)i;
+            return c.SelectedIndex();
+        }
+
+        // Set what `fresh` (the page made from the new data) shows on the page that is there.
+        // Text being typed is left alone.
+        void SyncValues(mux::FrameworkElement const& shown, mux::FrameworkElement const& fresh, const std::wstring& xaml)
+        {
+            size_t changed = 0;
+            // Moved cards: every named element of the page, found in one walk.
+            std::map<std::wstring, mux::DependencyObject> named;
+            if (g.moved)
+            {
+                std::function<void(mux::DependencyObject const&)> walk = [&](mux::DependencyObject const& o)
+                {
+                    if (auto fe = o.try_as<mux::FrameworkElement>(); fe && !fe.Name().empty()) named.emplace(fe.Name().c_str(), o);
+                    int n = mux::Media::VisualTreeHelper::GetChildrenCount(o);
+                    for (int i = 0; i < n; i++) walk(mux::Media::VisualTreeHelper::GetChild(o, i));
+                };
+                walk(shown);
+            }
+            for (size_t p = 0; (p = xaml.find(L"x:Name=\"", p)) != std::wstring::npos;)
+            {
+                p += 8;
+                size_t q = xaml.find(L'"', p);
+                if (q == std::wstring::npos) break;
+                std::wstring name = xaml.substr(p, q - p);
+                p = q;
+                auto nw = fresh.FindName(name);
+                mux::DependencyObject od{ nullptr };
+                if (g.moved) { if (auto it = named.find(name); it != named.end()) od = it->second; }
+                else od = shown.FindName(name).try_as<mux::DependencyObject>();
+                if (!nw || !od) continue;
+                if (auto n0 = nw.try_as<muxc::ToggleSwitch>())
+                {
+                    if (auto b = od.try_as<muxc::ToggleSwitch>(); b && b.IsOn() != n0.IsOn()) { b.IsOn(n0.IsOn()); changed++; }
+                }
+                else if (auto n1 = nw.try_as<muxc::CheckBox>())
+                {
+                    bool v = n1.IsChecked() && n1.IsChecked().Value();
+                    if (auto b = od.try_as<muxc::CheckBox>(); b && (b.IsChecked() && b.IsChecked().Value()) != v) { b.IsChecked(v); changed++; }
+                }
+                else if (auto n2 = nw.try_as<muxc::ComboBox>())
+                {
+                    int v = Picked(n2);
+                    if (auto b = od.try_as<muxc::ComboBox>(); b && v >= 0 && b.SelectedIndex() != v && !b.IsDropDownOpen()) { b.SelectedIndex(v); changed++; }
+                }
+                else if (auto n3 = nw.try_as<muxc::Slider>())
+                {
+                    if (auto b = od.try_as<muxc::Slider>(); b && std::fabs(b.Value() - n3.Value()) > 0.01 && b.FocusState() == mux::FocusState::Unfocused) { b.Value(n3.Value()); changed++; }
+                }
+                else if (auto n4 = nw.try_as<muxc::TextBox>())
+                {
+                    if (auto b = od.try_as<muxc::TextBox>(); b && b.Text() != n4.Text() && b.FocusState() == mux::FocusState::Unfocused) { b.Text(n4.Text()); changed++; }
+                }
+                else if (auto n5 = nw.try_as<muxc::Expander>())
+                {
+                    if (auto b = od.try_as<muxc::Expander>(); b && b.IsExpanded() != n5.IsExpanded()) { b.IsExpanded(n5.IsExpanded()); changed++; }
+                }
+                else if (auto n6 = nw.try_as<muxc::TextBlock>())
+                {
+                    if (auto b = od.try_as<muxc::TextBlock>(); b && b.Text() != n6.Text()) { b.Text(n6.Text()); changed++; }
+                }
+            }
+            if (changed) Log(L"settings: %zu value(s) set in place", changed);
+        }
+
+        // Show the new data on the page that is there. False: it cannot be (build the window).
+        bool Refresh()
+        {
+            auto cur = CurrentPage();
+            std::wstring x = PageXaml(cur, true, false);
+            if (x == g.shownXaml) return true;
+            auto root = g.window.Content().try_as<mux::FrameworkElement>();
+            auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
+            auto shown = nav ? nav.Content().try_as<mux::FrameworkElement>() : mux::FrameworkElement{ nullptr };
+            auto sv = shown ? Find<muxc::ScrollView>(shown, L"Scroll") : muxc::ScrollView{ nullptr };
+            if (!sv) return false;
+            mux::FrameworkElement fresh{ nullptr };
+            try { fresh = mux::Markup::XamlReader::Load(x).as<mux::FrameworkElement>(); }
+            catch (winrt::hresult_error const& e) { Log(L"settings: page XAML failed: %s", e.message().c_str()); return false; }
+            g.wiring = true;
+            if (Shape(x) == Shape(g.shownXaml))
+                SyncValues(shown, fresh, x);
+            else
+            {
+                // New cards in the same scroller (it keeps its position; the content is moved
+                // out of the page it was made in, after its controls were wired there).
+                auto fsv = Find<muxc::ScrollView>(fresh, L"Scroll");
+                auto content = fsv ? fsv.Content() : mux::UIElement{ nullptr };
+                if (!content) { g.wiring = false; return false; }
+                g.moved = false;  // (its names are its own: no walk for the ones a page lacks)
+                Wire(fresh);
+                fsv.Content(nullptr);
+                sv.Content(content);
+                g.moved = true;
+                Log(L"settings: page %s changed, its cards made again", g.page.c_str());
+            }
+            g.shownXaml = x;
+            g.window.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { g.wiring = false; });
+            return true;
+        }
+
         void Build()
         {
             if (!g.window) return;
@@ -2104,12 +2313,15 @@ namespace dbx
                 if (auto old = g.window.Content().try_as<mux::FrameworkElement>())
                     if (auto nav = Find<muxc::NavigationView>(old, L"Nav"))
                         if (auto shown = nav.Content().try_as<mux::FrameworkElement>())
-                            if (auto sv = Find<muxc::ScrollViewer>(shown, L"Scroll")) scroll = sv.VerticalOffset();
+                            if (auto sv = Find<muxc::ScrollView>(shown, L"Scroll")) scroll = sv.VerticalOffset();
             mux::FrameworkElement root{ nullptr };
             try { root = mux::Markup::XamlReader::Load(BuildXaml()).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: XAML failed: %s", e.message().c_str()); return; }
             g.wiring = true;
             g.builtPage = g.page;
+            g.moved = false;
+            g.shownXaml = PageXaml(CurrentPage(), true, false);
+            g.stringsSig = g.data.GetNamedObject(L"strings", JsonObject()).Stringify().c_str();
             g.window.Content(root);
             g.window.SetTitleBar(Find<mux::UIElement>(root, L"TitleBar"));
             Wire(root);
@@ -2125,11 +2337,12 @@ namespace dbx
             {
                 auto root = weakRoot.get();
                 if (!root) return;
-                root.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weakRoot, scroll, weakFocus]
+                // Where it was, before it is first drawn (not a frame at the top first).
+                if (auto sv = scroll > 0 && !weakFocus.get() ? Find<muxc::ScrollView>(root, L"Scroll") : muxc::ScrollView{ nullptr })
+                    sv.ScrollTo(0, scroll, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Disabled, muxc::ScrollingSnapPointsMode::Ignore));
+                root.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weakFocus]
                 {
-                    auto root = weakRoot.get();
                     if (auto focus = weakFocus.get()) focus.StartBringIntoView();
-                    else if (auto sv = root ? Find<muxc::ScrollViewer>(root, L"Scroll") : muxc::ScrollViewer{ nullptr }) sv.ChangeView(nullptr, scroll, nullptr, true);
                     g.wiring = false;
                 });
             });
@@ -2518,6 +2731,10 @@ namespace dbx
         }
         auto title = g.data.GetNamedObject(L"strings", JsonObject()).GetNamedString(L"title", L"Deskboxes");
         g.window.Title(title);
+        // Already showing this page in this language: updated where it is (see Refresh).
+        if (!fresh && !open && g.page == g.builtPage && !(g.switchTimer && g.switchTimer.IsRunning()) &&
+            g.stringsSig == std::wstring(g.data.GetNamedObject(L"strings", JsonObject()).Stringify().c_str()) && Refresh())
+            return;
         Build();
         if (open)
         {

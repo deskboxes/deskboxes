@@ -443,20 +443,85 @@ S.saved = { dur: 6, wp: [1900, -300, -330], cam: [110, 120, 1300, 760], draw: t 
     box({ x: c[0], y: c[1], w: bw(4), h: bh(1), title: 'Folders', tint: 'amber', items: FOLDERS.slice(5, 9), z: 3 }) + `<div class="abs" style="left:0;top:0;z-index:20">${menu}</div>` + p.html;
 } };
 
-S.search = { dur: 5, wp: [1900, -280, -360], cam: [150, 120, 1300, 731], draw: t => {
-  const docs = ['Report.docx', 'Sales Q1.xlsx', 'Pitch.pptx', 'Manual.docx', 'Meeting.one', 'Plan.md'];
-  const typed = [[0, 'spo'], [.95, 'sp'], [1.05, 's'], [1.15, ''], [1.8, 's'], [2.2, 'sp'], [2.55, 'spo']];
+S.search = { dur: 6.6, wp: [1900, -280, -360], cam: [0, 0, 1600, 900], draw: t => {
+  // Typing finds icons anywhere; the field opens into the list of them (with type filters and
+  // "make a box"); a click on a row shows that icon; the switch hides the others and the matches
+  // close up in their boxes. Starts and ends as the still: "note" searched, the others hidden.
+  const apps = ['Steam', 'Spotify', 'Discord', 'VS Code', 'Terminal', 'OneNote', 'Google Chrome', 'Notepad'];
+  const docs = ['Report.docx', 'Sales Q1.xlsx', 'Pitch.pptx', 'Notes.txt', 'Meeting.one', 'Plan.md'];
+  const AX = 230, DX = 902, BY = 24;
+  const typed = [[0, 'note'], [2.6, 'not'], [2.72, 'no'], [2.84, 'n'], [2.96, ''], [3.55, 'n'], [3.72, 'no'], [3.9, 'not'], [4.08, 'note']];
   const q = step(t, typed);
   const tc = typed.filter(k => t >= k[0]).pop()[0], pq = tc ? step(tc - .01, typed) : q;
-  const hit = (n, s) => !s || NAME(n).toLowerCase().split(' ').some(w => w.startsWith(s));
-  const u = io(seg(t, tc, tc + .22));
-  const first = s => s ? APPS.concat(docs).find(n => hit(n, s)) : null;
-  const f = (i, n) => ({ o: lerp(hit(n, pq) ? 1 : .18, hit(n, q) ? 1 : .18, u), sel: lerp(first(pq) === n ? 1 : 0, first(q) === n ? 1 : 0, u) });
+  const u = io(seg(t, tc, tc + .2));
+  const hit = (n, s) => !!s && NAME(n).toLowerCase().includes(s);
+  // Best first (the start of the name), then in reading order.
+  const found = s => {
+    const all = apps.map(n => [n, 'Apps']).concat(docs.map(n => [n, 'Documents'])).filter(([n]) => hit(n, s));
+    return all.filter(([n]) => NAME(n).toLowerCase().startsWith(s)).concat(all.filter(([n]) => !NAME(n).toLowerCase().startsWith(s)));
+  };
+  const list = found(q);
+  // Which one is shown: the best, or the row clicked.
+  const cur = t >= 1.95 && t < 2.96 ? 'Notes.txt' : (list[0] || [null])[0];
+  const pcur = t >= 1.95 && t < 2.15 ? (found('note')[0] || [])[0] : cur;
+  const su = t >= 1.95 && t < 2.15 ? io(seg(t, 1.95, 2.15)) : 1;
+  // "Hide the others" (the switch), the list, and how much the search dims the rest.
+  const hide = kf(t, [[0, 1], [.82, 1], [1.25, 0], [5.17, 0], [5.6, 1]], out);
+  const open = kf(t, [[0, 1], [2.96, 1], [3.2, 0], [3.55, 0], [3.8, 1]], out);
+  const dim = kf(t, [[0, 1], [2.96, 1], [3.2, 0], [3.55, 0], [3.75, 1]]);
+  const cell = (i, cols) => [PX + (i % cols) * CW, PY + Math.floor(i / cols) * CH];
+  const body = (names, cols) => {
+    const shown = names.filter(n => hit(n, 'note'));
+    return names.map((n, i) => {
+      const m = hit(n, q), pm = hit(n, pq);
+      const a = lerp(pm ? 1 : .18, m ? 1 : .18, u);
+      const o = lerp(1, a, dim) * (hit(n, 'note') ? 1 : 1 - hide);
+      const j = shown.indexOf(n);
+      const [x, y] = j >= 0 ? mix(cell(i, cols), cell(j, cols), hide) : cell(i, cols);
+      const sel = n === cur ? (n === pcur ? 1 : su) : n === pcur ? 1 - su : 0;
+      return o > .005 ? item(n, x, y, { o, sel: sel * dim }) : '';
+    }).join('');
+  };
+  let html = glow(800, 600, 520, D ? .14 : .1) +
+    box({ x: AX, y: BY, w: bw(4), h: bh(2), title: 'Apps', body: body(apps, 4) }) +
+    box({ x: DX, y: BY, w: bw(3), h: bh(2), title: 'Documents', body: body(docs, 3) });
+  // The list, opening out of the field.
+  const PW = 600, PXL = 500, PAD = 14, HEADH = 48, CHIPH = 50, ROWH = 56, FOOT = 58, ROWS = 3;
+  const PH = PAD + HEADH + CHIPH + ROWS * ROWH + FOOT + PAD, PY0 = 768 - PH;
+  const soft = a => D ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a})`;
+  if (open > .01) {
+    const nApps = apps.filter(n => hit(n, q)).length, nDocs = docs.filter(n => hit(n, q)).length;
+    const chip = (g, n, on) => `<div style="height:36px;padding:0 16px;border-radius:18px;display:flex;align-items:center;gap:10px;${on ? `background:${ACC};color:${D ? '#00243A' : '#fff'}` : `background:${soft(.07)};box-shadow:inset 0 0 0 1px ${soft(.1)}`};font:600 19px 'Segoe UI Variable Text'"><span class="gl" style="font-size:17px">${g}</span>${n === null ? '' : `<span>${n}</span>`}</div>`;
+    const chips = `<div class="abs" style="left:${PAD}px;top:${PAD + HEADH + 6}px;display:flex;gap:8px">${chip('', null, true)}${nApps ? chip('', nApps, false) : ''}${nDocs ? chip('', nDocs, false) : ''}</div>`;
+    const rows = list.slice(0, ROWS).map(([n, where], i) => {
+      const y = PAD + HEADH + CHIPH + i * ROWH;
+      const on = n === cur;
+      const pick = on ? `background:rgba(${ACCR},.22);` : '';
+      const bar = on ? `<div class="abs" style="left:1px;top:16px;width:4px;height:${ROWH - 32}px;border-radius:2px;background:${ACC}"></div>` : '';
+      return `<div class="abs" style="left:${PAD}px;top:${y}px;width:${PW - 2 * PAD}px;height:${ROWH}px;border-radius:8px;${pick}">${bar}
+        <img src="${SRC(n)}" class="abs" style="left:16px;top:${(ROWH - 36) / 2}px;width:36px;height:36px;object-fit:contain">
+        <div class="abs" style="left:68px;top:0;height:${ROWH}px;display:flex;align-items:center;font:400 21px 'Segoe UI Variable Text'">${NAME(n)}</div>
+        <div class="abs" style="right:16px;top:0;height:${ROWH}px;display:flex;align-items:center;font:400 18px 'Segoe UI Variable Text';opacity:.58">${where}</div></div>`;
+    }).join('');
+    const hy = PAD;
+    const head = `<div class="abs" style="left:${PAD + 8}px;top:${hy}px;height:${HEADH}px;display:flex;align-items:center;gap:10px;font:600 21px 'Segoe UI Variable Display';opacity:.9"><span class="gl" style="font-size:18px;opacity:.75"></span>${list.length}</div>` +
+      `<div class="abs gl" style="left:${PW - PAD - 64 - 44}px;top:${hy}px;height:${HEADH}px;display:flex;align-items:center;font-size:21px;opacity:.85"></div>` + toggle(hide, PW - PAD - 72, hy + 8);
+    const fy = PAD + HEADH + CHIPH + ROWS * ROWH + 10;
+    const btn = (x, w, g, strong) => `<div class="abs gl" style="left:${x}px;top:${fy}px;width:${w}px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;gap:10px;font-size:19px;${strong ? `background:${ACC};color:${D ? '#00243A' : '#fff'}` : `background:${soft(.07)};box-shadow:inset 0 0 0 1px ${soft(.1)}`}">${g}</div>`;
+    const foot = btn(PAD, 76, '', true) + btn(PAD + 86, 76, '', false);
+    const sy = (1 - open) * 18;
+    html += card(PXL, PY0 + sy, PW, PH, head + chips + rows + foot, `border-radius:16px;opacity:${open};z-index:30`);
+  }
+  // The field.
   const caret = Math.floor(t * 2.2) % 2 === 0 ? 1 : 0;
-  const n = q ? APPS.concat(docs).filter(x => hit(x, q)).length : 0;
-  const pill = `<div class="abs ui" style="left:560px;top:690px;width:480px;height:64px;border-radius:32px;backdrop-filter:blur(30px) saturate(1.4);background:${D ? 'rgba(34,36,44,.84)' : 'rgba(255,255,255,.88)'};box-shadow:0 18px 50px rgba(0,0,0,.4),inset 0 0 0 2px ${ACC};display:flex;align-items:center;padding:0 26px;gap:16px;color:${FG};font:400 25px 'Segoe UI Variable Text'"><span class="gl" style="font-size:21px;opacity:.8"></span><span>${q}<span style="display:inline-block;width:2px;height:28px;background:${FG};vertical-align:-5px;margin-left:2px;opacity:${caret}"></span></span><span style="margin-left:auto;opacity:.6;font-size:20px">${n ? '1 / ' + n : ''}</span></div>`;
-  return box({ x: 200, y: 160, w: bw(4), h: bh(2), title: 'Apps', items: APPS, f }) +
-    box({ x: 860, y: 160, w: bw(3), h: bh(2), cols: 3, title: 'Documents', items: docs, f }) + pill;
+  const n = list.length;
+  html += `<div class="abs ui" style="left:520px;top:780px;width:560px;height:64px;border-radius:32px;background:${D ? 'rgba(34,36,44,.9)' : 'rgba(255,255,255,.92)'};box-shadow:0 18px 50px rgba(0,0,0,.4),inset 0 0 0 2px ${ACC};display:flex;align-items:center;padding:0 26px;gap:16px;color:${FG};font:400 25px 'Segoe UI Variable Text';z-index:31"><span class="gl" style="font-size:21px;opacity:.8"></span><span>${q}<span style="display:inline-block;width:2px;height:28px;background:${FG};vertical-align:-5px;margin-left:2px;opacity:${caret}"></span></span><span style="margin-left:auto;opacity:.6;font-size:20px">${n ? '1 / ' + n : ''}</span></div>`;
+  // The pointer: the switch off, a row, aside while typing, the switch on.
+  const sw = [PXL + PW - PAD - 40, PY0 + PAD + 24], rest = [sw[0] + 10, sw[1] + 12];
+  const row2 = [PXL + 220, PY0 + PAD + HEADH + CHIPH + ROWH + ROWH / 2];
+  const aside = [1250, 640];
+  const p = pointer(t, [[0, ...rest], [.45, ...rest], [.75, ...sw], [1.4, ...sw], [1.85, ...row2], [2.4, ...row2], [3.0, ...aside], [4.5, ...aside], [5.05, ...sw], [5.8, ...sw], [6.4, ...rest]], [.8, 1.95, 5.15]);
+  return html + p.html;
 } };
 
 S.locks = { dur: 4.6, wp: [1900, -360, -300], cam: [400, 170, 880, 495], draw: t => {
