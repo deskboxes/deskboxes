@@ -736,6 +736,33 @@ pub fn fill_rect(dc: &ID2D1DeviceContext, r: RectF, c: Color) -> R<()> {
     }
 }
 
+/// A bitmap stretched over `dst` with rounded corners (a game's cover).
+pub fn draw_bitmap_round(dc: &ID2D1DeviceContext, b: &Bitmap, dst: RectF, radius: f32, opacity: f32) -> R<()> {
+    unsafe {
+        let sz = b.GetSize();
+        if sz.width <= 0.0 || sz.height <= 0.0 {
+            return Ok(());
+        }
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+            extendModeX: D2D1_EXTEND_MODE_CLAMP,
+            extendModeY: D2D1_EXTEND_MODE_CLAMP,
+            interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+        };
+        let br = dc.CreateBitmapBrush(b, Some(&props), None)?;
+        br.SetTransform(&Matrix3x2 {
+            M11: (dst.right - dst.left) / sz.width,
+            M12: 0.0,
+            M21: 0.0,
+            M22: (dst.bottom - dst.top) / sz.height,
+            M31: dst.left,
+            M32: dst.top,
+        });
+        br.SetOpacity(opacity.clamp(0.0, 1.0));
+        dc.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: dst, radiusX: radius, radiusY: radius }, &br);
+        Ok(())
+    }
+}
+
 pub fn draw_bitmap(dc: &ID2D1DeviceContext, b: &Bitmap, dst: RectF, opacity: f32) {
     unsafe { dc.DrawBitmap(b, Some(&dst), opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None) }
 }

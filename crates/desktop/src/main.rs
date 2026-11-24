@@ -32,6 +32,7 @@
 mod anim;
 mod app;
 mod az;
+mod covers;
 mod draw;
 mod droptarget;
 mod events;

@@ -161,6 +161,9 @@ pub enum View {
     Details,
     /// A bigger icon with the name, type and size to the right.
     Tiles,
+    /// Games as their store covers (portrait, 2:3), the name under each; an icon on a
+    /// cover-sized tile where there is no cover.
+    Covers,
 }
 
 impl View {
@@ -169,6 +172,7 @@ impl View {
             "list" => View::List,
             "details" => View::Details,
             "tiles" => View::Tiles,
+            "covers" => View::Covers,
             _ => View::Icons,
         }
     }
@@ -178,6 +182,7 @@ impl View {
             View::List => "list",
             View::Details => "details",
             View::Tiles => "tiles",
+            View::Covers => "covers",
         }
     }
 }
@@ -222,7 +227,7 @@ pub struct BoxModel {
     /// each tab keeps its own now (`Tab::folder_at`).
     #[serde(default)]
     pub folder_at: String,
-    /// How it shows its icons: "" = icons, "list", "details" or "tiles" (`View`).
+    /// How it shows its icons: "" = icons, "list", "details", "tiles" or "covers" (`View`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub view: String,
     /// Icon size in DIPs for the icons view; 0 = the desktop's size.

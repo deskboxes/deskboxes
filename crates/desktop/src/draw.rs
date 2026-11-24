@@ -732,9 +732,27 @@ impl App {
             return self.paint_private(dc, &it.display_name, icon, label, cell, th, shadow, opacity * cut_ghost);
         }
         let a = opacity * cut_ghost;
+        // Covers: the game's cover, or a cover-sized tile with its icon in the middle.
+        let mut icon = icon;
+        let mut covered = false;
+        if m.view == deskboxes_core::model::View::Covers {
+            let (fill, edge) = if self.light { (rgba(0, 0, 0, 0.06), rgba(0, 0, 0, 0.10)) } else { (rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.12)) };
+            let radius = crate::covers::RADIUS;
+            match self.cover_of(it) {
+                Some(c) => {
+                    r::draw_bitmap_round(dc, c, rf(icon), radius, a)?;
+                    covered = true;
+                }
+                None => {
+                    r::fill_round(dc, rf(icon), radius, Color { a: fill.a * a, ..fill })?;
+                    icon = Rect::new(icon.x + (icon.w - m.icon) / 2.0, icon.y + (icon.h - m.icon) / 2.0, m.icon, m.icon);
+                }
+            }
+            r::stroke_round(dc, rf(self.cover_parts(k, cell, full).0.inflate(-0.5)), radius, Color { a: edge.a * a, ..edge }, 1.0)?;
+        }
         // Blending in: the wallpaper's color behind the icon.
-        let wall_c = (fx.blend > 0.0).then(|| self.wall_color_at(Pt { x: icon.x + icon.w / 2.0, y: icon.y + icon.h / 2.0 }));
-        if let Some((bid, b)) = self.icon_bitmap(it, m) {
+        let wall_c = (fx.blend > 0.0 && !covered).then(|| self.wall_color_at(Pt { x: icon.x + icon.w / 2.0, y: icon.y + icon.h / 2.0 }));
+        if let Some((bid, b)) = self.icon_bitmap(it, m).filter(|_| !covered) {
             let mut r0 = fit_icon(b, icon);
             if grow < 1.0 {
                 let s = 0.65 + 0.35 * grow;

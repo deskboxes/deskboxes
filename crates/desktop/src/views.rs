@@ -42,7 +42,7 @@ pub struct Metrics {
 impl Metrics {
     /// A row view: the name is one line to the right of the icon.
     pub fn row(&self) -> bool {
-        self.view != View::Icons
+        matches!(self.view, View::List | View::Details | View::Tiles)
     }
 }
 
@@ -83,6 +83,8 @@ pub struct ViewState {
     texts: RefCell<HashMap<(ItemKey, u8), String>>,
     /// Ctrl+wheel over a box: the turn not used yet (a notch is 120; touchpads send less).
     pub wheel: i32,
+    /// Game covers (the Covers view).
+    pub covers: crate::covers::Covers,
 }
 
 impl ViewState {
@@ -106,6 +108,7 @@ pub fn preset(id: &str) -> Option<(&'static str, u32)> {
         "list" => ("list", 0),
         "details" => ("details", 0),
         "tiles" => ("tiles", 0),
+        "covers" => ("covers", 0),
         "desktop" => ("", 0),
         _ => return None,
     })
@@ -117,6 +120,7 @@ pub fn preset_of(b: &BoxModel) -> &'static str {
         View::List => "list",
         View::Details => "details",
         View::Tiles => "tiles",
+        View::Covers => "covers",
         View::Icons => match b.icon_size {
             0 => "desktop",
             256 => "xl",
@@ -155,6 +159,12 @@ impl App {
             View::Tiles => {
                 let cols = (avail / TILE_COL).floor().max(1.0);
                 Metrics { view: View::Tiles, cell_w: (avail / cols).floor(), cell_h: TILE_H, icon: 48.0, px: px(48.0) }
+            }
+            View::Covers => {
+                // Columns of covers spread over the box's width (as Tiles fill it).
+                let (cw, ch) = crate::covers::cell_size(self.line_h);
+                let cols = (avail / cw).floor().max(1.0);
+                Metrics { view: View::Covers, cell_w: (avail / cols).floor().max(cw), cell_h: ch, icon: 48.0, px: px(48.0) }
             }
         }
     }
@@ -221,9 +231,13 @@ impl App {
     pub fn request_sized_icons(&mut self, cells: &[(ItemKey, Rect, Option<u32>)]) {
         let mut want: HashMap<u32, Vec<(u32, String, u32)>> = HashMap::new();
         let mut ms: HashMap<u32, Metrics> = HashMap::new();
+        let mut covers: Vec<&ItemKey> = vec![];
         for (k, _, bx) in cells {
             let Some(id) = bx else { continue };
             let m = *ms.entry(*id).or_insert_with(|| self.metrics_of(Some(*id)));
+            if m.view == View::Covers {
+                covers.push(k);
+            }
             if m.px == self.icon_px {
                 continue;
             }
@@ -238,6 +252,9 @@ impl App {
         for (px, items) in want {
             log::info!("icons at {px} px: {} asked", items.len());
             let _ = self.worker.send(Req::IconsAt { px, items });
+        }
+        if !covers.is_empty() {
+            self.request_covers(covers.into_iter());
         }
     }
 
@@ -325,7 +342,7 @@ impl App {
         let cur = match b.view() {
             View::Details => 0,
             View::List => 1,
-            View::Tiles => 2 + BOX_WHEEL_SIZES.iter().position(|s| *s == 48).unwrap_or(2),
+            View::Tiles | View::Covers => 2 + BOX_WHEEL_SIZES.iter().position(|s| *s == 48).unwrap_or(2),
             View::Icons => {
                 let dip = if b.icon_size == 0 { self.icon_dip.round() as u32 } else { b.icon_size };
                 2 + BOX_WHEEL_SIZES.iter().enumerate().min_by_key(|(_, s)| s.abs_diff(dip)).map(|(i, _)| i).unwrap_or(2)

@@ -103,6 +103,8 @@ pub enum Ev {
         map: Vec<(u32, u32)>,
         icons: Vec<(u32, IconImage)>,
     },
+    /// Game covers read (see `covers`): Steam app id, its cover if there is one.
+    Covers(Vec<(u32, Option<IconImage>)>),
 }
 
 static QUEUE: Mutex<Vec<Ev>> = Mutex::new(Vec::new());

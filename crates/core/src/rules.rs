@@ -53,6 +53,19 @@ fn url_file(it: &Item) -> bool {
 }
 
 /// Where a shortcut leads, lowercase ("" for other icons and unread links).
+/// The Steam game a link starts (`steam://rungameid/1091500`, `steam://run/...`,
+/// `steam.exe -applaunch 1091500`): its app id, for its cover.
+pub fn steam_app_id(link: &str) -> Option<u32> {
+    let l = link.trim().to_ascii_lowercase();
+    let rest = ["steam://rungameid/", "steam://run/", "steam://launch/"]
+        .iter()
+        .find_map(|p| l.strip_prefix(p))
+        .or_else(|| l.find("-applaunch ").map(|i| l[i + "-applaunch ".len()..].trim_start()))?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    // (A shortcut to a mod or a non-Steam game has a 64-bit id: no cover of its own.)
+    digits.parse::<u32>().ok().filter(|id| *id > 0)
+}
+
 fn link_of(it: &Item) -> String {
     if it.kind == ItemKind::Folder || it.kind == ItemKind::Virtual {
         return String::new();
@@ -354,6 +367,26 @@ mod tests {
     use super::*;
     use crate::geom::{Grid, Rect};
     use crate::layout::{create_box, reconcile};
+
+    #[test]
+    fn steam_app_ids() {
+        assert_eq!(steam_app_id("steam://rungameid/1091500"), Some(1091500));
+        assert_eq!(steam_app_id("  STEAM://run/945360/"), Some(945360));
+        assert_eq!(steam_app_id("steam://launch/730/dialog"), Some(730));
+        assert_eq!(steam_app_id(r#""C:\Program Files (x86)\Steam\steam.exe" -applaunch 284160 -fullscreen"#), Some(284160));
+        // A non-Steam game's shortcut (64-bit id), Big Picture, a website: none.
+        assert_eq!(steam_app_id("steam://rungameid/12345678901234567890"), None);
+        assert_eq!(steam_app_id("steam://open/bigpicture"), None);
+        assert_eq!(steam_app_id("https://store.steampowered.com/app/730"), None);
+        assert_eq!(steam_app_id(""), None);
+    }
+
+    #[test]
+    fn covers_view_round_trips() {
+        use crate::model::View;
+        assert_eq!(View::parse("covers"), View::Covers);
+        assert_eq!(View::Covers.id(), "covers");
+    }
 
     fn item(name: &str, kind: ItemKind, size: u64, modified: u64) -> Item {
         let ext = std::path::Path::new(name).extension().map(|e| format!(".{}", e.to_string_lossy().to_lowercase())).unwrap_or_default();

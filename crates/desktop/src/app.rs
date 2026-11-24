@@ -1866,6 +1866,9 @@ impl App {
         if m.row() {
             return self.row_parts(cell, m);
         }
+        if m.view == deskboxes_core::model::View::Covers {
+            return self.cover_parts(key, cell, full);
+        }
         // Where Explorer puts them (measured on its own desktop): the icon 7 DIPs into the cell,
         // the label 3 DIPs under it.
         let icon = Rect::new(cell.x + (cell.w - m.icon) / 2.0, cell.y + 7.0, m.icon, m.icon);
@@ -3618,6 +3621,7 @@ impl App {
             e("list", S::ViewList),
             e("details", S::ViewDetails),
             e("tiles", S::ViewTiles),
+            e("covers", S::ViewCovers),
             json!({ "separator": true }),
             e("desktop", S::ViewAsDesktop),
         ]
@@ -6766,6 +6770,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         Ev::FileDone { op } => app.on_file_done(op),
                         Ev::FileStepDone { op, undo } => app.on_file_step_done(op, undo),
                         Ev::IconsAt { px, map, icons } => app.apply_sized_icons(px, map, icons),
+                        Ev::Covers(v) => app.apply_covers(v),
                         Ev::Update => {
                             // (The update status is compared on its own too: a setting applied from
                             // the window notes the whole state as sent without sending it.)

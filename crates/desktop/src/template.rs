@@ -1,7 +1,7 @@
 //! The default sorting template: boxes for apps, games, folders, documents, media and
 //! installers & archives, each with a "type" rule, made for the kinds of icons the desktop has.
 //! It runs once on a fresh install (no settings, no layout yet), and whenever "Sort now" is used
-//! with no rules. One undo step; the boxes and rules are ordinary ones the user can change or
+//! with no rules. The games box shows its games as covers. One undo step; the boxes and rules are ordinary ones the user can change or
 //! delete.
 
 use crate::app::{header_h, App, PAD};
@@ -59,9 +59,12 @@ impl App {
         let (cw, ch, work) = (self.grid.cell_w, self.grid.cell_h, self.work);
         let mut rects: Vec<Rect> = vec![];
         let (mut right, mut y, mut col_w) = (work.right() - GAP, work.y + GAP, 0.0f32);
-        for (_, _, n) in &plan {
+        for (_, cats, n) in &plan {
+            // The games box shows covers (taller cells, two rows at most).
+            let covers = cats.contains(&"games");
+            let ((cw, ch), max_rows) = if covers { (crate::covers::cell_size(self.line_h), 2.0) } else { ((cw, ch), 3.0) };
             let cols = (*n).clamp(2, 4) as f32;
-            let rows = (*n as f32 / cols).ceil().clamp(1.0, 3.0);
+            let rows = (*n as f32 / cols).ceil().clamp(1.0, max_rows);
             let (w, h) = (cols * cw + 2.0 * PAD, header_h() + rows * ch + 8.0);
             let mut r;
             loop {
@@ -93,6 +96,11 @@ impl App {
         self.change_layout(|l, g| {
             for ((title, cats, _), r) in plan.iter().zip(&rects) {
                 let id = layout::create_box(l, *r, title, style.clone());
+                if cats.contains(&"games") {
+                    if let Some(b) = l.boxes.iter_mut().find(|b| b.id == id) {
+                        b.view = "covers".into();
+                    }
+                }
                 let tab = l.boxes.iter().find(|b| b.id == id).map(|b| b.tabs[0].id).unwrap_or(0);
                 for c in cats.iter() {
                     rules::new_rule(l, "type", c, tab);
