@@ -1168,12 +1168,13 @@ namespace dbx
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
             x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
                  L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>"
-                 L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\">";
+                 L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\" IgnoredInputKinds=\"MouseWheel\">";  // (the wheel: WireWheel)
             // In a Grid: straight in the ScrollViewer, a page narrower than MaxWidth was placed by
             // its own width and then stretched, so it sat off to the right in a wide window.
             // (PageMove inside a plain Grid: the ScrollView drives its content's composition visual, and
-            // Rise moves PageMove's; one element's visual for both crashed the window.)
-            x += L"<Grid><Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
+            // Rise moves PageMove's; one element's visual for both crashed the window. Transparent,
+            // not empty: the gaps between cards catch the wheel too.)
+            x += L"<Grid Background=\"Transparent\"><Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
             x += animate ? L" Opacity=\"0\">" : L">";
             if (animate)
                 x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.083\"/></StackPanel.OpacityTransition>";
@@ -1776,45 +1777,74 @@ namespace dbx
                 hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(leave)), true);
         }
 
-        // The mouse wheel on a page: as far per notch as Windows' wheel setting says (3 lines:
-        // 200 px, about what Windows Settings scrolls; ScrollView's own step was a fifth of that), gliding there quickly; notches that
-        // come fast add up instead of restarting from where the glide is. Touchpads and Ctrl keep
-        // ScrollView's own handling. On the scroller's content, which sees the wheel before the
-        // scroller does; the scroller is looked up then (Refresh moves content between pages).
+        // The mouse wheel on a page, as Windows Settings scrolls (measured from a recording of it):
+        // a notch goes about 100 px (3 lines, Windows' wheel setting) in a quick ease-out of about
+        // 170 ms whose speed falls off evenly (36, 28, 22, 14, 8 px a frame at 30 fps). A notch that
+        // comes while the page still moves goes on from where the last one was headed. A touchpad's
+        // small steps follow at once. The ScrollView ignores the wheel (it scrolled on the compositor,
+        // where no step can be set); this listens on its content, which sees the wheel first (also
+        // over pictures and clips that mark it handled; not over a control that scrolls itself), and
+        // looks the scroller up then (Refresh moves content between pages).
+        struct WheelGlide
+        {
+            int32_t id = -1;                                   // the ScrollTo of the last notch
+            double target = 0;                                 // where it goes
+            std::chrono::steady_clock::time_point at{};        // when it started
+        };
+        WheelGlide g_wheel;
+        constexpr auto kWheelGlide = std::chrono::milliseconds(170);
+
         void WireWheel(mux::FrameworkElement const& root)
         {
             auto sv = Find<muxc::ScrollView>(root, L"Scroll");
             auto content = sv ? sv.Content().try_as<mux::UIElement>() : mux::UIElement{ nullptr };
             if (!content) return;
+            // The notch's glide (other scrolls, as bringing a found setting into view, keep theirs).
             sv.ScrollAnimationStarting([](auto&&, muxc::ScrollingScrollAnimationStartingEventArgs const& a)
                 {
-                    if (auto kf = a.Animation().try_as<winrt::Microsoft::UI::Composition::Vector3KeyFrameAnimation>())
-                        kf.Duration(std::chrono::milliseconds(200));
+                    if (a.CorrelationId() != g_wheel.id) return;
+                    auto comp = a.Animation().Compositor();
+                    auto glide = comp.CreateVector3KeyFrameAnimation();
+                    // Ease-out quad: the speed falls off in a straight line.
+                    auto quad = comp.CreateCubicBezierEasingFunction({ 0.5f, 1.0f }, { 0.89f, 1.0f });
+                    auto end = a.EndPosition();
+                    glide.InsertKeyFrame(1.0f, { end.x, end.y, 0.0f }, quad);
+                    glide.Duration(kWheelGlide);
+                    a.Animation(glide);
                 });
-            struct Glide { double target = 0; std::chrono::steady_clock::time_point at{}; };
-            auto glide = std::make_shared<Glide>();
-            content.PointerWheelChanged([glide](winrt::Windows::Foundation::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e)
+            auto wheel = [](winrt::Windows::Foundation::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e)
+            {
+                if ((e.KeyModifiers() & winrt::Windows::System::VirtualKeyModifiers::Control) != winrt::Windows::System::VirtualKeyModifiers::None) return;
+                auto self = s.as<mux::DependencyObject>();
+                // Handled by a control of its own scrolling (a long text box, a list): its wheel.
+                if (e.Handled())
+                    for (auto o = e.OriginalSource().try_as<mux::DependencyObject>(); o && o != self; o = mux::Media::VisualTreeHelper::GetParent(o))
+                        if (o.try_as<muxc::ScrollViewer>() || o.try_as<muxc::ScrollView>() || o.try_as<muxc::ComboBox>() || o.try_as<muxc::Slider>()) return;
+                auto pt = e.GetCurrentPoint(s.as<mux::UIElement>());
+                if (pt.Properties().IsHorizontalMouseWheel()) return;
+                muxc::ScrollView sv{ nullptr };
+                for (auto o = mux::Media::VisualTreeHelper::GetParent(self); o && !sv; o = mux::Media::VisualTreeHelper::GetParent(o))
+                    sv = o.try_as<muxc::ScrollView>();
+                if (!sv) return;
+                UINT lines = 3;
+                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                double step = lines == WHEEL_PAGESCROLL ? sv.ViewportHeight() * 0.9 : 100.0 / 3.0 * lines;
+                double delta = -pt.Properties().MouseWheelDelta() / 120.0 * step;
+                double most = std::max(0.0, sv.ScrollableHeight());
+                e.Handled(true);
+                if (e.Pointer().PointerDeviceType() != winrt::Microsoft::UI::Input::PointerDeviceType::Mouse)
                 {
-                    if (e.Pointer().PointerDeviceType() != winrt::Microsoft::UI::Input::PointerDeviceType::Mouse) return;
-                    if ((e.KeyModifiers() & winrt::Windows::System::VirtualKeyModifiers::Control) != winrt::Windows::System::VirtualKeyModifiers::None) return;
-                    auto pt = e.GetCurrentPoint(s.as<mux::UIElement>());
-                    if (pt.Properties().IsHorizontalMouseWheel()) return;
-                    muxc::ScrollView sv{ nullptr };
-                    for (auto o = mux::Media::VisualTreeHelper::GetParent(s.as<mux::DependencyObject>()); o && !sv; o = mux::Media::VisualTreeHelper::GetParent(o))
-                        sv = o.try_as<muxc::ScrollView>();
-                    if (!sv) return;
-                    UINT lines = 3;
-                    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-                    double step = lines == WHEEL_PAGESCROLL ? sv.ViewportHeight() * 0.9 : 200.0 / 3.0 * lines;
-                    double delta = -pt.Properties().MouseWheelDelta() / 120.0 * step;
-                    auto now = std::chrono::steady_clock::now();
-                    bool gliding = now - glide->at < std::chrono::milliseconds(260);
-                    double from = gliding ? glide->target : sv.VerticalOffset();
-                    glide->target = std::clamp(from + delta, 0.0, std::max(0.0, sv.ScrollableHeight()));
-                    glide->at = now;
-                    sv.ScrollTo(sv.HorizontalOffset(), glide->target, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Enabled, muxc::ScrollingSnapPointsMode::Ignore));
-                    e.Handled(true);
-                });
+                    g_wheel.id = -1;
+                    sv.ScrollTo(sv.HorizontalOffset(), std::clamp(sv.VerticalOffset() + delta, 0.0, most), muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Disabled, muxc::ScrollingSnapPointsMode::Ignore));
+                    return;
+                }
+                auto now = std::chrono::steady_clock::now();
+                double from = now - g_wheel.at < kWheelGlide ? g_wheel.target : sv.VerticalOffset();
+                g_wheel.target = std::clamp(from + delta, 0.0, most);
+                g_wheel.at = now;
+                g_wheel.id = sv.ScrollTo(sv.HorizontalOffset(), g_wheel.target, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Enabled, muxc::ScrollingSnapPointsMode::Ignore));
+            };
+            content.AddHandler(mux::UIElement::PointerWheelChangedEvent(), winrt::box_value(mux::Input::PointerEventHandler(wheel)), true);
         }
 
         void Wire(mux::FrameworkElement const& root)
