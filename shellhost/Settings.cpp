@@ -176,12 +176,16 @@ namespace dbx
             x += L"<CheckBox x:Name=\"" + p + L"On\" MinWidth=\"0\" VerticalAlignment=\"Center\"" + (r.GetNamedBoolean(L"enabled", true) ? L" IsChecked=\"True\"" : L"") + L"/>";
             x += L"<StackPanel Grid.Column=\"1\" Spacing=\"8\"><StackPanel Orientation=\"Horizontal\" Spacing=\"8\">" + Label(Str(L"ruleIf"));
             x += L"<ComboBox x:Name=\"" + p + L"Kind\" MinWidth=\"130\">" + Opt(L"type", Str(L"kindType"), kind == L"type") + Opt(L"name", Str(L"kindName"), kind == L"name") +
-                 Opt(L"ext", Str(L"kindExt"), kind == L"ext") + Opt(L"age", Str(L"kindAge"), kind == L"age") + Opt(L"size", Str(L"kindSize"), kind == L"size") + L"</ComboBox>";
-            if (kind == L"name")
+                 Opt(L"link", Str(L"kindLink"), kind == L"link") + Opt(L"ext", Str(L"kindExt"), kind == L"ext") + Opt(L"age", Str(L"kindAge"), kind == L"age") +
+                 Opt(L"size", Str(L"kindSize"), kind == L"size") + L"</ComboBox>";
+            if (kind == L"name" || kind == L"link")
             {
+                bool link = kind == L"link";
                 x += L"<ComboBox x:Name=\"" + p + L"Op\" MinWidth=\"130\">" + Opt(L"contains", Str(L"opContains"), op == L"contains") + Opt(L"starts", Str(L"opStarts"), op == L"starts") +
                      Opt(L"ends", Str(L"opEnds"), op == L"ends") + Opt(L"is", Str(L"opIs"), op == L"is") + L"</ComboBox>";
-                x += L"<TextBox x:Name=\"" + p + L"Val\" Width=\"160\" PlaceholderText=\"" + Str(L"textHint") + L"\" Text=\"" + val + L"\"/>";
+                // (A shortcut target is hard to guess: the hover note shows what one looks like.)
+                x += L"<TextBox x:Name=\"" + p + L"Val\" Width=\"" + std::wstring(link ? L"200" : L"160") + L"\" PlaceholderText=\"" + Str(link ? L"linkHint" : L"textHint") + L"\"" +
+                     (link ? L" ToolTipService.ToolTip=\"" + Str(L"linkNote") + L"\"" : std::wstring()) + L" Text=\"" + val + L"\"/>";
             }
             else if (kind == L"ext")
                 x += L"<TextBox x:Name=\"" + p + L"Val\" Width=\"200\" PlaceholderText=\"" + Str(L"extHint") + L"\" Text=\"" + val + L"\"/>";

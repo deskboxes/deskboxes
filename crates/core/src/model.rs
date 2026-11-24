@@ -61,6 +61,11 @@ pub struct Item {
     pub source: Source,
     /// Index into the icon cache (shared by items with the same system icon).
     pub icon: u32,
+    /// Where a shortcut leads: a .lnk's target (a path, or a shell item's parsing name) and its
+    /// arguments after a space, or a .url's URL. Empty for other items, or when it could not be
+    /// read (a file only in the cloud is not downloaded for it).
+    #[serde(default)]
+    pub link: String,
 }
 
 impl Item {
@@ -390,12 +395,12 @@ pub struct PageContent {
 pub struct Rule {
     pub id: u32,
     pub enabled: bool,
-    /// "type", "name", "ext", "age" or "size".
+    /// "type", "name", "link" (a shortcut's target), "ext", "age" or "size".
     pub kind: String,
-    /// type: category id; name: "contains" | "starts" | "ends" | "is"; age: "newer" | "older"
-    /// (days); size: "larger" | "smaller" (MB).
+    /// type: category id; name, link: "contains" | "starts" | "ends" | "is"; age: "newer" |
+    /// "older" (days); size: "larger" | "smaller" (MB).
     pub op: String,
-    /// name: text; ext: list like "pdf, docx"; age: days; size: MB.
+    /// name, link: text; ext: list like "pdf, docx"; age: days; size: MB.
     pub value: String,
     pub target: u32,
 }

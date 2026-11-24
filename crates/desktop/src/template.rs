@@ -1,4 +1,4 @@
-//! The default sorting template: boxes for apps, folders, documents, media and
+//! The default sorting template: boxes for apps, games, folders, documents, media and
 //! installers & archives, each with a "type" rule, made for the kinds of icons the desktop has.
 //! It runs once on a fresh install (no settings, no layout yet), and whenever "Sort now" is used
 //! with no rules. One undo step; the boxes and rules are ordinary ones the user can change or
@@ -10,13 +10,17 @@ use deskboxes_core::*;
 use deskboxes_i18n::{t, S};
 
 /// The template's boxes: title and the rule categories (`rules::CATEGORIES`) that go there.
-const GROUPS: [(S, &[&str]); 5] = [
+const GROUPS: [(S, &[&str]); 6] = [
     (S::TplApps, &["programs", "weblinks"]),
+    (S::TplGames, &["games", "launchers"]),
     (S::TplFolders, &["folders"]),
     (S::TplDocuments, &["documents"]),
     (S::TplMedia, &["images", "videos", "music"]),
     (S::TplInstallers, &["installers", "archives"]),
 ];
+
+/// The order `GROUPS` take their icons in: games before apps (games are programs too).
+const CLAIM: [usize; 6] = [1, 0, 2, 3, 4, 5];
 
 /// Gap between the template's boxes and from the screen edge.
 const GAP: f32 = 14.0;
@@ -34,15 +38,19 @@ impl App {
             .cloned()
             .collect();
         let mut used: std::collections::HashSet<ItemKey> = Default::default();
-        let mut plan: Vec<(String, &[&str], usize)> = vec![];
-        for (title, cats) in GROUPS {
-            let hits: Vec<ItemKey> = candidates.iter().filter(|i| !used.contains(&i.key) && cats.iter().any(|c| rules::in_category(i, c))).map(|i| i.key.clone()).collect();
-            let n = hits.len();
-            used.extend(hits);
-            if n > 0 {
-                plan.push((t(self.lang, title).to_string(), cats, n));
+        let mut counts = [0usize; GROUPS.len()];
+        for g in CLAIM {
+            let cats = GROUPS[g].1;
+            // A games box only for games (it then takes their launchers along): a launcher
+            // alone stays with the apps.
+            if cats.contains(&"games") && !candidates.iter().any(|i| rules::in_category(i, "games")) {
+                continue;
             }
+            let hits: Vec<ItemKey> = candidates.iter().filter(|i| !used.contains(&i.key) && cats.iter().any(|c| rules::in_category(i, c))).map(|i| i.key.clone()).collect();
+            counts[g] = hits.len();
+            used.extend(hits);
         }
+        let plan: Vec<(String, &[&str], usize)> = GROUPS.iter().zip(counts).filter(|(_, n)| *n > 0).map(|((title, cats), n)| (t(self.lang, *title).to_string(), *cats, n)).collect();
         if plan.is_empty() {
             log::info!("template: no icons to sort");
             return 0;

@@ -183,11 +183,93 @@ fn kind_of(e: &Entry) -> ItemKind {
     }
 }
 
-/// Full item for an entry (one CreateFile + one shell item; run on a worker).
+fn from_buf(b: &[u16]) -> String {
+    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf16_lossy(&b[..n])
+}
+
+/// A .lnk's target (a path, or a shell item's parsing name such as a Store app's) and its
+/// arguments after a space. Only read, never resolved (no searching for a moved target).
+fn lnk_target(path: &str) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::*;
+    unsafe {
+        let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pf: IPersistFile = sl.cast().ok()?;
+        pf.Load(pcw(&wide(path)), STGM_READ).ok()?;
+        let mut buf = vec![0u16; 2048];
+        let mut target = if sl.GetPath(&mut buf, std::ptr::null_mut(), 0).is_ok() { from_buf(&buf) } else { String::new() };
+        if target.is_empty() {
+            if let Ok(pidl) = sl.GetIDList() {
+                if !pidl.is_null() {
+                    if let Ok(n) = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING) {
+                        target = n.to_string().unwrap_or_default();
+                        CoTaskMemFree(Some(n.0 as _));
+                    }
+                    CoTaskMemFree(Some(pidl as _));
+                }
+            }
+        }
+        buf.fill(0);
+        let args = if sl.GetArguments(&mut buf).is_ok() { from_buf(&buf) } else { String::new() };
+        let args = args.trim();
+        Some(if args.is_empty() { target } else { format!("{target} {args}") })
+    }
+}
+
+/// The URL in an internet shortcut's text: `URL=` in its `[InternetShortcut]` section.
+pub fn url_in(text: &str) -> Option<String> {
+    let mut section = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            section = l.eq_ignore_ascii_case("[InternetShortcut]");
+        } else if let (true, Some((k, v))) = (section, l.split_once('=')) {
+            if k.trim().eq_ignore_ascii_case("url") {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A .url or .website file's URL (the file is ANSI, UTF-8 or UTF-16 text).
+fn url_target(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut b = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024).read_to_end(&mut b).ok()?;
+    let text = if let Some(u) = b.strip_prefix(&[0xFF, 0xFE]) {
+        String::from_utf16_lossy(&u.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>())
+    } else {
+        String::from_utf8_lossy(b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&b)).into_owned()
+    };
+    url_in(&text)
+}
+
+/// Where a desktop shortcut leads (`Item::link`), for sorting rules. Not read for icons in a
+/// folder box (rules never sort those), nor for files only in the cloud (reading would
+/// download them).
+fn link_of(e: &Entry, kind: ItemKind, ext: &str) -> String {
+    const NOT_LOCAL: u32 = 0x1000 | 0x40000 | 0x400000; // OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS
+    if e.attrs & NOT_LOCAL != 0 || e.source == Source::Folder {
+        return String::new();
+    }
+    let link = match kind {
+        ItemKind::Shortcut => lnk_target(&e.path),
+        ItemKind::UrlFile => url_target(&e.path),
+        ItemKind::File if ext == ".website" => url_target(&e.path),
+        _ => None,
+    };
+    link.unwrap_or_default()
+}
+
+/// Full item for an entry (one CreateFile + one shell item, and a shortcut's target; run on a
+/// worker).
 pub fn item_from_entry(e: &Entry) -> Item {
     let kind = kind_of(e);
     let ext = if kind == ItemKind::Folder { String::new() } else { Path::new(&e.name).extension().map(|x| format!(".{}", x.to_string_lossy().to_lowercase())).unwrap_or_default() };
     Item {
+        link: link_of(e, kind, &ext),
         key: file_key(&e.path),
         display_name: display_name(&e.path).unwrap_or_else(|| e.name.clone()),
         parsing_name: e.path.clone(),
@@ -230,7 +312,58 @@ pub fn virtual_items() -> Vec<Item> {
                 attrs: 0,
                 source: Source::Virtual,
                 icon: 0,
+                link: String::new(),
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::System::Com::*;
+
+    fn entry(path: &Path) -> Entry {
+        Entry { path: path.display().to_string(), name: path.file_name().unwrap().to_string_lossy().into_owned(), attrs: 0x20, size: 1, modified: 1, source: Source::Fixture }
+    }
+
+    #[test]
+    fn shortcut_targets_are_read() {
+        crate::com_sta();
+        let dir = std::env::temp_dir().join(format!("dbx-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A .lnk with arguments (made the way Explorer makes one).
+        let lnk = dir.join("Dota 2.lnk");
+        unsafe {
+            let sl: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            sl.SetPath(pcw(&wide(r"C:\Program Files (x86)\Steam\steam.exe"))).unwrap();
+            sl.SetArguments(pcw(&wide("-applaunch 570"))).unwrap();
+            sl.cast::<IPersistFile>().unwrap().Save(pcw(&wide(&lnk.display().to_string())), true).unwrap();
+        }
+        let it = item_from_entry(&entry(&lnk));
+        assert_eq!(it.kind, ItemKind::Shortcut);
+        assert_eq!(it.link.to_lowercase(), r"c:\program files (x86)\steam\steam.exe -applaunch 570");
+        // .url files as Steam (ANSI) and as UTF-16 with a BOM.
+        let url = dir.join("Cyberpunk 2077.url");
+        std::fs::write(&url, "[{000214A0-0000-0000-C000-000000000046}]\r\nProp3=19,0\r\n[InternetShortcut]\r\nIDList=\r\nIconIndex=0\r\nURL=steam://rungameid/1091500\r\n").unwrap();
+        assert_eq!(item_from_entry(&entry(&url)).link, "steam://rungameid/1091500");
+        let wurl = dir.join("Wiadomości.url");
+        let mut b = vec![0xFF, 0xFE];
+        b.extend("[InternetShortcut]\r\nURL=https://example.com/zażółć\r\n".encode_utf16().flat_map(|c| c.to_le_bytes()));
+        std::fs::write(&wurl, b).unwrap();
+        assert_eq!(item_from_entry(&entry(&wurl)).link, "https://example.com/zażółć");
+        // Cloud-only files are not read; plain files have no link.
+        assert_eq!(item_from_entry(&Entry { attrs: 0x20 | 0x400000, ..entry(&url) }).link, "");
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, "URL=x").unwrap();
+        assert_eq!(item_from_entry(&entry(&txt)).link, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn url_lines() {
+        assert_eq!(url_in("[Other]\nURL=nope\n[InternetShortcut]\n url = https://a.b/?x=1 \n").as_deref(), Some("https://a.b/?x=1"));
+        assert_eq!(url_in("URL=https://a.b/"), None);
+    }
 }

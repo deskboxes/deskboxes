@@ -414,6 +414,7 @@ mod tests {
             attrs: 0,
             source: Source::User,
             icon: 0,
+            link: String::new(),
         };
         reconcile(&mut l, std::slice::from_ref(&it.key), &g);
         let p2 = new_page(&mut l, "", None);

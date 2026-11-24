@@ -18,7 +18,7 @@ Installed copies update themselves.
 - **Boxes.** Group icons into boxes. You can move, resize and snap boxes to screen edges, and give each one its own color, transparency and background blur.
 - **Tabs.** Keep several groups of icons in one box and switch between them from the title bar.
 - **Roll-up.** Fold a box down to its title. It opens when you point at it, click it or double-click its title.
-- **Sorting rules.** New icons go into the right box by themselves, by file type, name or date.
+- **Sorting rules.** New icons go into the right box by themselves, by file type, name, date or where a shortcut leads. Games from Steam, Epic, GOG and other stores, and their launchers, are types of their own.
 - **A–Z index.** Keep a box in name order with a letter bar for jumping to a letter.
 - **Folder boxes.** Show a folder's files in a box, and open its subfolders right there.
 - **Desktop pages.** Keep more desktops side by side, each with its own boxes and icons. Switch pages with Alt+Left and Alt+Right, a touchpad swipe or by dragging the desktop.

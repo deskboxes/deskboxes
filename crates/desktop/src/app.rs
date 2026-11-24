@@ -4013,6 +4013,7 @@ impl App {
                     if let Some(r) = l.rules.iter_mut().find(|r| r.id == id) {
                         deskboxes_core::rules::set_kind(r, &k);
                     }
+                    deskboxes_core::rules::order_rule(l, id);
                 });
             }
             ("rules", field) => {
@@ -4027,6 +4028,11 @@ impl App {
                             "target" => r.target = val.as_f64().unwrap_or(0.0) as u32,
                             _ => {}
                         }
+                    }
+                    // Another type: a narrower one (games) moves ahead of a broader one (programs)
+                    // that would take its icons first.
+                    if field == "op" {
+                        deskboxes_core::rules::order_rule(l, id);
                     }
                 });
             }

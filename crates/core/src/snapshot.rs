@@ -5,7 +5,7 @@
 use crate::model::{Item, ItemKey, ItemKind, Source};
 
 pub const MAGIC: &[u8; 4] = b"DBXS";
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IconImage {
@@ -127,6 +127,7 @@ impl Snapshot {
             w.u64(it.modified);
             w.u32(it.attrs);
             w.u32(it.icon);
+            w.s(&it.link);
         }
         w.u32(self.icons.len() as u32);
         for ic in &self.icons {
@@ -152,7 +153,7 @@ impl Snapshot {
             let kind = kind_of(r.u8()?);
             let source = source_of(r.u8()?);
             let ext = r.s()?;
-            s.items.push(Item { key, parsing_name, display_name, kind, ext, size: r.u64()?, modified: r.u64()?, attrs: r.u32()?, source, icon: r.u32()? });
+            s.items.push(Item { key, parsing_name, display_name, kind, ext, size: r.u64()?, modified: r.u64()?, attrs: r.u32()?, source, icon: r.u32()?, link: r.s()? });
         }
         let m = r.u32()? as usize;
         for _ in 0..m {
@@ -179,13 +180,14 @@ mod tests {
                 key: ItemKey::file(0xabc, 42),
                 parsing_name: "C:\\x\\Zażółć gęślą jaźń.txt".into(),
                 display_name: "Zażółć gęślą jaźń.txt".into(),
-                kind: ItemKind::File,
-                ext: ".txt".into(),
+                kind: ItemKind::Shortcut,
+                ext: ".lnk".into(),
                 size: 7,
                 modified: 133_000_000_000_000_000,
                 attrs: 0x20,
                 source: Source::Fixture,
                 icon: 0,
+                link: "C:\\Gry\\Wiedźmin 3\\witcher3.exe -skip".into(),
             }],
             icons: vec![IconImage { w: 2, h: 1, bgra: vec![1, 2, 3, 4, 5, 6, 7, 8] }],
         };
