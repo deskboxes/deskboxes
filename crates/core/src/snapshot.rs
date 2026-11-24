@@ -5,7 +5,7 @@
 use crate::model::{Item, ItemKey, ItemKind, Source};
 
 pub const MAGIC: &[u8; 4] = b"DBXS";
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IconImage {

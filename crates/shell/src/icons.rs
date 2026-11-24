@@ -73,10 +73,29 @@ pub fn folder_image(parsing: &str, px: u32) -> Option<IconImage> {
         let p = wide(parsing);
         let f: IShellItemImageFactory = SHCreateItemFromParsingName(pcw(&p), None).ok()?;
         let hb = f.GetImage(SIZE { cx: px as i32, cy: px as i32 }, SIIGBF_BIGGERSIZEOK).ok()?;
-        let img = bitmap_pixels(hb);
+        let raw = bitmap_raw(hb);
         let _ = DeleteObject(hb.into());
-        img
+        let (img, had_alpha) = raw?;
+        // A folder picture always has see-through corners. Windows sometimes hands one back
+        // flattened (no alpha, or on black), e.g. while its thumbnail cache is still being built at
+        // sign-in; drawn as is, the folder sits in a black box. The caller falls back to the plain
+        // folder icon instead.
+        if !had_alpha || !see_through_corners(&img) {
+            log::info!("folder picture without transparency for {parsing}; using the icon");
+            return None;
+        }
+        Some(img)
     }
+}
+
+/// Whether at least three of the four corner pixels are mostly transparent.
+fn see_through_corners(img: &IconImage) -> bool {
+    if img.w < 4 || img.h < 4 {
+        return true;
+    }
+    let a = |x: u32, y: u32| img.bgra[((y * img.w + x) * 4 + 3) as usize];
+    let (r, b) = (img.w - 1, img.h - 1);
+    [a(0, 0), a(r, 0), a(0, b), a(r, b)].iter().filter(|&&v| v < 128).count() >= 3
 }
 
 /// Explorer's tooltip text for an item (type, size, date modified, a shortcut's description...).
@@ -92,8 +111,13 @@ pub fn info_tip(parsing: &str) -> Option<String> {
     }
 }
 
-/// 32-bpp pixels of an HBITMAP, top-down, premultiplied.
+/// 32-bpp pixels of an HBITMAP, top-down, premultiplied (opaque when it has no alpha).
 unsafe fn bitmap_pixels(hb: HBITMAP) -> Option<IconImage> {
+    bitmap_raw(hb).map(|(img, _)| img)
+}
+
+/// Same, and whether the bitmap had an alpha channel of its own.
+unsafe fn bitmap_raw(hb: HBITMAP) -> Option<(IconImage, bool)> {
     let mut bm = BITMAP::default();
     if GetObjectW(hb.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
         return None;
@@ -122,7 +146,7 @@ unsafe fn bitmap_pixels(hb: HBITMAP) -> Option<IconImage> {
             }
         }
     }
-    Some(IconImage { w: w as u32, h: h as u32, bgra: px })
+    Some((IconImage { w: w as u32, h: h as u32, bgra: px }, has_alpha))
 }
 
 /// The item's icon at `px` × `px` (no thumbnail, no overlay).
@@ -159,14 +183,31 @@ pub fn has_thumbnail_handler(ext: &str) -> bool {
     }
 }
 
-/// Pixels of an HICON (color bitmap with alpha; mask applied when it has no alpha).
+/// Pixels of an HICON (color bitmap with alpha; mask applied when it has no alpha, as for old
+/// icons, which would otherwise sit in a black square).
 unsafe fn icon_pixels(hi: HICON) -> Option<IconImage> {
     let mut ii = ICONINFO::default();
     GetIconInfo(hi, &mut ii).ok()?;
-    let img = bitmap_pixels(ii.hbmColor);
+    let raw = bitmap_raw(ii.hbmColor);
+    let mask = if matches!(raw, Some((_, false))) { bitmap_raw(ii.hbmMask) } else { None };
     let _ = DeleteObject(ii.hbmColor.into());
     let _ = DeleteObject(ii.hbmMask.into());
-    img
+    let (mut img, _) = raw?;
+    if let Some((m, _)) = mask {
+        if m.w == img.w && m.h >= img.h {
+            apply_mask(&mut img, &m);
+        }
+    }
+    Some(img)
+}
+
+/// Clears the pixels an icon's AND mask marks as transparent (mask set = see-through).
+fn apply_mask(img: &mut IconImage, mask: &IconImage) {
+    for (p, m) in img.bgra.chunks_exact_mut(4).zip(mask.bgra.chunks_exact(4)) {
+        if m[0] > 127 {
+            p.copy_from_slice(&[0, 0, 0, 0]);
+        }
+    }
 }
 
 /// The system overlay image (1-based overlay index, e.g. the shortcut arrow) from the image list

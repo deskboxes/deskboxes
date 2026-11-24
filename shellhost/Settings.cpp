@@ -1894,6 +1894,23 @@ namespace dbx
             });
         }
 
+        // Keeps the settings window at least 640 x 500 (at 100% scale), like Windows Settings keeps
+        // room for its navigation and a card.
+        LRESULT CALLBACK MinSizeProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR)
+        {
+            if (msg == WM_GETMINMAXINFO)
+            {
+                LRESULT r = DefSubclassProc(hwnd, msg, wp, lp);
+                UINT dpi = GetDpiForWindow(hwnd);
+                auto mmi = reinterpret_cast<MINMAXINFO*>(lp);
+                mmi->ptMinTrackSize.x = std::max<LONG>(mmi->ptMinTrackSize.x, MulDiv(640, dpi, 96));
+                mmi->ptMinTrackSize.y = std::max<LONG>(mmi->ptMinTrackSize.y, MulDiv(500, dpi, 96));
+                return r;
+            }
+            if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, MinSizeProc, id);
+            return DefSubclassProc(hwnd, msg, wp, lp);
+        }
+
         void MakeWindow()
         {
             g.window = mux::Window();
@@ -1917,6 +1934,8 @@ namespace dbx
             auto& wa = mi.rcWork;
             w = std::min<int>(w, wa.right - wa.left); h = std::min<int>(h, wa.bottom - wa.top);
             aw.MoveAndResize({ wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h });
+            // Not smaller than the navigation and a settings card need.
+            SetWindowSubclass(g.hwnd, MinSizeProc, 1, 0);
             g.window.Closed([](auto&&, auto&&)
                 {
                     if (g.switchTimer) g.switchTimer.Stop();

@@ -449,6 +449,8 @@ pub struct App {
     /// What the settings window last got (boxes, styles, default style, language): resent when
     /// the layout changes it, so an open window stays current.
     pub settings_sent: String,
+    /// The update status in the data last sent to the settings window (JSON).
+    pub update_sent: String,
     /// Rolled-up boxes opened because the pointer is on them.
     pub revealed: std::collections::HashSet<u32>,
     /// How far open each box is drawn, 0 (title only) .. 1 (animated toward its target).
@@ -1149,6 +1151,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         pending_new: None,
         box_edit: None,
         settings_sent: String::new(),
+        update_sent: String::new(),
         revealed: Default::default(),
         open_t: HashMap::new(),
         anim_last: None,
@@ -3560,6 +3563,11 @@ impl App {
     /// Send the settings window its data; `open` shows it, otherwise an open one is refreshed.
     pub fn send_settings(&mut self, open: bool, focus_box: Option<u32>) {
         let Some(h) = self.host.clone() else { return };
+        // What is sent is noted before it is built: the updater changes its status on its own
+        // thread, and a change made meanwhile (a download going from 100% to "ready") must still
+        // count as not sent, or Settings kept showing 100% until it was opened again.
+        let sig = self.settings_sig();
+        let upd = crate::update::status();
         let style = |st: &BoxStyle| json!({ "color": st.color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)).unwrap_or_default(), "opacity": st.opacity, "blur": st.blur });
         let strings: serde_json::Map<String, Value> = settings_strings(self.lang).into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
         let colors: Vec<Value> = BOX_COLORS
@@ -3618,7 +3626,7 @@ impl App {
             "hide": { "doubleClick": self.settings.hide.double_click },
             "update": {
                 "auto": self.settings.update.auto,
-                "status": crate::update::status(),
+                "status": &upd,
                 "version": crate::update::current(),
             },
             "above": { "hotkey": self.settings.above.hotkey, "corner": self.settings.above.corner, "dim": self.settings.above.dim, "hotkeyOk": self.above_hotkey_ok },
@@ -3670,7 +3678,8 @@ impl App {
         if let Err(e) = h.send("settings", body) {
             log::warn!("settings: {e}");
         }
-        self.settings_sent = self.settings_sig();
+        self.settings_sent = sig;
+        self.update_sent = serde_json::to_string(&upd).unwrap_or_default();
     }
 
     /// A change made in the settings window, applied live.
@@ -6634,7 +6643,10 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         Ev::FileStepDone { op, undo } => app.on_file_step_done(op, undo),
                         Ev::IconsAt { px, map, icons } => app.apply_sized_icons(px, map, icons),
                         Ev::Update => {
-                            if app.host.is_some() && app.settings_sig() != app.settings_sent {
+                            // (The update status is compared on its own too: a setting applied from
+                            // the window notes the whole state as sent without sending it.)
+                            let upd = serde_json::to_string(&crate::update::status()).unwrap_or_default();
+                            if app.host.is_some() && (app.settings_sig() != app.settings_sent || upd != app.update_sent) {
                                 app.send_settings(false, None);
                             }
                         }
