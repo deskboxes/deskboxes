@@ -50,7 +50,7 @@ Deskboxes only changes how your icons are shown. Your files stay where they are,
 </tr>
 <tr>
 <td width="50%"><a id="boxes-above-windows"></a><picture><source media="(prefers-color-scheme: light)" srcset="res/settings/above_l.jpg"><img src="res/settings/above.jpg" alt="Boxes above windows"></picture><br><b>Boxes above windows</b><br>Bring your boxes up over the open windows with Win+Shift+D or a screen corner. No window gets minimized.</td>
-<td width="50%"><a id="search"></a><picture><source media="(prefers-color-scheme: light)" srcset="res/settings/search_l.jpg"><img src="res/settings/search.jpg" alt="Search"></picture><br><b>Search</b><br>Start typing on the desktop, or press Ctrl+F, to find any icon, whether loose, in a box or on another page.</td>
+<td width="50%"><a id="search"></a><picture><source media="(prefers-color-scheme: light)" srcset="res/settings/search_l.jpg"><img src="res/settings/search.jpg" alt="Search"></picture><br><b>Search</b><br>Start typing on the desktop, or press Ctrl+F, to find any icon, whether loose, in a box or on another page. The results open in a list with type filters; hide everything else, or make a box of what you found.</td>
 </tr>
 <tr>
 <td width="50%"><a id="blend-into-wallpaper"></a><picture><source media="(prefers-color-scheme: light)" srcset="res/settings/blend_l.jpg"><img src="res/settings/blend.jpg" alt="Blend into wallpaper"></picture><br><b>Blend into wallpaper</b><br>Icons take on the wallpaper's colors until you point at them, or get a tint of your choice.</td>
@@ -69,7 +69,7 @@ Deskboxes only changes how your icons are shown. Your files stay where they are,
 - **Desktop pages.** More desktops side by side; new files go to the page you're on or the first page.
 - **Several monitors.** Boxes and pages on every screen; drag between them. An unplugged screen's boxes wait on the main screen and go back when it returns.
 - **Boxes above windows.** A shortcut or a hot corner brings the boxes over your apps; drag from them into an app.
-- **Search.** Type anywhere on the desktop to find an icon.
+- **Search.** Type anywhere on the desktop to find an icon, filter the results by type, hide the rest or make a box of them.
 - **Hide all.** Double-click an empty spot to show only the wallpaper.
 - **Icon looks.** Tint icons, or let them blend into the wallpaper until you point at them.
 - **Saved layouts.** Save how your boxes are arranged and go back to it, or to any of the last seven days.
