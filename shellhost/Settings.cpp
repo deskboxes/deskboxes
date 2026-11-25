@@ -1171,11 +1171,7 @@ namespace dbx
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
             x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
                  L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>";
-            // The scroller as it comes: its wheel, touchpad and keyboard scrolling run on the
-            // compositor, apart from the UI thread, and notches that follow flow on. (0.1.6 had a
-            // wheel of its own, a glide started from the UI thread per notch: late, later still on
-            // a slow PC, and each notch began its glide anew.)
-            x += L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\">";
+            x += L"<ScrollViewer x:Name=\"Scroll\" Grid.Row=\"1\" VerticalScrollBarVisibility=\"Auto\" ZoomMode=\"Disabled\">";
             // In a Grid: straight in the ScrollViewer, a page narrower than MaxWidth was placed by
             // its own width and then stretched, so it sat off to the right in a wide window.
             // (PageMove inside a plain Grid: the scroller moves its content's composition visual, and
@@ -1187,7 +1183,7 @@ namespace dbx
                 x += L"<StackPanel.OpacityTransition><ScalarTransition Duration=\"0:0:0.083\"/></StackPanel.OpacityTransition>";
             if (cur->hero) x += Hero(cur);
             x += cur->build();
-            return x + L"</StackPanel></Grid></Grid></ScrollView></Grid>";
+            return x + L"</StackPanel></Grid></Grid></ScrollViewer></Grid>";
         }
 
         std::wstring BuildXaml()
@@ -1710,7 +1706,7 @@ namespace dbx
                         if (!st) return;
                         if (status != winrt::Windows::Foundation::AsyncStatus::Completed) { done(); return; }
                         auto bmp = op.GetResults();
-                        bool queued = st->queue.TryEnqueue([ws, play, bmp, done]
+                        bool queued = st->queue.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [ws, play, bmp, done]
                             {
                                 auto st = ws.lock();
                                 if (!st) return;
@@ -1859,14 +1855,13 @@ namespace dbx
                 if (st->timer) st->timer.Stop();
                 if (st->mp) st->mp.Pause();
             };
-            // Shown: a page's own clip plays; a tile's is loaded, so a pointer on it starts it at once.
-            el.Loaded([weak, clip, st, autoplay](auto&&, auto&&)
-                {
-                    auto e = weak.get();
-                    if (!e) return;
-                    if (autoplay) StartClip(e, clip, st);
-                    else if (winrt::Windows::UI::ViewManagement::UISettings().AnimationsEnabled()) LoadClip(e, clip, st);
-                });
+            // Home can show many tiles. Open each video on first hover so opening Settings
+            // and scrolling its first screen don't have to wait for all the media players.
+            if (autoplay)
+                el.Loaded([weak, clip, st](auto&&, auto&&)
+                    {
+                        if (auto e = weak.get()) StartClip(e, clip, st);
+                    });
             // The page went (another one was picked, or the window closed): let the file go.
             el.Unloaded([st, stop](auto&&, auto&&)
                 {
@@ -2344,7 +2339,7 @@ namespace dbx
             auto root = g.window.Content().try_as<mux::FrameworkElement>();
             auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
             auto shown = nav ? nav.Content().try_as<mux::FrameworkElement>() : mux::FrameworkElement{ nullptr };
-            auto sv = shown ? Find<muxc::ScrollView>(shown, L"Scroll") : muxc::ScrollView{ nullptr };
+            auto sv = shown ? Find<muxc::ScrollViewer>(shown, L"Scroll") : muxc::ScrollViewer{ nullptr };
             if (!sv) return false;
             mux::FrameworkElement fresh{ nullptr };
             try { fresh = mux::Markup::XamlReader::Load(x).as<mux::FrameworkElement>(); }
@@ -2356,8 +2351,8 @@ namespace dbx
             {
                 // New cards in the same scroller (it keeps its position; the content is moved
                 // out of the page it was made in, after its controls were wired there).
-                auto fsv = Find<muxc::ScrollView>(fresh, L"Scroll");
-                auto content = fsv ? fsv.Content() : mux::UIElement{ nullptr };
+                auto fsv = Find<muxc::ScrollViewer>(fresh, L"Scroll");
+                auto content = fsv ? fsv.Content() : nullptr;
                 if (!content) { g.wiring = false; return false; }
                 g.moved = false;  // (its names are its own: no walk for the ones a page lacks)
                 Wire(fresh);
@@ -2380,7 +2375,7 @@ namespace dbx
                 if (auto old = g.window.Content().try_as<mux::FrameworkElement>())
                     if (auto nav = Find<muxc::NavigationView>(old, L"Nav"))
                         if (auto shown = nav.Content().try_as<mux::FrameworkElement>())
-                            if (auto sv = Find<muxc::ScrollView>(shown, L"Scroll")) scroll = sv.VerticalOffset();
+                            if (auto sv = Find<muxc::ScrollViewer>(shown, L"Scroll")) scroll = sv.VerticalOffset();
             mux::FrameworkElement root{ nullptr };
             try { root = mux::Markup::XamlReader::Load(BuildXaml()).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: XAML failed: %s", e.message().c_str()); return; }
@@ -2405,8 +2400,8 @@ namespace dbx
                 auto root = weakRoot.get();
                 if (!root) return;
                 // Where it was, before it is first drawn (not a frame at the top first).
-                if (auto sv = scroll > 0 && !weakFocus.get() ? Find<muxc::ScrollView>(root, L"Scroll") : muxc::ScrollView{ nullptr })
-                    sv.ScrollTo(0, scroll, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Disabled, muxc::ScrollingSnapPointsMode::Ignore));
+                if (auto sv = scroll > 0 && !weakFocus.get() ? Find<muxc::ScrollViewer>(root, L"Scroll") : muxc::ScrollViewer{ nullptr })
+                    sv.ChangeView(nullptr, scroll, nullptr, true);
                 root.DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weakFocus]
                 {
                     if (auto focus = weakFocus.get()) focus.StartBringIntoView();
