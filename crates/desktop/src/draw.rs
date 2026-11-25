@@ -73,74 +73,233 @@ impl App {
             self.tab_anim = None;
         }
         let cells = self.cells_in_view();
+        self.upload_in_view(&cells);
+        self.pictures_first(&cells);
         for (k, cell, in_box) in &cells {
             self.prep_label(k, *cell, *in_box);
         }
+        self.make_shadows();
         self.request_sized_icons(&cells);
-        if self.prep_gen != self.items_gen {
+        if self.prep_gen != self.items_gen || !self.uploads.is_empty() {
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 60, None);
             }
         }
     }
 
+    /// Snapshot icons of these cells still waiting to be uploaded (`uploads`): uploaded now.
+    fn upload_in_view(&mut self, cells: &[(ItemKey, Rect, Option<u32>)]) {
+        if self.uploads.is_empty() {
+            return;
+        }
+        let ids: Vec<u32> = cells.iter().filter_map(|(k, ..)| self.items.get(k)).map(|i| i.icon).filter(|id| self.uploads.contains(id)).collect();
+        for id in ids {
+            self.upload_icon(id);
+        }
+    }
+
+    /// While pictures are being made after a scan: the ones in view on the screen in use first
+    /// (asked again when what is in view changes).
+    fn pictures_first(&mut self, cells: &[(ItemKey, Rect, Option<u32>)]) {
+        if !self.pictures_pending || self.paint_inactive {
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (k, ..) in cells {
+            k.hash(&mut h);
+        }
+        let sig = h.finish();
+        if sig == self.pictures_asked {
+            return;
+        }
+        self.pictures_asked = sig;
+        let paths: Vec<String> = cells.iter().filter_map(|(k, ..)| self.items.get(k)).map(|i| i.parsing_name.clone()).take(2000).collect();
+        let _ = self.worker.send(crate::worker::Req::PicturesFirst(paths));
+    }
+
+    /// One waiting snapshot icon onto the GPU.
+    fn upload_icon(&mut self, id: u32) {
+        if !self.uploads.remove(&id) {
+            return;
+        }
+        if let Some(img) = self.icon_imgs.get(&id) {
+            match self.gpu.bitmap(img) {
+                Ok(b) => {
+                    self.bitmaps.insert(id, b);
+                }
+                Err(e) => log::warn!("icon upload: {e}"),
+            }
+        }
+    }
+
     /// A label's layout and its shadow bitmap, made once.
     fn prep_label(&mut self, k: &ItemKey, cell: Rect, in_box: Option<u32>) {
+        self.prep_label_with(k, cell, in_box, true);
+    }
+
+    /// `prep_label`; `shadows` false: the layouts only (offscreen labels past the picture budget).
+    fn prep_label_with(&mut self, k: &ItemKey, cell: Rect, in_box: Option<u32>, shadows: bool) {
+        let t_layout = Instant::now();
         let m = self.metrics_of(in_box);
         let (w, full, row) = self.label_spec(k, cell, &m);
         let _ = self.label_for(k, w, full, row);
         if !row {
             let _ = self.label_layout(k, w, false);
         }
+        PREP_MS.with(|c| {
+            let (a, b) = c.get();
+            c.set((a + t_layout.elapsed().as_secs_f64() * 1000.0, b));
+        });
         let light_box = in_box.and_then(|id| self.box_by_id(id)).map(|b| self.box_is_light(b)).unwrap_or(false);
-        if light_box {
+        if light_box || !shadows {
             return;
         }
+        // The shadow pictures are made together (`make_shadows`, before the frame is drawn).
         for f in [full, false] {
             let key = App::lkey(k, w, f, row);
-            if !self.label_bmps.contains_key(&key) {
+            if !self.label_bmps.contains_key(&key) && !self.shadow_queued.contains(&key) {
                 if let Some(l) = self.labels.get(&key) {
                     let h = r::text_height(l);
-                    match self.gpu.shadowed_label(l, w, h, self.scale, Self::desktop_theme().text) {
-                        Ok(b) => {
-                            self.label_bmps.insert(key, b);
-                        }
-                        Err(e) => log::warn!("label bitmap: {e}"),
-                    }
+                    self.shadow_queue.push((key.clone(), l.clone(), w, h));
+                    self.shadow_queued.insert(key);
                 }
             }
         }
     }
 
+    /// The shadow pictures of the labels queued by `prep_label_with`, made in one go.
+    pub(crate) fn make_shadows(&mut self) {
+        if self.shadow_queue.is_empty() {
+            return;
+        }
+        let t = Instant::now();
+        let q = std::mem::take(&mut self.shadow_queue);
+        self.shadow_queued.clear();
+        let items: Vec<(r::TextLayout, f32, f32)> = q.iter().map(|(_, l, w, h)| (l.clone(), *w, *h)).collect();
+        match self.gpu.shadowed_labels(&items, self.scale) {
+            Ok(v) => {
+                for ((key, ..), s) in q.into_iter().zip(v) {
+                    self.label_bmps.insert(key, s);
+                }
+            }
+            // (Drawn with a live shadow meanwhile: `draw_text_shadowed`.)
+            Err(e) => log::warn!("label shadows: {e}"),
+        }
+        PREP_MS.with(|c| {
+            let (a, b) = c.get();
+            c.set((a, b + t.elapsed().as_secs_f64() * 1000.0));
+        });
+    }
+
     /// While idle: labels of icons out of view (scrolled away in a box), a few ms at a time, so
     /// scrolling later finds them ready.
+    ///
+    /// The labels still missing are listed once per change of the icons (rows nearest the view
+    /// first) and worked through from where the last slice stopped; the time is checked on every
+    /// entry, also one found made meanwhile. Shadow pictures stop at a budget: past it, offscreen
+    /// labels get their layout only (the picture is made when they come into view).
     pub fn prep_more(&mut self) {
+        /// Shadow pictures kept for labels not yet seen, at most (a 10,000-icon box).
+        const SHADOW_BUDGET: usize = 3000;
         let t = Instant::now();
+        // Snapshot icons not in view yet first (search results, other pages, a scroll show them).
+        let uploading = !self.uploads.is_empty();
+        while let Some(&id) = self.uploads.first() {
+            if t.elapsed().as_secs_f32() > 0.004 {
+                // (Drawn again with them: the search's results, a folder box's view.)
+                self.invalidate();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 30, None);
+                }
+                return;
+            }
+            self.upload_icon(id);
+        }
+        if uploading {
+            self.invalidate();
+        }
         let gen = self.items_gen;
+        if self.prep_queue_gen != gen {
+            self.prep_queue = self.prep_list();
+            self.prep_queue_gen = gen;
+            self.prep_pos = 0;
+        }
+        while self.prep_pos < self.prep_queue.len() {
+            // Shadows in batches (a batch costs a little more than one, far less than its
+            // labels one by one).
+            if self.shadow_queue.len() >= 48 {
+                self.make_shadows();
+            }
+            if t.elapsed().as_secs_f32() > 0.004 {
+                self.make_shadows();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 30, None);
+                }
+                return;
+            }
+            let (k, cell, in_box) = self.prep_queue[self.prep_pos].clone();
+            self.prep_pos += 1;
+            let m = self.metrics_of(in_box);
+            let (w, _, row) = self.label_spec(&k, cell, &m);
+            if self.labels.contains_key(&App::lkey(&k, w, false, row)) || !self.items.contains_key(&k) {
+                continue;
+            }
+            let shadows = self.label_bmps.len() < SHADOW_BUDGET;
+            self.prep_label_with(&k, cell, in_box, shadows);
+        }
+        self.make_shadows();
+        self.prep_queue = vec![];
+        self.prep_gen = gen;
+    }
+
+    /// The labels `prep_more` is to make: every icon shown or scrolled away in an open box whose
+    /// label is not made yet, the rows nearest each box's view first.
+    fn prep_list(&self) -> Vec<(ItemKey, Rect, Option<u32>)> {
+        let mut v: Vec<(f32, (ItemKey, Rect, Option<u32>))> = vec![];
         for (k, cell, in_box) in self.visible_cells() {
             let m = self.metrics_of(in_box);
             let (w, _, row) = self.label_spec(&k, cell, &m);
             if self.labels.contains_key(&App::lkey(&k, w, false, row)) {
                 continue;
             }
-            self.prep_label(&k, cell, in_box);
-            if t.elapsed().as_secs_f32() > 0.004 {
-                unsafe {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(self.msg_hwnd), crate::app::T_PREP, 30, None);
-                }
-                return;
-            }
+            let away = in_box
+                .and_then(|id| self.box_by_id(id))
+                .map(|b| {
+                    let c = Self::content_rect(b);
+                    (c.y - cell.bottom()).max(cell.y - c.bottom()).max(0.0)
+                })
+                .unwrap_or(0.0);
+            v.push((away, (k, cell, in_box)));
         }
-        self.prep_gen = gen;
+        // (A stable sort: equals keep their reading order.)
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v.into_iter().map(|(_, e)| e).collect()
     }
 
     /// A frame: every screen's (each other screen first, the one in use last).
     pub fn draw(&mut self) {
-        let others = self.draw_other_screens();
+        let t = Instant::now();
+        // The other screens only when something that shows there changed, or while they animate
+        // (a frame for hover or a drag on this screen does not draw them all again).
+        let others = if self.others_dirty || self.others_anim {
+            self.others_dirty = false;
+            let a = self.draw_other_screens();
+            self.others_anim = a;
+            a
+        } else {
+            false
+        };
         let mine = self.draw_screen_only();
         crate::anim::set(mine || others);
         self.note_long_animation(mine || others, mine);
         crate::uia::update(self);
+        if self.frame_times.len() < 100_000 {
+            self.frame_times.push(t.elapsed().as_secs_f32() * 1000.0);
+            if let Some((at, _)) = self.input_at.take() {
+                self.input_times.push(at.elapsed().as_secs_f32() * 1000.0);
+            }
+        }
     }
 
     /// Frames at the refresh rate for half a minute on end are a stuck animation (a screen's held
@@ -167,14 +326,17 @@ impl App {
         self.step_roll_anim();
         self.vanish_animating();
         self.prepare();
+        let t_prep = t.elapsed().as_secs_f64() * 1000.0;
         self.pages_before_frame();
         self.prepare_beside();
+        let t_beside = t.elapsed().as_secs_f64() * 1000.0;
         let Some(surf) = self.surf.take() else {
             self.frame_ok = false;
             return false;
         };
         *self.paint_memo.borrow_mut() = Some(std::collections::HashMap::new());
         let res = surf.draw(self.scale, |dc| self.paint_frame(dc));
+        let t_paint = t.elapsed().as_secs_f64() * 1000.0;
         *self.paint_memo.borrow_mut() = None;
         self.surf = Some(surf);
         self.frame_ok = match res.and_then(|_| self.gpu.commit()) {
@@ -185,6 +347,17 @@ impl App {
             }
         };
         self.stats.draw_ms_last = t.elapsed().as_secs_f64() * 1000.0;
+        if self.draw_times.is_empty() {
+            let (lay, sh) = PREP_MS.with(|c| c.get());
+            log::info!(
+                "PHASE first_frame prepare={t_prep:.0} (label layouts {lay:.0}, shadows {sh:.0}) beside={:.0} paint={:.0} commit={:.0} ms; {} icon(s) on the GPU, {} label(s)",
+                t_beside - t_prep,
+                t_paint - t_beside,
+                self.stats.draw_ms_last - t_paint,
+                self.bitmaps.len(),
+                self.labels.len()
+            );
+        }
         if self.draw_times.len() < 100_000 {
             self.draw_times.push(self.stats.draw_ms_last as f32);
         }
@@ -222,9 +395,11 @@ impl App {
             return;
         }
         let cells = self.cells_in_view();
+        self.upload_in_view(&cells);
         for (k, cell, in_box) in &cells {
             self.prep_label(k, *cell, *in_box);
         }
+        self.make_shadows();
         self.request_sized_icons(&cells);
         pages::switch_to(&mut self.layout, back);
     }
@@ -254,9 +429,7 @@ impl App {
             let (lw, _, row) = self.label_spec(k, *cell, &m);
             let lk = App::lkey(k, lw, false, row);
             if let (Some(b), Some(l)) = (self.label_bmps.get(&lk), self.labels.get(&lk)) {
-                let sz = unsafe { b.GetPixelSize() };
-                let m = r::LABEL_MARGIN;
-                r::draw_bitmap(dc, b, r::rect(label.x + dx - m, label.y + dy - m, sz.width as f32 / self.scale, sz.height as f32 / self.scale), alpha);
+                r::draw_shadow(dc, b, label.x + dx, label.y + dy, self.scale, alpha);
                 r::draw_text(dc, l, label.x + dx, label.y + dy, ghost_text)?;
             } else if let Some(l) = self.labels.get(&lk) {
                 r::draw_text(dc, l, label.x + dx, label.y + dy, ghost_text)?;
@@ -799,10 +972,8 @@ impl App {
         match (shadow, self.label_bmps.get(&lk), self.labels.get(&lk)) {
             (true, Some(b), Some(l)) => {
                 // The shadow (cached), then the text with ClearType, as Explorer draws it.
-                let sz = unsafe { b.GetPixelSize() };
-                let m = r::LABEL_MARGIN;
                 if shadow_a > 0.01 {
-                    r::draw_bitmap(dc, b, r::rect(label.x - m, label.y - m, sz.width as f32 / self.scale, sz.height as f32 / self.scale), opacity * shadow_a);
+                    r::draw_shadow(dc, b, label.x, label.y, self.scale, opacity * shadow_a);
                 }
                 r::draw_text_cleartype(dc, l, label.x, label.y, Color { a: text_c.a * opacity, ..text_c })?;
             }
@@ -902,9 +1073,7 @@ impl App {
             }
             if let Some((l, sh)) = &v.label {
                 if let (true, Some(b)) = (shadow, sh) {
-                    let sz = unsafe { b.GetPixelSize() };
-                    let m = r::LABEL_MARGIN;
-                    r::draw_bitmap(dc, b, r::rect(v.label_at.x - m, v.label_at.y - m, sz.width as f32 / self.scale, sz.height as f32 / self.scale), a * a);
+                    r::draw_shadow(dc, b, v.label_at.x, v.label_at.y, self.scale, a * a);
                 }
                 r::draw_text(dc, l, v.label_at.x, v.label_at.y, Color { a: th.text.a * a * a, ..th.text })?;
             }
@@ -1389,4 +1558,9 @@ fn fit_icon(b: &r::Bitmap, icon: Rect) -> Rect {
     let k = (icon.w / sz.width as f32).min(icon.h / sz.height as f32);
     let (w, h) = (sz.width as f32 * k, sz.height as f32 * k);
     Rect::new(icon.x + (icon.w - w) / 2.0, icon.bottom() - h, w, h)
+}
+
+thread_local! {
+    /// Time spent making labels: (layouts, shadow pictures), ms (the first frame's report).
+    static PREP_MS: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
 }

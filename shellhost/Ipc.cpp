@@ -27,8 +27,11 @@ namespace dbx
         winrt::Microsoft::UI::Dispatching::DispatcherQueue g_ui{ nullptr };
         std::shared_ptr<BuiltMenu> g_prefetched;   // last prefetch result
         std::wstring g_prefetchKey;
+        double g_settingsOpenId = 0;
         bool g_menuOpen = false;
         JsonObject g_nextShow{ nullptr };   // a "show" that came while a menu was open
+        std::atomic<uint64_t> g_prefetchSeq{ 0 };   // prefetches read from the pipe so far
+        std::atomic<int> g_showsWaiting{ 0 };       // shows read, not handled yet
         void Prewarm();
         // The first menu is built ahead once the core has its "ready" (0) and the package scan
         // is done (1), a moment later (what the core asks for first, as Settings, goes first).
@@ -196,6 +199,8 @@ namespace dbx
                     return;
                 }
                 double t0 = NowMs();
+                // The UI thread is on it (see "got").
+                Send(Msg(L"building", id));
                 MenuRequest r = Request(o);
                 std::shared_ptr<BuiltMenu> m;
                 // A prefetched model is reused when it was built for the same items and extras (the
@@ -266,7 +271,9 @@ namespace dbx
             }
             else if (t == L"settings")
             {
-                ShowSettings(o, Bool(o, L"open"), [](JsonObject m)
+                bool open = Bool(o, L"open");
+                if (open) g_settingsOpenId = id;
+                ShowSettings(o, open, [](JsonObject m)
                 {
                     m.SetNamedValue(L"t", JsonValue::CreateStringValue(L"setting"));
                     m.SetNamedValue(L"id", JsonValue::CreateNumberValue(0));
@@ -394,9 +401,38 @@ namespace dbx
                     if (len == 0 || len > (16u << 20)) { Log(L"pipe: bad frame length %u", len); break; }
                     std::string body(len, '\0');
                     if (!ReadExact(body.data(), len)) break;
+                    // A prefetch is built on the UI thread: one that a newer prefetch or a "show"
+                    // came after while it waited is of no use (a show drops it anyway), and is
+                    // not built, so the menu asked for is not kept waiting behind it.
+                    // (The core writes compact JSON: `"t":"…"` is the type; inside a string a
+                    // quote is escaped, so it cannot match there.)
+                    bool isPrefetch = body.find("\"t\":\"prefetch\"") != std::string::npos;
+                    bool isShow = !isPrefetch && body.find("\"t\":\"show\"") != std::string::npos;
+                    uint64_t seq = isPrefetch ? ++g_prefetchSeq : 0;
+                    if (isShow) ++g_showsWaiting;
                     std::wstring text = Utf8ToWide(body);
-                    g_ui.TryEnqueue([text]
+                    double at = NowMs();
+                    // A show is acknowledged at once, from here: the core knows this host is
+                    // alive and reading, and gives a slow PC the time to build the menu (it
+                    // took one that was only slow for a stuck one before).
+                    if (isShow)
                     {
+                        try { Send(Msg(L"got", JsonObject::Parse(text).GetNamedNumber(L"id", 0))); }
+                        catch (winrt::hresult_error const&) {}
+                    }
+                    g_ui.TryEnqueue([text, isPrefetch, isShow, seq, at]
+                    {
+                        if (isShow) --g_showsWaiting;
+                        // Time waited behind other work on the UI thread (a menu being built,
+                        // Settings): logged when noticeable, apart from the build's own phases.
+                        double waited = NowMs() - at;
+                        if ((isShow || isPrefetch) && waited >= 16)
+                            Log(L"%s waited %.1f ms in the UI queue", isShow ? L"show" : L"prefetch", waited);
+                        if (isPrefetch && (seq != g_prefetchSeq.load() || g_showsWaiting.load() > 0))
+                        {
+                            Log(L"prefetch %llu skipped: %s came after it", seq, seq != g_prefetchSeq.load() ? L"a newer one" : L"a show");
+                            return;
+                        }
                         try { Handle(JsonObject::Parse(text)); }
                         catch (winrt::hresult_error const& e) { Log(L"pipe: bad message (%s): %.200s", e.message().c_str(), text.c_str()); }
                     });
@@ -419,6 +455,11 @@ namespace dbx
             CloseHandle(tok);
             return s;
         }
+    }
+
+    void SettingsClosed()
+    {
+        Send(Msg(L"settingsClosed", g_settingsOpenId));
     }
 
     bool StartPipeServer(const std::wstring& pipeName)

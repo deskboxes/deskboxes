@@ -46,6 +46,11 @@ pub fn reconcile(l: &mut MonitorLayout, present: &[ItemKey], g: &Grid) -> bool {
     let mut changed = false;
     // The other desktop pages: removed items go from there too; their items are placed.
     for c in l.parked.values_mut() {
+        // (Untouched unless an item there is gone: an undo step may share the page.)
+        if !c.holds_other_than(&set) {
+            continue;
+        }
+        let c = std::sync::Arc::make_mut(c);
         let n = c.loose.len();
         c.loose.retain(|k, _| set.contains(k));
         c.homes.retain(|k, _| set.contains(k));
@@ -125,7 +130,7 @@ pub fn reconcile(l: &mut MonitorLayout, present: &[ItemKey], g: &Grid) -> bool {
 
 /// Take items out of wherever they are (they are being placed somewhere on purpose: a cell they
 /// were pushed out of no longer counts as theirs).
-fn remove_everywhere(l: &mut MonitorLayout, keys: &[ItemKey]) {
+pub(crate) fn remove_everywhere(l: &mut MonitorLayout, keys: &[ItemKey]) {
     let set: HashSet<&ItemKey> = keys.iter().collect();
     l.loose.retain(|k, _| !set.contains(k));
     l.homes.retain(|k, _| !set.contains(k));
@@ -136,6 +141,10 @@ fn remove_everywhere(l: &mut MonitorLayout, keys: &[ItemKey]) {
     }
     // (And from the other desktop pages.)
     for c in l.parked.values_mut() {
+        if !c.holds_any(&set) {
+            continue;
+        }
+        let c = std::sync::Arc::make_mut(c);
         c.loose.retain(|k, _| !set.contains(k));
         c.homes.retain(|k, _| !set.contains(k));
         for b in &mut c.boxes {
@@ -206,27 +215,39 @@ pub fn nearest_free(l: &MonitorLayout, g: &Grid, want: Cell, taken: &HashSet<Cel
     let max_ring = g.cols.max(g.rows);
     for ring in 0..=max_ring {
         let mut best: Option<(f32, Cell)> = None;
-        for col in (want.col - ring)..=(want.col + ring) {
-            for row in (want.row - ring)..=(want.row + ring) {
-                if (col - want.col).abs() != ring && (row - want.row).abs() != ring {
-                    continue; // inside the ring: already searched
+        let mut look = |col: i32, row: i32| {
+            let c = Cell { col, row };
+            if taken.contains(&c) || blocked_by_boxes(l, g, c) {
+                return;
+            }
+            let (dx, dy) = ((col - want.col) as f32 * g.cell_w, (row - want.row) as f32 * g.cell_h);
+            let d = dx * dx + dy * dy;
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, c));
+            }
+        };
+        // Only the ring's own cells inside the grid, column by column, top to bottom (the order
+        // ties were always settled in).
+        let (r0, r1) = ((want.row - ring).max(0), (want.row + ring).min(g.rows - 1));
+        for col in (want.col - ring).max(0)..=(want.col + ring).min(g.cols - 1) {
+            if (col - want.col).abs() == ring {
+                for row in r0..=r1 {
+                    look(col, row);
                 }
-                if col < 0 || row < 0 || col >= g.cols || row >= g.rows {
-                    continue;
-                }
-                let c = Cell { col, row };
-                if taken.contains(&c) || blocked_by_boxes(l, g, c) {
-                    continue;
-                }
-                let (dx, dy) = ((col - want.col) as f32 * g.cell_w, (row - want.row) as f32 * g.cell_h);
-                let d = dx * dx + dy * dy;
-                if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                    best = Some((d, c));
+            } else {
+                for row in [want.row - ring, want.row + ring] {
+                    if row >= 0 && row < g.rows {
+                        look(col, row);
+                    }
                 }
             }
         }
         if let Some((_, c)) = best {
             return Some(c);
+        }
+        // The ring already reaches past every edge: nothing further out.
+        if want.col - ring <= 0 && want.row - ring <= 0 && want.col + ring >= g.cols - 1 && want.row + ring >= g.rows - 1 {
+            return None;
         }
     }
     None
@@ -852,6 +873,10 @@ impl History {
     pub fn record(&mut self, before: &MonitorLayout) {
         self.push(Entry::Layout(before.clone()));
     }
+    /// `record` for a layout the caller has no more use for (no second copy).
+    pub fn record_owned(&mut self, before: MonitorLayout) {
+        self.push(Entry::Layout(before));
+    }
     pub fn record_files(&mut self, step: FileStep) {
         self.push(Entry::Files(step));
     }
@@ -958,7 +983,7 @@ impl History {
 mod tests {
     use super::*;
     fn keys(n: usize) -> Vec<ItemKey> {
-        (0..n).map(|i| ItemKey(format!("p:{i}"))).collect()
+        (0..n).map(|i| ItemKey(format!("p:{i}").into())).collect()
     }
     fn grid() -> Grid {
         Grid::new(Rect::new(0.0, 0.0, 750.0, 500.0), 75.0, 100.0) // 10 x 5
@@ -1262,6 +1287,33 @@ mod tests {
     }
 
     #[test]
+    fn undo_steps_share_the_pages_they_did_not_change() {
+        let g = grid();
+        let mut l = MonitorLayout::default();
+        let k = keys(3);
+        reconcile(&mut l, &k, &g);
+        let p2 = crate::pages::new_page(&mut l, "", None);
+        crate::pages::move_items_to_page(&mut l, &k[1..], p2, &g);
+        let mut h = History::default();
+        h.record(&l);
+        // A change on the page shown; the reconcile that follows a scan finds nothing gone there.
+        create_box(&mut l, Rect::new(0.0, 0.0, 100.0, 100.0), "x", BoxStyle::default());
+        assert!(!reconcile(&mut l, &k, &g));
+        let Some(Entry::Layout(before)) = h.undo.last() else { panic!() };
+        assert!(std::sync::Arc::ptr_eq(&before.parked[&p2], &l.parked[&p2]));
+        assert!(std::sync::Arc::ptr_eq(&before.loose.keys().next().unwrap().0, &l.loose.keys().next().unwrap().0));
+        // An item there gone: that page is copied, the undo step keeps it as it was.
+        reconcile(&mut l, &k[..2], &g);
+        let Some(Entry::Layout(before)) = h.undo.last() else { panic!() };
+        assert!(!std::sync::Arc::ptr_eq(&before.parked[&p2], &l.parked[&p2]));
+        assert_eq!(before.parked[&p2].loose.len(), 2);
+        assert_eq!(l.parked[&p2].loose.len(), 1);
+        assert!(h.undo(&mut l).is_some());
+        assert_eq!(l.parked[&p2].loose.len(), 2);
+        assert!(l.boxes.is_empty());
+    }
+
+    #[test]
     fn off_grid_icons_on_other_pages_come_back() {
         let g = grid(); // 10 x 5
         let mut l = MonitorLayout::default();
@@ -1353,5 +1405,65 @@ mod tests {
         h.files_done(true, Some(recycled(&[("C:\\d\\a.txt", "")])));
         assert!(!h.can_redo());
         assert_eq!(h.next_undo(), Some(None));
+    }
+
+    /// The ring walk finds what walking every cell of each square found.
+    #[test]
+    fn nearest_free_matches_the_full_square_walk() {
+        fn reference(l: &MonitorLayout, g: &Grid, want: Cell, taken: &HashSet<Cell>) -> Option<Cell> {
+            let want = Cell { col: want.col.clamp(0, g.cols - 1), row: want.row.clamp(0, g.rows - 1) };
+            for ring in 0..=g.cols.max(g.rows) {
+                let mut best: Option<(f32, Cell)> = None;
+                for col in (want.col - ring)..=(want.col + ring) {
+                    for row in (want.row - ring)..=(want.row + ring) {
+                        if (col - want.col).abs() != ring && (row - want.row).abs() != ring {
+                            continue;
+                        }
+                        if col < 0 || row < 0 || col >= g.cols || row >= g.rows {
+                            continue;
+                        }
+                        let c = Cell { col, row };
+                        if taken.contains(&c) || blocked_by_boxes(l, g, c) {
+                            continue;
+                        }
+                        let (dx, dy) = ((col - want.col) as f32 * g.cell_w, (row - want.row) as f32 * g.cell_h);
+                        let d = dx * dx + dy * dy;
+                        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                            best = Some((d, c));
+                        }
+                    }
+                }
+                if let Some((_, c)) = best {
+                    return Some(c);
+                }
+            }
+            None
+        }
+        let mut seed = 12345u64;
+        let mut rnd = |n: i32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % n as u64) as i32
+        };
+        for (w, h) in [(10.0, 5.0), (3.0, 12.0), (7.0, 7.0), (1.0, 1.0)] {
+            let g = Grid::new(Rect::new(0.0, 0.0, 75.0 * w, 100.0 * h), 75.0, 100.0);
+            let mut l = MonitorLayout::default();
+            if w > 3.0 {
+                create_box(&mut l, Rect::new(150.0, 100.0, 150.0, 200.0), "B", BoxStyle::default());
+            }
+            for fill in [0, 30, 70, 95, 100] {
+                let mut taken = HashSet::new();
+                for col in 0..g.cols {
+                    for row in 0..g.rows {
+                        if rnd(100) < fill {
+                            taken.insert(Cell { col, row });
+                        }
+                    }
+                }
+                for _ in 0..40 {
+                    let want = Cell { col: rnd(g.cols + 4) - 2, row: rnd(g.rows + 4) - 2 };
+                    assert_eq!(nearest_free(&l, &g, want, &taken), reference(&l, &g, want, &taken), "{w}x{h} {fill}% {want:?}");
+                }
+            }
+        }
     }
 }

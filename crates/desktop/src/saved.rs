@@ -77,8 +77,8 @@ impl App {
             .flatten()
             .filter_map(|e| {
                 let id: u64 = e.path().file_stem()?.to_str()?.parse().ok()?;
-                let l = persist::load_layout(&self.saved_dir(), &id.to_string())?;
-                Some(SavedLayout { id, when: shown(id), boxes: l.boxes.len() })
+                let boxes = self.box_count(&self.saved_dir(), &id.to_string())?;
+                Some(SavedLayout { id, when: shown(id), boxes })
             })
             .collect();
         v.sort_by(|a, b| b.id.cmp(&a.id));
@@ -94,12 +94,30 @@ impl App {
             .filter_map(|e| {
                 let day = e.file_name().to_str()?.to_string();
                 let id: u64 = day.replace('-', "").parse().ok()?;
-                let l = self.backup_of(&e.path())?;
-                Some(SavedLayout { id, when: shown(id), boxes: l.boxes.len() })
+                let p = e.path();
+                let boxes = self.box_count(&p, &self.topology).or_else(|| self.box_count(&p, &self.legacy_topology))?;
+                Some(SavedLayout { id, when: shown(id), boxes })
             })
             .collect();
         v.sort_by(|a, b| b.id.cmp(&a.id));
         v
+    }
+
+    /// How many boxes the layout file `name` in `dir` has (None: none there, or unreadable).
+    /// Read once per version of the file: Settings lists every saved layout and backup on each
+    /// refresh, and reading them all each time was the slow part of it.
+    fn box_count(&self, dir: &std::path::Path, name: &str) -> Option<usize> {
+        let file = persist::layout_path(dir, name);
+        let md = std::fs::metadata(&file).ok()?;
+        let stamp = (md.modified().ok(), md.len());
+        if let Some((s, n)) = self.saved_meta.borrow().get(&file) {
+            if *s == stamp {
+                return *n;
+            }
+        }
+        let n = persist::load_layout(dir, name).map(|l| l.boxes.len());
+        self.saved_meta.borrow_mut().insert(file, (stamp, n));
+        n
     }
 
     /// The layout in a day's backup folder (a backup from before 0.1.4 has it under the old name).

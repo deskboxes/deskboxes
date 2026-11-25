@@ -40,6 +40,7 @@ mod iconfx;
 mod logger;
 mod pages;
 mod saved;
+mod saver;
 mod screens;
 mod above;
 mod folderbox;
@@ -51,6 +52,7 @@ mod template;
 mod transfer;
 mod uia;
 mod views;
+mod wallcache;
 mod worker;
 
 use deskboxes_shell::hide;
@@ -67,6 +69,8 @@ pub struct Args {
     /// Fixture mode: a second folder standing in for the Public desktop (duplicate names).
     pub public_dir: Option<PathBuf>,
     pub window: bool,
+    /// Only the first monitor's screen (measurements that must not depend on the others).
+    pub one_screen: bool,
     pub no_hide: bool,
     pub profile: Option<PathBuf>,
     pub exit_after: Option<u32>,
@@ -103,6 +107,7 @@ fn parse_args() -> Args {
             "--desktop-dir" => a.desktop_dir = Some(next(&mut i).into()),
             "--public-dir" => a.public_dir = Some(next(&mut i).into()),
             "--window" => a.window = true,
+            "--one-screen" => a.one_screen = true,
             "--no-hide" => a.no_hide = true,
             "--profile" => a.profile = Some(next(&mut i).into()),
             "--exit-after" => a.exit_after = next(&mut i).parse().ok(),

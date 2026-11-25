@@ -5,6 +5,7 @@
 
 #include "pch.h"
 #include "Settings.h"
+#include "Ipc.h"
 #include "Log.h"
 #include <algorithm>
 #include <cmath>
@@ -34,6 +35,9 @@ namespace dbx
             std::wstring lastSig;            // the data last built, without the download progress
             std::wstring shownXaml;          // the shown page's markup (standalone), see Refresh
             std::wstring stringsSig;         // the strings it was built with (a new language: build anew)
+            std::map<std::wstring, std::wstring> strs;  // the strings, escaped for markup (see Str)
+            bool strsOk = false;             // `strs` is made from the strings in `data`
+            mux::FrameworkElement movedNames{ nullptr };
             bool moved = false;              // cards moved in from another XAML document (see Refresh)
             // A page switch waiting for the old page to fade out (kept here: a timer nothing
             // holds is released at once and never ticks).
@@ -79,10 +83,20 @@ namespace dbx
             return s;
         }
 
+        // A string of the core's table, escaped for markup. Read out of the JSON once per table (a
+        // page asks for a hundred; the search index for every page's).
         std::wstring Str(const wchar_t* key)
         {
-            auto s = g.data.GetNamedObject(L"strings", JsonObject());
-            return Esc(std::wstring(s.GetNamedString(key, key).c_str()));
+            if (!g.strsOk)
+            {
+                g.strs.clear();
+                for (auto const& kv : g.data.GetNamedObject(L"strings", JsonObject()))
+                    if (kv.Value().ValueType() == JsonValueType::String)
+                        g.strs.emplace(kv.Key().c_str(), Esc(std::wstring(kv.Value().GetString().c_str())));
+                g.strsOk = true;
+            }
+            auto it = g.strs.find(key);
+            return it != g.strs.end() ? it->second : Esc(key);
         }
 
         std::wstring Num(double v)
@@ -922,16 +936,25 @@ namespace dbx
 
         std::wstring ExeDir()
         {
-            wchar_t p[MAX_PATH]{};
-            GetModuleFileNameW(nullptr, p, MAX_PATH);
-            std::wstring s = p;
-            return s.substr(0, s.find_last_of(L'\\'));
+            static const std::wstring dir = []
+            {
+                wchar_t p[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, p, MAX_PATH);
+                std::wstring s = p;
+                return s.substr(0, s.find_last_of(L'\\'));
+            }();
+            return dir;
         }
 
         // The clip of a feature (settings/CLIP.mp4, CLIP_l.mp4 in the light theme), if there is one.
+        // (Looked for once each: a page's markup is made again on every refresh.)
         bool HasClip(const wchar_t* clip)
         {
-            return clip && GetFileAttributesW((ExeDir() + L"\\settings\\" + clip + L".mp4").c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (!clip) return false;
+            static std::map<std::wstring, bool> known;
+            auto [it, added] = known.try_emplace(clip, false);
+            if (added) it->second = GetFileAttributesW((ExeDir() + L"\\settings\\" + clip + L".mp4").c_str()) != INVALID_FILE_ATTRIBUTES;
+            return it->second;
         }
 
         // A feature's picture, filling a rounded frame: res/settings/NAME.jpg in the dark theme,
@@ -1001,10 +1024,94 @@ namespace dbx
             return g.data.GetNamedObject(t.scope, JsonObject()).GetNamedBoolean(t.key, def);
         }
 
+        // A count on Home (a number over its name); with `target`, a button to that page.
+        std::wstring Stat(const wchar_t* key, size_t n, const wchar_t* label, const wchar_t* target, int row, int col)
+        {
+            std::wstring pos = L" Grid.Row=\"" + std::to_wstring(row) + L"\" Grid.Column=\"" + std::to_wstring(col) + L"\"";
+            std::wstring body = L"<StackPanel VerticalAlignment=\"Center\"><TextBlock x:Name=\"StatN_" + std::wstring(key) + L"\" Text=\"" + std::to_wstring(n) +
+                                L"\" Style=\"{StaticResource SubtitleTextBlockStyle}\"/><TextBlock Text=\"" + Str(label) +
+                                L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" TextTrimming=\"CharacterEllipsis\"/></StackPanel>";
+            if (!target)
+                return L"<Border" + pos + L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"16,8\">" + body + L"</Border>";
+            return L"<Button x:Name=\"Stat_" + std::wstring(target) + L"\"" + pos + L" AutomationProperties.Name=\"" + Str(label) +
+                   L"\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Center\" Padding=\"16,8\""
+                   L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\">"
+                   L"<Grid><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>" + body +
+                   L"<FontIcon Grid.Column=\"1\" Glyph=\"&#xE76C;\" FontSize=\"12\" VerticalAlignment=\"Center\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\"/></Grid></Button>";
+        }
+
+        // "#RRGGBB" as its parts; false: not a color.
+        bool Rgb(const std::wstring& hex, int& r, int& gr, int& b)
+        {
+            if (hex.size() != 7 || hex[0] != L'#') return false;
+            unsigned v = 0;
+            if (swscanf_s(hex.c_str() + 1, L"%x", &v) != 1) return false;
+            r = (v >> 16) & 255; gr = (v >> 8) & 255; b = v & 255;
+            return true;
+        }
+
+        // Home's map of the desktop page: the wallpaper (set by WireHome) and the boxes where
+        // they are, in their colors, each a button to its group on the Boxes page. Drawn at the
+        // screen's own size (DIPs, as the boxes' rects are) and scaled down to the card.
+        std::wstring DeskMap()
+        {
+            auto desk = g.data.GetNamedObject(L"desk", JsonObject());
+            double W = desk.GetNamedNumber(L"w", 0), H = desk.GetNamedNumber(L"h", 0);
+            if (W < 100 || H < 100) return L"";
+            auto num = [](double v) { return std::to_wstring((long long)std::lround(v)); };
+            // What reads at the map's size (~420 wide): ~11 px text, hairline outlines.
+            double font = W / 40, line = std::max(1.0, W / 700), corner = W / 150;
+            std::wstring wall = desk.GetNamedString(L"color", L"#000000").c_str();
+            std::wstring x = L"<Border Background=\"" + Esc(wall) + L"\" CornerRadius=\"6\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\">"
+                             L"<Viewbox Stretch=\"Uniform\"><Grid Width=\"" + num(W) + L"\" Height=\"" + num(H) + L"\">"
+                             L"<Border x:Name=\"MapWall\" Tag=\"" + Esc(std::wstring(desk.GetNamedString(L"wallpaper", L"").c_str())) + L"|" +
+                             num(desk.GetNamedNumber(L"pos", 4)) + L"\"/><Canvas>";
+            auto def = g.data.GetNamedObject(L"default", JsonObject());
+            auto boxes = g.data.GetNamedArray(L"boxes", JsonArray());
+            for (auto const& v : boxes)
+            {
+                auto o = v.GetObject();
+                auto rc = o.GetNamedArray(L"rect", JsonArray());
+                if (rc.Size() != 4) continue;
+                double bx = rc.GetNumberAt(0), by = rc.GetNumberAt(1), bw = rc.GetNumberAt(2), bh = rc.GetNumberAt(3);
+                if (bw < 1 || bh < 1) continue;
+                auto st = o.GetNamedObject(L"style", JsonObject());
+                std::wstring col = st.GetNamedString(L"color", L"").c_str();
+                if (col.empty()) col = def.GetNamedString(L"color", L"").c_str();
+                int r = 0x20, gr = 0x20, b = 0x20;
+                Rgb(col, r, gr, b);
+                double op = std::clamp(st.GetNamedNumber(L"opacity", def.GetNamedNumber(L"opacity", 0.8)), 0.0, 1.0);
+                int a = (int)std::lround(0x70 + op * 0x80);
+                bool lightBox = 0.2126 * r + 0.7152 * gr + 0.0722 * b > 150;
+                wchar_t fill[16], over[16];
+                swprintf_s(fill, L"#%02X%02X%02X%02X", a, r, gr, b);
+                swprintf_s(over, L"#%02X%02X%02X%02X", std::min(255, a + 0x30), std::min(255, r + 24), std::min(255, gr + 24), std::min(255, b + 24));
+                std::wstring text = lightBox ? L"#E6000000" : L"#F2FFFFFF";
+                std::wstring title = Esc(std::wstring(o.GetNamedString(L"title", L"").c_str()));
+                std::wstring id = num(o.GetNamedNumber(L"id"));
+                x += L"<Button x:Name=\"MapBox_" + id + L"\" AutomationProperties.Name=\"" + title + L"\" Canvas.Left=\"" + num(bx) + L"\" Canvas.Top=\"" + num(by) +
+                     L"\" Width=\"" + num(bw) + L"\" Height=\"" + num(bh) + L"\" Padding=\"" + num(font * 0.6) + L"\" CornerRadius=\"" + num(corner) +
+                     L"\" BorderThickness=\"" + num(line) + L"\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Top\" UseSystemFocusVisuals=\"True\">"
+                     L"<Button.Resources>"
+                     L"<SolidColorBrush x:Key=\"ButtonBackground\" Color=\"" + fill + L"\"/><SolidColorBrush x:Key=\"ButtonBackgroundPointerOver\" Color=\"" + over + L"\"/>"
+                     L"<SolidColorBrush x:Key=\"ButtonBackgroundPressed\" Color=\"" + fill + L"\"/>"
+                     L"<SolidColorBrush x:Key=\"ButtonBorderBrush\" Color=\"#40FFFFFF\"/><SolidColorBrush x:Key=\"ButtonBorderBrushPointerOver\" Color=\"#E6FFFFFF\"/>"
+                     L"<SolidColorBrush x:Key=\"ButtonBorderBrushPressed\" Color=\"#99FFFFFF\"/>"
+                     L"<SolidColorBrush x:Key=\"ButtonForeground\" Color=\"" + text + L"\"/><SolidColorBrush x:Key=\"ButtonForegroundPointerOver\" Color=\"" + text + L"\"/>"
+                     L"<SolidColorBrush x:Key=\"ButtonForegroundPressed\" Color=\"" + text + L"\"/>"
+                     L"</Button.Resources><TextBlock Text=\"" + title + L"\" FontSize=\"" + num(font) + L"\" FontWeight=\"SemiBold\" TextTrimming=\"CharacterEllipsis\"/></Button>";
+            }
+            x += L"</Canvas>";
+            if (boxes.Size() == 0)
+                x += L"<Border Background=\"#99000000\" CornerRadius=\"" + num(corner * 2) + L"\" Padding=\"" + num(font) + L"," + num(font * 0.5) +
+                     L"\" HorizontalAlignment=\"Center\" VerticalAlignment=\"Center\"><TextBlock Text=\"" + Str(L"homeMapEmpty") + L"\" FontSize=\"" + num(font * 1.3) + L"\" Foreground=\"White\"/></Border>";
+            x += L"</Grid></Viewbox></Border>";
+            return x;
+        }
+
         std::wstring PageHome()
         {
             auto app = g.data.GetNamedObject(L"app", JsonObject());
-            size_t boxes = g.data.GetNamedArray(L"boxes", JsonArray()).Size();
             // The picture with the name over it.
             std::wstring x = L"<Grid Height=\"230\" Margin=\"0,0,0,8\">" + Pic(L"home", L"", L"8") +
                              L"<Border CornerRadius=\"8\"><Border.Background><LinearGradientBrush StartPoint=\"0,0.5\" EndPoint=\"1,0.5\">"
@@ -1012,7 +1119,7 @@ namespace dbx
                              L"<StackPanel VerticalAlignment=\"Center\" HorizontalAlignment=\"Left\" MaxWidth=\"380\" Margin=\"28,0,24,0\" Spacing=\"2\">"
                              L"<TextBlock Text=\"Deskboxes\" Style=\"{StaticResource TitleLargeTextBlockStyle}\" Foreground=\"White\"/>"
                              L"<TextBlock Text=\"" + Str(L"homeTag") + L"\" Foreground=\"#E6FFFFFF\" TextWrapping=\"Wrap\"/>"
-                             L"<TextBlock Text=\"" + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"  ·  " + Str(L"boxesN") + std::to_wstring(boxes) + L"\" Foreground=\"#B3FFFFFF\" Style=\"{StaticResource CaptionTextBlockStyle}\" Margin=\"0,4,0,0\"/>"
+                             L"<TextBlock Text=\"" + Esc(std::wstring(app.GetNamedString(L"version", L"").c_str())) + L"\" Foreground=\"#B3FFFFFF\" Style=\"{StaticResource CaptionTextBlockStyle}\" Margin=\"0,4,0,0\"/>"
                              L"</StackPanel></Grid>";
             // A downloaded update: say so here too, with its button.
             {
@@ -1028,16 +1135,50 @@ namespace dbx
                 return std::wstring(L"<Button x:Name=\"") + name + L"\"" + (accent ? L" Style=\"{StaticResource AccentButtonStyle}\"" : L"") +
                        L" Padding=\"14,8\"><StackPanel Orientation=\"Horizontal\" Spacing=\"8\"><FontIcon Glyph=\"" + glyph + L"\" FontSize=\"14\"/><TextBlock Text=\"" + Str(text) + L"\"/></StackPanel></Button>";
             };
-            x += L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\" Margin=\"0,4,0,0\">" + action(L"HomeSort", L"&#xE8CB;", g.data.GetNamedObject(L"sorting", JsonObject()).GetNamedArray(L"rules", JsonArray()).Size() ? L"sortNowButtonLong" : L"sortTemplateButtonLong", true) +
+            auto rules = g.data.GetNamedObject(L"sorting", JsonObject()).GetNamedArray(L"rules", JsonArray());
+            x += L"<StackPanel Orientation=\"Horizontal\" Spacing=\"8\" Margin=\"0,4,0,0\">" + action(L"HomeSort", L"&#xE8CB;", rules.Size() ? L"sortNowButtonLong" : L"sortTemplateButtonLong", true) +
                  action(L"HomeSave", L"&#xE74E;", L"saveNow", false) + action(L"HomeRules", L"&#xE71C;", L"pageRules", false) + L"</StackPanel>";
+            // Your desktop: the page's map and the counts (every page's boxes and icons).
+            {
+                auto pages = g.data.GetNamedObject(L"pages", JsonObject());
+                auto list = pages.GetNamedArray(L"list", JsonArray());
+                size_t nBoxes = 0, nIcons = 0;
+                for (auto const& v : list)
+                {
+                    auto o = v.GetObject();
+                    nBoxes += (size_t)o.GetNamedNumber(L"boxes", 0);
+                    nIcons += (size_t)o.GetNamedNumber(L"icons", 0);
+                }
+                if (list.Size() == 0) nBoxes = g.data.GetNamedArray(L"boxes", JsonArray()).Size();
+                std::wstring map = DeskMap();
+                x += Section(Str(L"homeDesktop"));
+                x += L"<Grid ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"3*\"/><ColumnDefinition Width=\"2*\" MinWidth=\"180\"/></Grid.ColumnDefinitions>";
+                if (!map.empty())
+                    x += L"<Border Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"12\">"
+                         L"<StackPanel Spacing=\"8\">" + map + (g.data.GetNamedArray(L"boxes", JsonArray()).Size() ? L"<TextBlock Text=\"" + Str(L"homeMapHint") +
+                         L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" TextWrapping=\"Wrap\"/>" : L"") + L"</StackPanel></Border>";
+                x += std::wstring(L"<Grid Grid.Column=\"") + (map.empty() ? L"0\" Grid.ColumnSpan=\"2" : L"1") + L"\" RowSpacing=\"8\" ColumnSpacing=\"8\">"
+                     L"<Grid.RowDefinitions><RowDefinition Height=\"*\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
+                     L"<Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions>" +
+                     Stat(L"boxes", nBoxes, L"statBoxes", L"boxes", 0, 0) + Stat(L"icons", nIcons, L"statIcons", nullptr, 0, 1) +
+                     Stat(L"pages", std::max<size_t>(1, list.Size()), L"statPages", L"pages", 1, 0) + Stat(L"rules", rules.Size(), L"statRules", L"rules", 1, 1) + L"</Grid></Grid>";
+            }
             // Features.
             x += Section(Str(L"navFeatures"));
             // The tiles fill the row (Wire sets ItemWidth from the width; at least 230 each), so
             // their right edge lines up with the banner's. The -8 takes back the last one's gap.
             x += L"<VariableSizedWrapGrid x:Name=\"Tiles\" Orientation=\"Horizontal\" ItemWidth=\"230\" ItemHeight=\"206\" Margin=\"0,0,-8,0\">";
+            // How many of a feature there are, beside its name (none: nothing shown).
+            auto count = [&](const std::wstring& tag) -> size_t
+            {
+                if (tag == L"rules") return rules.Size();
+                if (tag == L"saved") return g.data.GetNamedObject(L"saved", JsonObject()).GetNamedArray(L"list", JsonArray()).Size();
+                if (tag == L"folder") return g.data.GetNamedObject(L"folderBoxes", JsonObject()).GetNamedArray(L"list", JsonArray()).Size();
+                return 0;
+            };
             for (auto const& t : kTiles)
             {
-                std::wstring tag = t.page;
+                std::wstring tag = t.page, title = Str(t.title), desc = Str(t.desc);
                 // The button is the tile's background and click target; the picture and the text lie
                 // over it and let clicks through. The switch (not in the button, so switching it doesn't
                 // open the page) has its own column in the title row, so it never covers the
@@ -1048,27 +1189,31 @@ namespace dbx
                 std::wstring clip = std::wstring(L"t_") + t.pic;
                 if (!HasClip(clip.c_str())) clip = t.pic;
                 x += L"<Grid x:Name=\"TileG_" + tag + L"\" Margin=\"0,0,8,8\">"
-                     L"<Button x:Name=\"Tile_" + tag + L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\""
+                     L"<Button x:Name=\"Tile_" + tag + L"\" AutomationProperties.Name=\"" + title + L"\" AutomationProperties.HelpText=\"" + desc +
+                     L"\" Padding=\"0\" HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\""
                      L" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" CornerRadius=\"8\"/>"
                      L"<Grid Margin=\"1\"><Grid.RowDefinitions><RowDefinition Height=\"123\"/><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
                      L"<Grid IsHitTestVisible=\"False\">" + Pic(std::wstring(L"t_") + t.pic, L"", L"7,7,0,0", clip.c_str(), L"t_" + tag) + L"</Grid>"
-                     L"<Grid Grid.Row=\"1\" Margin=\"14,10,10,0\" ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
-                     L"<TextBlock Text=\"" + Str(t.title) + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" VerticalAlignment=\"Center\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/>";
+                     L"<Grid Grid.Row=\"1\" Margin=\"14,10,10,0\" ColumnSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
+                     L"<TextBlock Text=\"" + title + L"\" Style=\"{StaticResource BodyStrongTextBlockStyle}\" VerticalAlignment=\"Center\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/>";
+                if (size_t n = count(tag))
+                    x += L"<Border Grid.Column=\"1\" Background=\"{ThemeResource SubtleFillColorSecondaryBrush}\" CornerRadius=\"9\" Padding=\"7,1\" MinWidth=\"20\" VerticalAlignment=\"Center\" IsHitTestVisible=\"False\">"
+                         L"<TextBlock x:Name=\"Badge_" + tag + L"\" Text=\"" + std::to_wstring(n) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" HorizontalAlignment=\"Center\"/></Border>";
                 if (t.scope)
-                    x += L"<ToggleSwitch x:Name=\"HomeT_" + tag + L"\" Grid.Column=\"1\" OnContent=\"\" OffContent=\"\" MinWidth=\"0\" Width=\"40\" VerticalAlignment=\"Center\" Margin=\"0,-12,0,-12\"" +
+                    x += L"<ToggleSwitch x:Name=\"HomeT_" + tag + L"\" AutomationProperties.Name=\"" + title + L"\" Grid.Column=\"2\" OnContent=\"\" OffContent=\"\" MinWidth=\"0\" Width=\"40\" VerticalAlignment=\"Center\" Margin=\"0,-12,0,-12\"" +
                          std::wstring(TileOn(t) ? L" IsOn=\"True\"" : L"") + L"/>";
                 else
-                    x += L"<FontIcon Grid.Column=\"1\" Glyph=\"&#xE76C;\" FontSize=\"12\" VerticalAlignment=\"Center\" Margin=\"0,0,6,0\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" IsHitTestVisible=\"False\"/>";
-                x += L"</Grid><TextBlock Grid.Row=\"2\" Margin=\"14,2,14,10\" Text=\"" + Str(t.desc) + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\""
+                    x += L"<FontIcon Grid.Column=\"2\" Glyph=\"&#xE76C;\" FontSize=\"12\" VerticalAlignment=\"Center\" Margin=\"0,0,6,0\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\" IsHitTestVisible=\"False\"/>";
+                x += L"</Grid><TextBlock Grid.Row=\"2\" Margin=\"14,2,14,10\" Text=\"" + desc + L"\" Style=\"{StaticResource CaptionTextBlockStyle}\" Foreground=\"{ThemeResource TextFillColorSecondaryBrush}\""
                      L" TextWrapping=\"Wrap\" MaxLines=\"2\" TextTrimming=\"CharacterEllipsis\" IsHitTestVisible=\"False\"/></Grid></Grid>";
             }
             x += L"</VariableSizedWrapGrid>";
-            // Shortcuts.
-            x += Section(Str(L"shortcutsHead"));
+            // Shortcuts: small cards, two to a row, what it does over its keys (side by side, a long
+            // "how" squeezed the name into three lines).
             auto row = [](const std::wstring& what, const std::wstring& keys)
             {
-                return L"<Grid Padding=\"16,10\" ColumnSpacing=\"16\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"Auto\"/></Grid.ColumnDefinitions>"
-                       L"<TextBlock Text=\"" + what + L"\" VerticalAlignment=\"Center\"/><StackPanel Grid.Column=\"1\" Orientation=\"Horizontal\" Spacing=\"4\" VerticalAlignment=\"Center\">" + keys + L"</StackPanel></Grid>";
+                return L"<StackPanel Spacing=\"6\" VerticalAlignment=\"Center\"><TextBlock Text=\"" + what + L"\" TextWrapping=\"Wrap\"/>"
+                       L"<StackPanel Orientation=\"Horizontal\" Spacing=\"4\">" + keys + L"</StackPanel></StackPanel>";
             };
             auto words = [](const wchar_t* key)
             {
@@ -1078,11 +1223,11 @@ namespace dbx
             bool hide = g.data.GetNamedObject(L"hide", JsonObject()).GetNamedBoolean(L"doubleClick", false);
             // Searching is typing; Ctrl+F does the same and comes second (round 11: two rows read as
             // if Ctrl+F were for searching from inside an app).
-            std::wstring rows = row(Str(L"scSearch"), words(L"scTypeHow") + words(L"scOr") + Key(L"Ctrl") + Key(L"F")) +
-                                row(Str(L"scUndo"), Key(L"Ctrl") + Key(L"Z")) + row(Str(L"scRedo"), Key(L"Ctrl") + Key(L"Y")) +
-                                row(Str(L"scRename"), Key(L"F2"));
-            if (rollup.GetNamedBoolean(L"doubleClick", true)) rows += row(Str(L"scRoll"), words(L"scRollHow"));
-            if (hide) rows += row(Str(L"scHide"), words(L"scHideHow"));
+            std::vector<std::wstring> rows = { row(Str(L"scSearch"), words(L"scTypeHow") + words(L"scOr") + Key(L"Ctrl") + Key(L"F")),
+                                               row(Str(L"scUndo"), Key(L"Ctrl") + Key(L"Z")), row(Str(L"scRedo"), Key(L"Ctrl") + Key(L"Y")),
+                                               row(Str(L"scRename"), Key(L"F2")) };
+            if (rollup.GetNamedBoolean(L"doubleClick", true)) rows.push_back(row(Str(L"scRoll"), words(L"scRollHow")));
+            if (hide) rows.push_back(row(Str(L"scHide"), words(L"scHideHow")));
             {
                 std::wstring hk = g.data.GetNamedObject(L"above", JsonObject()).GetNamedString(L"hotkey", L"win+shift+d").c_str();
                 if (!hk.empty())
@@ -1098,13 +1243,21 @@ namespace dbx
                         caps += Key(k);
                         at = e + 1;
                     }
-                    rows += row(Str(L"scAbove"), caps);
+                    rows.push_back(row(Str(L"scAbove"), caps));
                 }
             }
             if (g.data.GetNamedObject(L"pages", JsonObject()).GetNamedBoolean(L"enabled", true) && g.data.GetNamedObject(L"pages", JsonObject()).GetNamedBoolean(L"altKeys", true))
-                rows += row(Str(L"scPages"), Key(L"Alt") + Key(L"&#x2190;") + Key(L"&#x2192;"));
-            rows += row(Str(L"scBoxMenu"), words(L"scBoxMenuHow"));
-            x += L"<Border Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"0,4\"><StackPanel>" + rows + L"</StackPanel></Border>";
+                rows.push_back(row(Str(L"scPages"), Key(L"Alt") + Key(L"&#x2190;") + Key(L"&#x2192;")));
+            rows.push_back(row(Str(L"scBoxMenu"), words(L"scBoxMenuHow")));
+            x += L"<StackPanel x:Name=\"HomeMore\">" + Section(Str(L"shortcutsHead")) +
+                 L"<Grid ColumnSpacing=\"8\" RowSpacing=\"8\"><Grid.ColumnDefinitions><ColumnDefinition Width=\"*\"/><ColumnDefinition Width=\"*\"/></Grid.ColumnDefinitions><Grid.RowDefinitions>";
+            for (size_t i = 0; i < (rows.size() + 1) / 2; i++) x += L"<RowDefinition Height=\"Auto\"/>";
+            x += L"</Grid.RowDefinitions>";
+            for (size_t i = 0; i < rows.size(); i++)
+                x += L"<Border Grid.Row=\"" + std::to_wstring(i / 2) + L"\" Grid.Column=\"" + std::to_wstring(i % 2) +
+                     L"\" Background=\"{ThemeResource CardBackgroundFillColorDefaultBrush}\" BorderBrush=\"{ThemeResource CardStrokeColorDefaultBrush}\" BorderThickness=\"1\" CornerRadius=\"8\" Padding=\"16,10\" MinHeight=\"48\">" +
+                     rows[i] + L"</Border>";
+            x += L"</Grid></StackPanel>";
             return x;
         }
 
@@ -1164,11 +1317,10 @@ namespace dbx
         // them in as Windows Settings does (the title changes at once; the cards rise into place).
         // (One animation for the whole page: per-card entrance transitions started late, after the
         // page had already been drawn once, so it blinked and the pictures popped.)
-        std::wstring PageXaml(const Page* cur, bool standalone, bool animate)
+        std::wstring PageXaml(const Page* cur, bool animate)
         {
             std::wstring x = L"<Grid";
-            if (standalone)
-                x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
+            x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
             x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
                  L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>";
             x += L"<ScrollViewer x:Name=\"Scroll\" Grid.Row=\"1\" VerticalScrollBarVisibility=\"Auto\" ZoomMode=\"Disabled\">";
@@ -1186,7 +1338,7 @@ namespace dbx
             return x + L"</StackPanel></Grid></Grid></ScrollViewer></Grid>";
         }
 
-        std::wstring BuildXaml()
+        std::wstring BuildXaml(const std::wstring& page)
         {
             const Page* cur = CurrentPage();
             std::wstring x = LR"(<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
@@ -1229,7 +1381,7 @@ namespace dbx
             x += L"</NavigationView.MenuItems><NavigationView.FooterMenuItems>";
             for (auto const& p : kPages)
                 if (std::wstring(p.tag) == L"about") x += item(p);
-            x += L"</NavigationView.FooterMenuItems>" + PageXaml(cur, false, false) + L"</NavigationView></Grid>";
+            x += L"</NavigationView.FooterMenuItems>" + page + L"</NavigationView></Grid>";
             return x;
         }
 
@@ -1271,7 +1423,7 @@ namespace dbx
         void OnCombo(mux::FrameworkElement const& root, const std::wstring& name, std::function<void(std::wstring)> f)
         {
             if (auto c = Find<muxc::ComboBox>(root, name))
-                c.SelectionChanged([c, f](auto&&, auto&&) { f(Tag(c, L"")); });
+                c.SelectionChanged([f](auto&& sender, auto&&) { f(Tag(sender.template as<muxc::ComboBox>(), L"")); });
         }
 
         void OnToggle(mux::FrameworkElement const& root, const std::wstring& name, const wchar_t* scope, const wchar_t* key, double id = 0)
@@ -1279,9 +1431,10 @@ namespace dbx
             if (auto t = Find<muxc::ToggleSwitch>(root, name))
             {
                 auto state = Find<muxc::TextBlock>(root, name + L"State");
-                t.Toggled([t, state, scope, key, id](auto&&, auto&&)
+                t.Toggled([weakState = winrt::make_weak(state), scope, key, id](auto&& sender, auto&&)
                 {
-                    if (state) state.Text(winrt::hstring(Str(t.IsOn() ? L"toggleOn" : L"toggleOff")));
+                    auto t = sender.template as<muxc::ToggleSwitch>();
+                    if (auto state = weakState.get()) state.Text(winrt::hstring(Str(t.IsOn() ? L"toggleOn" : L"toggleOff")));
                     Send(scope, id, key, JsonValue::CreateBooleanValue(t.IsOn()));
                 });
             }
@@ -1299,15 +1452,15 @@ namespace dbx
             auto t = Find<muxc::TextBox>(root, name);
             if (!t) return;
             auto orig = std::make_shared<std::wstring>(t.Text().c_str());
-            auto commit = [t, orig, scope, id, key]
+            auto commit = [orig, scope, id, key](muxc::TextBox const& t)
             {
                 std::wstring now = t.Text().c_str();
                 if (now == *orig) return;
                 *orig = now;
                 Send(scope, id, key, JsonValue::CreateStringValue(now));
             };
-            t.LostFocus([commit](auto&&, auto&&) { commit(); });
-            t.KeyDown([commit](auto&&, mux::Input::KeyRoutedEventArgs const& e) { if (e.Key() == winrt::Windows::System::VirtualKey::Enter) commit(); });
+            t.LostFocus([commit](auto&& sender, auto&&) { commit(sender.template as<muxc::TextBox>()); });
+            t.KeyDown([commit](auto&& sender, mux::Input::KeyRoutedEventArgs const& e) { if (e.Key() == winrt::Windows::System::VirtualKey::Enter) commit(sender.template as<muxc::TextBox>()); });
         }
 
         void WireStyle(mux::FrameworkElement const& root, const std::wstring& prefix, const wchar_t* scope, double id)
@@ -1342,22 +1495,26 @@ namespace dbx
             auto cb = Find<muxc::ComboBox>(root, name + L"Preset");
             if (!sl || !cb) return;
             auto sync = std::make_shared<bool>(false);
-            cb.SelectionChanged([sl, cb, sync](auto&&, auto&&)
+            cb.SelectionChanged([weakSlider = winrt::make_weak(sl), sync](auto&& sender, auto&&)
             {
                 if (*sync) return;
-                auto t = Tag(cb, L"custom");
+                auto sl = weakSlider.get();
+                if (!sl) return;
+                auto t = Tag(sender.template as<muxc::ComboBox>(), L"custom");
                 if (t == L"custom") return;
                 *sync = true;
                 sl.Value(_wtof(t.c_str()));
                 *sync = false;
             });
-            mux::FrameworkElement r = root;
-            sl.ValueChanged([cb, sync, key, r](auto&&, mux::Controls::Primitives::RangeBaseValueChangedEventArgs const& e)
+            auto r = winrt::make_weak(root);
+            sl.ValueChanged([weakCombo = winrt::make_weak(cb), sync, key, r](auto&&, mux::Controls::Primitives::RangeBaseValueChangedEventArgs const& e)
             {
                 Send(L"look", 0, key, JsonValue::CreateNumberValue(e.NewValue()));
-                UnmarkPresets(r);
+                if (auto page = r.get()) UnmarkPresets(page);
                 if (*sync) return;
                 *sync = true;
+                auto cb = weakCombo.get();
+                if (!cb) { *sync = false; return; }
                 auto items = cb.Items();
                 int sel = (int)items.Size() - 1;
                 for (uint32_t i = 0; i < items.Size(); i++)
@@ -1832,7 +1989,8 @@ namespace dbx
         // the top of a feature's own page (`autoplay`) it plays from the start for as long as the
         // page shows. Nothing plays when Windows' animation effects are off. The player is kept
         // out of the system's media controls.
-        void WireClip(mux::FrameworkElement const& root, mux::FrameworkElement const& hover, mux::FrameworkElement const& el, bool autoplay = false)
+        void WireClip(mux::FrameworkElement const& root, mux::FrameworkElement const& hover, mux::FrameworkElement const& el, bool autoplay = false,
+                      muxc::Control const& focus = nullptr)
         {
             if (!hover || !el) return;
             std::wstring clip = winrt::unbox_value_or<winrt::hstring>(el.Tag(), L"").c_str();
@@ -1878,12 +2036,104 @@ namespace dbx
             auto leave = [stop](winrt::Windows::Foundation::IInspectable const&, mux::Input::PointerRoutedEventArgs const&) { stop(); };
             for (auto ev : { mux::UIElement::PointerExitedEvent(), mux::UIElement::PointerCanceledEvent(), mux::UIElement::PointerCaptureLostEvent() })
                 hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(leave)), true);
+            // Reached with Tab or the arrows: it plays as under the pointer.
+            if (focus)
+            {
+                focus.GotFocus([weak, clip, st](auto&& sender, auto&&)
+                    {
+                        if (sender.template as<muxc::Control>().FocusState() != mux::FocusState::Keyboard) return;
+                        if (auto e = weak.get()) StartClip(e, clip, st);
+                    });
+                focus.LostFocus([stop](auto&&, auto&&) { stop(); });
+            }
+        }
+
+        // Home's map and counts: the wallpaper under the map (read here, off the markup, at about
+        // the size it shows at), a box opens its group on the Boxes page, a count its page.
+        void WireHome(mux::FrameworkElement const& root)
+        {
+            if (auto wall = Find<muxc::Border>(root, L"MapWall"))
+            {
+                std::wstring tag = winrt::unbox_value_or<winrt::hstring>(wall.Tag(), L"").c_str();
+                size_t bar = tag.rfind(L'|');
+                std::wstring path = bar == std::wstring::npos ? tag : tag.substr(0, bar);
+                int pos = bar == std::wstring::npos ? 4 : _wtoi(tag.c_str() + bar + 1);
+                if (!path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    try
+                    {
+                        mux::Media::Imaging::BitmapImage bmp;
+                        bmp.DecodePixelWidth(720);
+                        // Over the wallpaper's color, fading in once decoded (not popping in).
+                        mux::ScalarTransition fade;
+                        fade.Duration(std::chrono::milliseconds(220));
+                        wall.Opacity(0.0);
+                        wall.OpacityTransition(fade);
+                        bmp.ImageOpened([w = winrt::make_weak(wall)](auto&&, auto&&)
+                            {
+                                if (auto e = w.get()) e.Opacity(1.0);
+                            });
+                        bmp.UriSource(winrt::Windows::Foundation::Uri(FileUri(path)));
+                        mux::Media::ImageBrush brush;
+                        brush.ImageSource(bmp);
+                        // Stretch, fit, else as fill (centered and tiled pictures: near enough).
+                        brush.Stretch(pos == 2 ? mux::Media::Stretch::Fill : pos == 3 ? mux::Media::Stretch::Uniform : mux::Media::Stretch::UniformToFill);
+                        wall.Background(brush);
+                    }
+                    catch (winrt::hresult_error const& e) { Log(L"settings: wallpaper for the map: %s", e.message().c_str()); }
+            }
+            for (auto const& v : g.data.GetNamedArray(L"boxes", JsonArray()))
+            {
+                long long id = (long long)v.GetObject().GetNamedNumber(L"id", 0);
+                if (auto b = Find<muxc::Button>(root, L"MapBox_" + std::to_wstring(id)))
+                    b.Click([id](auto&&, auto&&)
+                        {
+                            g.focusBox = id;
+                            g.expanded.insert(id);
+                            GoTo(L"boxes");
+                        });
+            }
+            for (const wchar_t* tag : { L"boxes", L"pages", L"rules" })
+                if (auto b = Find<muxc::Button>(root, L"Stat_" + std::wstring(tag)))
+                    b.Click([t = std::wstring(tag)](auto&&, auto&&) { GoTo(t); });
+        }
+
+        // Home's feature tiles and shortcuts are laid out once the first frame is drawn: they are
+        // below the fold at the window's usual size (and come a frame later where they are not),
+        // so the window shows sooner. Only for a page shown from the top.
+        void DeferLater(mux::FrameworkElement const& root)
+        {
+            if (g.page != L"home" || !root) return;
+            auto later = std::make_shared<std::vector<winrt::weak_ref<mux::UIElement>>>();
+            for (auto const& t : kTiles)
+                if (auto e = Find<mux::UIElement>(root, L"TileG_" + std::wstring(t.page)))
+                    {
+                        e.Visibility(mux::Visibility::Collapsed);
+                        later->push_back(e);
+                    }
+            if (auto e = Find<mux::UIElement>(root, L"HomeMore"))
+            {
+                e.Visibility(mux::Visibility::Collapsed);
+                later->push_back(e);
+            }
+            if (later->empty()) return;
+            root.Loaded([later](auto&&, auto&&)
+                {
+                    auto token = std::make_shared<winrt::event_token>();
+                    *token = mux::Media::CompositionTarget::Rendered([later, token](auto&&, auto&&)
+                        {
+                            mux::Media::CompositionTarget::Rendered(*token);
+                            for (auto& w : *later)
+                                if (auto e = w.get()) e.Visibility(mux::Visibility::Visible);
+                        });
+                });
         }
 
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
-                WireClip(root, Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<mux::FrameworkElement>(root, L"Clip_t_" + std::wstring(t.page)));
+                WireClip(root, Find<mux::FrameworkElement>(root, L"TileG_" + std::wstring(t.page)), Find<mux::FrameworkElement>(root, L"Clip_t_" + std::wstring(t.page)), false,
+                         Find<muxc::Button>(root, L"Tile_" + std::wstring(t.page)));
+            WireHome(root);
             WireClip(root, Find<mux::FrameworkElement>(root, L"ClipG_hero"), Find<mux::FrameworkElement>(root, L"Clip_hero"), true);
             if (auto tiles = Find<muxc::VariableSizedWrapGrid>(root, L"Tiles"))
                 tiles.SizeChanged([](winrt::Windows::Foundation::IInspectable const& s, mux::SizeChangedEventArgs const& e)
@@ -1957,19 +2207,19 @@ namespace dbx
                     b.Click([id](auto&&, auto&&) { Send(L"look", 0, L"preset", JsonValue::CreateStringValue(id)); });
             }
             {
-                mux::FrameworkElement r = root;
+                auto r = winrt::make_weak(root);
                 OnCombo(root, L"LookBar", [r](std::wstring v)
                 {
                     Send(L"look", 0, L"titleBar", JsonValue::CreateStringValue(v));
-                    if (auto s = Find<muxc::Slider>(r, L"LookBand")) s.IsEnabled(v == L"band");
-                    UnmarkPresets(r);
+                    if (auto page = r.get()) if (auto s = Find<muxc::Slider>(page, L"LookBand")) s.IsEnabled(v == L"band");
+                    if (auto page = r.get()) UnmarkPresets(page);
                 });
-                OnCombo(root, L"LookAlign", [r](std::wstring v) { Send(L"look", 0, L"align", JsonValue::CreateStringValue(v)); UnmarkPresets(r); });
+                OnCombo(root, L"LookAlign", [r](std::wstring v) { Send(L"look", 0, L"align", JsonValue::CreateStringValue(v)); if (auto page = r.get()) UnmarkPresets(page); });
                 if (auto s = Find<muxc::Slider>(root, L"LookBand"))
                     s.ValueChanged([r](auto&&, mux::Controls::Primitives::RangeBaseValueChangedEventArgs const& e)
                     {
                         Send(L"look", 0, L"band", JsonValue::CreateNumberValue(e.NewValue() / 100.0));
-                        UnmarkPresets(r);
+                        if (auto page = r.get()) UnmarkPresets(page);
                     });
             }
             WireSizePair(root, L"LookSize", L"titleSize");
@@ -1984,7 +2234,7 @@ namespace dbx
                 double id = rv.GetObject().GetNamedNumber(L"id");
                 std::wstring p = L"R" + std::to_wstring((long long)id);
                 if (auto c = Find<muxc::CheckBox>(root, p + L"On"))
-                    c.Click([c, id](auto&&, auto&&) { auto v = c.IsChecked(); Send(L"rules", id, L"enabled", JsonValue::CreateBooleanValue(v && v.Value())); });
+                    c.Click([id](auto&& sender, auto&&) { auto v = sender.template as<muxc::CheckBox>().IsChecked(); Send(L"rules", id, L"enabled", JsonValue::CreateBooleanValue(v && v.Value())); });
                 OnCombo(root, p + L"Kind", [id](std::wstring v) { Send(L"rules", id, L"kind", JsonValue::CreateStringValue(v)); });
                 OnCombo(root, p + L"Op", [id](std::wstring v) { Send(L"rules", id, L"op", JsonValue::CreateStringValue(v)); });
                 OnText(root, p + L"Val", L"rules", id, L"value");
@@ -2078,11 +2328,11 @@ namespace dbx
             OnCombo(root, L"LookFont", [](std::wstring v) { Send(L"look", 0, L"titleFont", JsonValue::CreateStringValue(v)); });
             OnCombo(root, L"LookWeight", [](std::wstring v) { Send(L"look", 0, L"titleWeight", JsonValue::CreateStringValue(v)); });
             {
-                mux::FrameworkElement r = root;
+                auto r = winrt::make_weak(root);
                 OnCombo(root, L"LookOutline", [r](std::wstring v)
                 {
                     Send(L"look", 0, L"outline", JsonValue::CreateStringValue(v));
-                    if (auto s = Find<muxc::Slider>(r, L"LookOutlineW")) s.IsEnabled(v != L"none");
+                    if (auto page = r.get()) if (auto s = Find<muxc::Slider>(page, L"LookOutlineW")) s.IsEnabled(v != L"none");
                 });
                 if (auto s = Find<muxc::Slider>(root, L"LookOutlineW"))
                     s.ValueChanged([](auto&&, mux::Controls::Primitives::RangeBaseValueChangedEventArgs const& e) { Send(L"look", 0, L"outlineW", JsonValue::CreateNumberValue(e.NewValue())); });
@@ -2136,7 +2386,7 @@ namespace dbx
         // The page to show next, made while the one before fades out.
         mux::FrameworkElement MakePage(bool anim)
         {
-            try { return mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), true, anim)).as<mux::FrameworkElement>(); }
+            try { return mux::Markup::XamlReader::Load(PageXaml(CurrentPage(), anim)).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: page XAML failed: %s", e.message().c_str()); }
             return nullptr;
         }
@@ -2157,10 +2407,25 @@ namespace dbx
             else body = nullptr;
             g.wiring = true;
             g.builtPage = g.page;
+            g.movedNames = nullptr;
             g.moved = false;
-            g.shownXaml = PageXaml(CurrentPage(), true, false);
+            g.shownXaml = PageXaml(CurrentPage(), false);
             nav.Content(page);
             Wire(page);
+            if (g.focusBox)
+            {
+                winrt::weak_ref<muxc::Expander> focus{ Find<muxc::Expander>(page, L"Box" + std::to_wstring(g.focusBox) + L"Exp") };
+                g.focusBox = 0;
+                page.Loaded([focus](auto&& sender, auto&&)
+                    {
+                        sender.template as<mux::FrameworkElement>().DispatcherQueue().TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [focus]
+                            {
+                                if (auto f = focus.get()) f.StartBringIntoView();
+                            });
+                    });
+            }
+            else
+                DeferLater(page);
             // (Weak: the page's own handler holding it, or its child, would keep every page
             // switched away from alive.)
             winrt::weak_ref<mux::UIElement> weakBody{ body }, weakMove{ move };
@@ -2334,7 +2599,7 @@ namespace dbx
         bool Refresh()
         {
             auto cur = CurrentPage();
-            std::wstring x = PageXaml(cur, true, false);
+            std::wstring x = PageXaml(cur, false);
             if (x == g.shownXaml) return true;
             auto root = g.window.Content().try_as<mux::FrameworkElement>();
             auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
@@ -2358,6 +2623,7 @@ namespace dbx
                 Wire(fresh);
                 fsv.Content(nullptr);
                 sv.Content(content);
+                g.movedNames = fresh;
                 g.moved = true;
                 Log(L"settings: page %s changed, its cards made again", g.page.c_str());
             }
@@ -2377,16 +2643,23 @@ namespace dbx
                         if (auto shown = nav.Content().try_as<mux::FrameworkElement>())
                             if (auto sv = Find<muxc::ScrollViewer>(shown, L"Scroll")) scroll = sv.VerticalOffset();
             mux::FrameworkElement root{ nullptr };
-            try { root = mux::Markup::XamlReader::Load(BuildXaml()).as<mux::FrameworkElement>(); }
+            double tm = NowMs();
+            auto page = PageXaml(CurrentPage(), false);
+            double tl = NowMs();
+            try { root = mux::Markup::XamlReader::Load(BuildXaml(page)).as<mux::FrameworkElement>(); }
             catch (winrt::hresult_error const& e) { Log(L"settings: XAML failed: %s", e.message().c_str()); return; }
+            if (GetEnvironmentVariableW(L"DBX_SETTINGS_TIMING", nullptr, 0))
+                Log(L"settings timing: markup made in %.1f ms, read in %.1f ms", tl - tm, NowMs() - tl);
             g.wiring = true;
             g.builtPage = g.page;
+            g.movedNames = nullptr;
             g.moved = false;
-            g.shownXaml = PageXaml(CurrentPage(), true, false);
+            g.shownXaml = std::move(page);
             g.stringsSig = g.data.GetNamedObject(L"strings", JsonObject()).Stringify().c_str();
             g.window.Content(root);
             g.window.SetTitleBar(Find<mux::UIElement>(root, L"TitleBar"));
             Wire(root);
+            if (scroll == 0 && !g.focusBox) DeferLater(root);
             // Opened from a box's menu: that box's group open and in view.
             muxc::Expander focus{ nullptr };
             if (g.focusBox)
@@ -2408,6 +2681,48 @@ namespace dbx
                     g.wiring = false;
                 });
             });
+        }
+
+        // Tests (DBX_SETTINGS_TIMING=1): when the window opened at `t0` is first drawn and when the
+        // pictures of its page are in.
+        void TimeOpen(double t0)
+        {
+            if (!GetEnvironmentVariableW(L"DBX_SETTINGS_TIMING", nullptr, 0)) return;
+            auto root = g.window.Content().try_as<mux::FrameworkElement>();
+            if (!root) return;
+            Log(L"settings timing: page markup %zu chars", g.shownXaml.size());
+            auto frame = std::make_shared<winrt::event_token>();
+            *frame = mux::Media::CompositionTarget::Rendered([t0, frame](auto&&, auto&&)
+                {
+                    mux::Media::CompositionTarget::Rendered(*frame);
+                    Log(L"settings timing: first frame at %.0f ms", NowMs() - t0);
+                });
+            root.Loaded([t0](auto&& sender, auto&&)
+                {
+                    auto left = std::make_shared<int>(0);
+                    int total = 0;
+                    std::function<void(mux::DependencyObject const&)> walk = [&](mux::DependencyObject const& o)
+                    {
+                        auto bmp = [&](mux::Media::Brush const& b)
+                        {
+                            auto ib = b ? b.try_as<mux::Media::ImageBrush>() : nullptr;
+                            auto bi = ib ? ib.ImageSource().try_as<mux::Media::Imaging::BitmapImage>() : nullptr;
+                            if (!bi) return;
+                            total++;
+                            if (bi.PixelWidth() > 0) return;
+                            ++*left;
+                            bi.ImageOpened([t0, left](auto&&, auto&&)
+                                {
+                                    if (--*left == 0) Log(L"settings timing: all pictures in at %.0f ms", NowMs() - t0);
+                                });
+                        };
+                        if (auto b = o.try_as<muxc::Border>()) bmp(b.Background());
+                        int n = mux::Media::VisualTreeHelper::GetChildrenCount(o);
+                        for (int i = 0; i < n; i++) walk(mux::Media::VisualTreeHelper::GetChild(o, i));
+                    };
+                    walk(sender.template as<mux::DependencyObject>());
+                    Log(L"settings timing: loaded at %.0f ms, %d picture(s), %d still loading", NowMs() - t0, total, *left);
+                });
         }
 
         // Keeps the settings window at least 640 x 500 (at 100% scale), like Windows Settings keeps
@@ -2486,6 +2801,8 @@ namespace dbx
                     if (g.switchTimer) g.switchTimer.Stop();
                     g.switchTimer = nullptr;
                     g_nextPage = nullptr;
+                    g.movedNames = nullptr;
+                    SettingsClosed();
                     g.window = nullptr; g.hwnd = nullptr; g.builtPage.clear(); TrimMemorySoon();
                 });
         }
@@ -2775,16 +3092,40 @@ namespace dbx
     void ShowSettings(JsonObject const& data, bool open, std::function<void(JsonObject)> send)
     {
         double t0 = NowMs();
+        // A refresh leaves out the fixed texts (strings, color and category names, known folders):
+        // the ones had so far stay. A new table (an open, another language) is read anew.
+        bool newStrings = data.HasKey(L"strings");
+        if (g.data)
+        {
+            for (auto key : { L"strings", L"colors", L"categories" })
+                if (!data.HasKey(key) && g.data.HasKey(key)) data.SetNamedValue(key, g.data.GetNamedValue(key));
+            auto fb = data.GetNamedObject(L"folderBoxes", JsonObject());
+            auto oldFb = g.data.GetNamedObject(L"folderBoxes", JsonObject());
+            if (data.HasKey(L"folderBoxes") && !fb.HasKey(L"known") && oldFb.HasKey(L"known")) fb.SetNamedValue(L"known", oldFb.GetNamedValue(L"known"));
+        }
+        if (newStrings || !g.data) g.strsOk = false;
         g.data = data;
         g.send = std::move(send);
         if (!g.window && !open) return;
         // Only the download went on: move the progress bar instead of building the page again
         // (a rebuild per percent would restart the ring and flicker).
         {
-            auto copy = JsonObject::Parse(data.Stringify());
-            auto st = copy.GetNamedObject(L"update", JsonObject()).GetNamedObject(L"status", JsonObject());
+            // Most fields (including the language table) can be shared. The transport
+            // request ID changes on every refresh and is unrelated to the visible page.
+            JsonObject copy, update, status;
+            // (Nor the fixed texts: another language changes the app's settings too.)
+            for (auto const& field : data)
+                if (field.Key() != L"id" && field.Key() != L"update" && field.Key() != L"strings" && field.Key() != L"colors" && field.Key() != L"categories")
+                    copy.Insert(field.Key(), field.Value());
+            auto original = data.GetNamedObject(L"update", JsonObject());
+            for (auto const& field : original)
+                if (field.Key() != L"status") update.Insert(field.Key(), field.Value());
+            auto st = original.GetNamedObject(L"status", JsonObject());
             double progress = st.GetNamedNumber(L"progress", 0);
-            if (st.HasKey(L"progress")) st.SetNamedValue(L"progress", JsonValue::CreateNumberValue(0));
+            for (auto const& field : st)
+                if (field.Key() != L"progress") status.Insert(field.Key(), field.Value());
+            update.SetNamedValue(L"status", status);
+            copy.SetNamedValue(L"update", update);
             std::wstring sig = copy.Stringify().c_str();
             bool same = !open && g.window && sig == g.lastSig;
             g.lastSig = sig;
@@ -2825,7 +3166,7 @@ namespace dbx
         g.window.Title(title);
         // Already showing this page in this language: updated where it is (see Refresh).
         if (!fresh && !open && g.page == g.builtPage && !(g.switchTimer && g.switchTimer.IsRunning()) &&
-            g.stringsSig == std::wstring(g.data.GetNamedObject(L"strings", JsonObject()).Stringify().c_str()) && Refresh())
+            (!newStrings || g.stringsSig == std::wstring(g.data.GetNamedObject(L"strings", JsonObject()).Stringify().c_str())) && Refresh())
             return;
         Build();
         if (open)
@@ -2833,6 +3174,7 @@ namespace dbx
             g.window.Activate();
             if (IsIconic(g.hwnd)) ShowWindow(g.hwnd, SW_RESTORE);
             SetForegroundWindow(g.hwnd);
+            TimeOpen(t0);
         }
         Log(L"settings %s (%u boxes) in %.0f ms", fresh ? L"opened" : L"refreshed", g.data.GetNamedArray(L"boxes", JsonArray()).Size(), NowMs() - t0);
     }

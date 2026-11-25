@@ -105,37 +105,61 @@ fn source_of(c: u8) -> Source {
     }
 }
 
+/// A snapshot to write, its icons shared with the app's (not copied on the UI thread).
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotParts {
+    pub source_id: String,
+    pub dpi: u32,
+    pub icon_px: u32,
+    pub cell_w: u32,
+    pub cell_h: u32,
+    pub items: Vec<Item>,
+    pub icons: Vec<std::sync::Arc<IconImage>>,
+}
+
+impl SnapshotParts {
+    /// The same bytes as `Snapshot::encode` of the same snapshot.
+    pub fn encode(&self) -> Vec<u8> {
+        let icons: Vec<&IconImage> = self.icons.iter().map(|i| &**i).collect();
+        encode(&self.source_id, [self.dpi, self.icon_px, self.cell_w, self.cell_h], &self.items, &icons)
+    }
+}
+
+fn encode(source_id: &str, head: [u32; 4], items: &[Item], icons: &[&IconImage]) -> Vec<u8> {
+    let mut w = W(Vec::with_capacity(64 * 1024 + icons.iter().map(|i| i.bgra.len()).sum::<usize>()));
+    w.0.extend_from_slice(MAGIC);
+    w.u32(VERSION);
+    w.s(source_id);
+    for v in head {
+        w.u32(v);
+    }
+    w.u32(items.len() as u32);
+    for it in items {
+        w.s(&it.key.0);
+        w.s(&it.parsing_name);
+        w.s(&it.display_name);
+        w.u8(kind_code(it.kind));
+        w.u8(source_code(it.source));
+        w.s(&it.ext);
+        w.u64(it.size);
+        w.u64(it.modified);
+        w.u32(it.attrs);
+        w.u32(it.icon);
+        w.s(&it.link);
+    }
+    w.u32(icons.len() as u32);
+    for ic in icons {
+        w.u32(ic.w);
+        w.u32(ic.h);
+        w.0.extend_from_slice(&ic.bgra);
+    }
+    w.0
+}
+
 impl Snapshot {
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = W(Vec::with_capacity(64 * 1024 + self.icons.iter().map(|i| i.bgra.len()).sum::<usize>()));
-        w.0.extend_from_slice(MAGIC);
-        w.u32(VERSION);
-        w.s(&self.source_id);
-        w.u32(self.dpi);
-        w.u32(self.icon_px);
-        w.u32(self.cell_w);
-        w.u32(self.cell_h);
-        w.u32(self.items.len() as u32);
-        for it in &self.items {
-            w.s(&it.key.0);
-            w.s(&it.parsing_name);
-            w.s(&it.display_name);
-            w.u8(kind_code(it.kind));
-            w.u8(source_code(it.source));
-            w.s(&it.ext);
-            w.u64(it.size);
-            w.u64(it.modified);
-            w.u32(it.attrs);
-            w.u32(it.icon);
-            w.s(&it.link);
-        }
-        w.u32(self.icons.len() as u32);
-        for ic in &self.icons {
-            w.u32(ic.w);
-            w.u32(ic.h);
-            w.0.extend_from_slice(&ic.bgra);
-        }
-        w.0
+        let icons: Vec<&IconImage> = self.icons.iter().collect();
+        encode(&self.source_id, [self.dpi, self.icon_px, self.cell_w, self.cell_h], &self.items, &icons)
     }
 
     pub fn decode(b: &[u8]) -> Option<Snapshot> {
@@ -147,7 +171,7 @@ impl Snapshot {
         let n = r.u32()? as usize;
         s.items.reserve(n);
         for _ in 0..n {
-            let key = ItemKey(r.s()?);
+            let key = ItemKey(r.s()?.into());
             let parsing_name = r.s()?;
             let display_name = r.s()?;
             let kind = kind_of(r.u8()?);
@@ -192,6 +216,16 @@ mod tests {
             icons: vec![IconImage { w: 2, h: 1, bgra: vec![1, 2, 3, 4, 5, 6, 7, 8] }],
         };
         let b = s.encode();
+        let parts = SnapshotParts {
+            source_id: s.source_id.clone(),
+            dpi: s.dpi,
+            icon_px: s.icon_px,
+            cell_w: s.cell_w,
+            cell_h: s.cell_h,
+            items: s.items.clone(),
+            icons: s.icons.iter().cloned().map(std::sync::Arc::new).collect(),
+        };
+        assert_eq!(parts.encode(), b);
         assert_eq!(Snapshot::decode(&b), Some(s));
         assert_eq!(Snapshot::decode(&b[..b.len() - 1]), None);
     }

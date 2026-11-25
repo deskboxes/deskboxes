@@ -3,7 +3,7 @@
 //! otherwise; input-driven frames do not need it.
 
 use crate::events::WM_APP_DRAW;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Dxgi::*;
@@ -17,6 +17,12 @@ static STOPPED: AtomicBool = AtomicBool::new(false);
 /// A frame is posted and not drawn yet (shared with `App::invalidate`).
 pub static PENDING: AtomicBool = AtomicBool::new(false);
 static TARGET: AtomicIsize = AtomicIsize::new(0);
+/// Frames asked for so far (queued or not): tells whether handling an input asked for one.
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn requests() -> u64 {
+    REQUESTS.load(Ordering::Relaxed)
+}
 static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
 /// Post one frame request to the UI thread unless one is already queued.
@@ -24,6 +30,7 @@ pub fn request_frame() {
     if STOPPED.load(Ordering::Acquire) {
         return;
     }
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
     if !PENDING.swap(true, Ordering::AcqRel) {
         let h = HWND(TARGET.load(Ordering::Relaxed) as _);
         unsafe {

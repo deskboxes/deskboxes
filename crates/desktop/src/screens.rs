@@ -161,8 +161,8 @@ pub struct ScreenRt {
     pub wall_src: Option<(Option<(Bitmap, (u32, u32))>, deskboxes_render::Color, i32, u32, u32)>,
     pub wall_sig: String,
     pub wall_used: (String, i32, u32),
-    pub wall_grid: Option<(u32, u32, Vec<u8>, f32)>,
-    pub label_bmps: HashMap<(ItemKey, bool, i32), Bitmap>,
+    pub wall_grid: std::cell::RefCell<Option<crate::app::WallGrid>>,
+    pub label_bmps: HashMap<(ItemKey, bool, i32), deskboxes_render::Shadow>,
     pub frame_ok: bool,
     pub page_anim: Option<crate::pages::Slide>,
     pub page_other: Option<u32>,
@@ -191,7 +191,7 @@ impl ScreenRt {
             wall_src: None,
             wall_sig: String::new(),
             wall_used: Default::default(),
-            wall_grid: None,
+            wall_grid: std::cell::RefCell::new(None),
             label_bmps: HashMap::new(),
             frame_ok: false,
             page_anim: None,
@@ -228,7 +228,7 @@ impl App {
         std::mem::swap(&mut self.wall_src, &mut s.wall_src);
         std::mem::swap(&mut self.wall_sig, &mut s.wall_sig);
         std::mem::swap(&mut self.wall_used, &mut s.wall_used);
-        std::mem::swap(&mut self.wall_grid, &mut s.wall_grid);
+        std::mem::swap(self.wall_grid.get_mut(), s.wall_grid.get_mut());
         std::mem::swap(&mut self.label_bmps, &mut s.label_bmps);
         std::mem::swap(&mut self.frame_ok, &mut s.frame_ok);
         std::mem::swap(&mut self.pages.anim, &mut s.page_anim);
@@ -378,6 +378,10 @@ impl App {
             self.paint_inactive = true;
             anim |= self.draw_screen_only();
             self.paint_inactive = false;
+            // (A frame that could not be drawn is drawn again next time.)
+            if !self.frame_ok {
+                self.others_dirty = true;
+            }
         }
         self.use_screen(cur);
         self.preview_loose = preview;
@@ -538,7 +542,10 @@ impl App {
 
     /// The monitors as found now (fixture screens in window mode).
     pub fn find_monitors(&self) -> Vec<Monitor> {
-        let real = monitors();
+        let mut real = monitors();
+        if self.args.one_screen {
+            real.truncate(1);
+        }
         if !self.desktop_mode {
             let main = real.first().cloned().unwrap_or(Monitor { id: "fixture".into(), name: String::new(), n: 1, rect: self.mon, work: self.mon, dpi: 96 });
             let spec = self.fixture_screens.clone();

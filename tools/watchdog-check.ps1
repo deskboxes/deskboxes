@@ -1,6 +1,6 @@
 # watchdog-check.ps1: exercises deskboxes-watchdog.exe against a fixture core in window mode.
 #   crash  -> icons restored, core restarted
-#   hang   -> (core suspended) detected by WM_NULL timeout, core killed and restarted
+#   hang   -> (core suspended) detected by two WM_NULL timeouts, core killed and restarted
 #   3 restarts in 60 s, then one more failure -> watchdog gives up, exits
 #   deskboxes --restore-icons -> watchdog and core both stop, no restart
 # Runs the app non-elevated through run-as-user.exe. Leaves no processes or fixture files behind.
@@ -53,12 +53,13 @@ try {
     $p2 = Wait-NewCore @($p1) 10000
     $results.crashRestart = [bool]$p2
 
-    # B. hang: suspend the core; the watchdog must see WM_NULL time out (3 s period + 6 s timeout)
-    Start-Sleep -Seconds 2
+    # B. hang: suspend the core once it has answered a check (before, it counts as starting); the
+    # watchdog must see WM_NULL time out twice in a row (3 s period, 6 s timeout)
+    Start-Sleep -Seconds 5
     $h = (Get-Process -Id $p2).Handle
     [void][WdChk.N]::NtSuspendProcess($h)
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $p3 = Wait-NewCore @($p1, $p2) 20000
+    $p3 = Wait-NewCore @($p1, $p2) 30000
     $results.hangRestart = [bool]$p3
     $results.hangDetectMs = $sw.ElapsedMilliseconds
     if (Get-Process -Id $p2 -ErrorAction SilentlyContinue) { [void][WdChk.N]::NtResumeProcess($h); Stop-Process -Id $p2 -Force }

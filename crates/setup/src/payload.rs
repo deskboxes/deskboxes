@@ -171,30 +171,87 @@ pub fn program_bytes(exe: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// `deskboxes-setup --pack <dir> <out.exe>`: this program + every file under `dir`.
+///
+/// The files are read a chunk at a time and compressed on a few threads (LZMS is slow to
+/// compress, fast to decompress), at most two chunks per thread in hand at once; the compressed
+/// chunks go to a spool file in order, and are copied after the header once their sizes are
+/// known. Memory and threads stay the same whatever the size of the release.
 pub fn pack(dir: &Path, out: &Path, app_version: &str) -> std::io::Result<(usize, u64, u64)> {
     let mut paths = Vec::new();
     walk(dir, dir, &mut paths)?;
     paths.sort_by_key(|p| p.to_ascii_lowercase());
-    let mut files = Vec::new();
-    let mut stream = Vec::new();
-    for rel in &paths {
-        let data = std::fs::read(dir.join(rel))?;
-        files.push(FileEntry { path: rel.clone(), size: data.len() as u64 });
-        stream.extend_from_slice(&data);
-    }
-    // Compress the chunks in parallel (LZMS is slow to compress, fast to decompress).
-    let parts: Vec<&[u8]> = stream.chunks(CHUNK).collect();
-    let compressed: Vec<std::io::Result<Vec<u8>>> = std::thread::scope(|s| {
-        let hs: Vec<_> = parts.iter().map(|p| s.spawn(move || Compressor::new()?.compress(p))).collect();
-        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(std::io::Error::other("compressor thread panicked")))).collect()
-    });
-    let mut chunks = Vec::new();
-    let mut data = Vec::new();
-    for (p, c) in parts.iter().zip(compressed) {
-        let c = c?;
-        chunks.push(Chunk { clen: c.len() as u64, ulen: p.len() as u64, crc: crc32(p) });
-        data.extend_from_slice(&c);
-    }
+    let spool_path = out.with_extension("pack.tmp");
+    let r = pack_with(dir, &paths, out, &spool_path, app_version);
+    let _ = std::fs::remove_file(&spool_path);
+    r
+}
+
+fn pack_with(dir: &Path, paths: &[String], out: &Path, spool_path: &Path, app_version: &str) -> std::io::Result<(usize, u64, u64)> {
+    use std::sync::mpsc;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let in_hand = 2 * threads;
+    let mut reader = ChunkReader { dir, paths, ix: 0, cur: None, cur_size: 0, sizes: Vec::with_capacity(paths.len()) };
+    let mut spool = std::io::BufWriter::new(std::fs::File::create(spool_path)?);
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut data_len = 0u64;
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<u8>)>(in_hand);
+    let job_rx = std::sync::Mutex::new(job_rx);
+    let (res_tx, res_rx) = mpsc::channel::<(usize, u64, u32, std::io::Result<Vec<u8>>)>();
+    std::thread::scope(|s| -> std::io::Result<()> {
+        for _ in 0..threads {
+            let (job_rx, res_tx) = (&job_rx, res_tx.clone());
+            s.spawn(move || {
+                let c = Compressor::new();
+                loop {
+                    let job = job_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    let Ok((i, raw)) = job else { break };
+                    let r = match &c {
+                        Ok(c) => c.compress(&raw),
+                        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                    };
+                    if res_tx.send((i, raw.len() as u64, crc32(&raw), r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(res_tx);
+        let job_tx = job_tx;
+        let mut run = || -> std::io::Result<()> {
+            let (mut sent, mut written, mut read_all) = (0usize, 0usize, false);
+            let mut done: std::collections::BTreeMap<usize, (u64, u32, Vec<u8>)> = std::collections::BTreeMap::new();
+            loop {
+                while !read_all && sent - written < in_hand {
+                    match reader.next_chunk()? {
+                        Some(raw) => {
+                            job_tx.send((sent, raw)).map_err(|_| std::io::Error::other("compressor threads gone"))?;
+                            sent += 1;
+                        }
+                        None => read_all = true,
+                    }
+                }
+                if read_all && written == sent {
+                    return Ok(());
+                }
+                let (i, ulen, crc, c) = res_rx.recv().map_err(|_| std::io::Error::other("compressor thread panicked"))?;
+                done.insert(i, (ulen, crc, c?));
+                // In order, as far as they are done.
+                while let Some((ulen, crc, c)) = done.remove(&written) {
+                    spool.write_all(&c)?;
+                    data_len += c.len() as u64;
+                    chunks.push(Chunk { clen: c.len() as u64, ulen, crc });
+                    written += 1;
+                }
+            }
+        };
+        let r = run();
+        // (The compressor threads end once nothing more comes.)
+        drop(job_tx);
+        r
+    })?;
+    spool.flush()?;
+    drop(spool);
+    let files: Vec<FileEntry> = paths.iter().zip(&reader.sizes).map(|(p, n)| FileEntry { path: p.clone(), size: *n }).collect();
     let header = Header { app_version: app_version.to_string(), files, chunks };
     let h = serde_json::to_vec(&header).map_err(std::io::Error::other)?;
     let me = std::env::current_exe()?;
@@ -204,8 +261,11 @@ pub fn pack(dir: &Path, out: &Path, app_version: &str) -> std::io::Result<(usize
     let off = program.len() as u64;
     o.write_all(&(h.len() as u32).to_le_bytes())?;
     o.write_all(&h)?;
-    o.write_all(&data)?;
-    let plen = 4 + h.len() as u64 + data.len() as u64;
+    let copied = std::io::copy(&mut std::fs::File::open(spool_path)?, &mut o)?;
+    if copied != data_len {
+        return Err(std::io::Error::other("the spooled chunks changed"));
+    }
+    let plen = 4 + h.len() as u64 + data_len;
     o.write_all(MAGIC)?;
     o.write_all(&FORMAT.to_le_bytes())?;
     o.write_all(&0u32.to_le_bytes())?;
@@ -213,6 +273,41 @@ pub fn pack(dir: &Path, out: &Path, app_version: &str) -> std::io::Result<(usize
     o.write_all(&plen.to_le_bytes())?;
     o.flush()?;
     Ok((header.files.len(), header.total(), plen))
+}
+
+/// The files under a folder read as one stream, cut into `CHUNK`-byte chunks (the last one
+/// shorter); each file's size is what was read of it.
+struct ChunkReader<'a> {
+    dir: &'a Path,
+    paths: &'a [String],
+    ix: usize,
+    cur: Option<std::fs::File>,
+    cur_size: u64,
+    sizes: Vec<u64>,
+}
+
+impl ChunkReader<'_> {
+    fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
+        while buf.len() < CHUNK {
+            if self.cur.is_none() {
+                let Some(rel) = self.paths.get(self.ix) else { break };
+                self.cur = Some(std::fs::File::open(self.dir.join(rel))?);
+                self.cur_size = 0;
+            }
+            let want = CHUNK - buf.len();
+            let f = self.cur.as_mut().expect("a file open");
+            let n = f.take(want as u64).read_to_end(&mut buf)?;
+            self.cur_size += n as u64;
+            if n < want {
+                // The end of this file.
+                self.sizes.push(self.cur_size);
+                self.cur = None;
+                self.ix += 1;
+            }
+        }
+        Ok((!buf.is_empty()).then_some(buf))
+    }
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
@@ -296,4 +391,51 @@ pub fn crc32(data: &[u8]) -> u32 {
         c = t[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     !c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Files across chunk boundaries (empty ones, one larger than a chunk, one ending exactly on
+    /// one) packed and extracted again: every byte the same.
+    #[test]
+    fn pack_and_extract_round_trip() {
+        let base = std::env::temp_dir().join(format!("dbx-pack-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let mut x: u32 = 12345;
+        let mut bytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    if i % 7 == 0 { (x >> 16) as u8 } else { (i % 251) as u8 }
+                })
+                .collect()
+        };
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("a.bin", bytes(1000)),
+            ("b-empty.txt", vec![]),
+            ("c-big.bin", bytes(CHUNK + 12_345)),
+            ("d.bin", bytes(CHUNK - 12_345 - 1000 + CHUNK)),
+            (r"sub\e-empty.txt", vec![]),
+            (r"sub\f.bin", bytes(77)),
+        ];
+        for (p, b) in &files {
+            std::fs::write(src.join(p), b).unwrap();
+        }
+        let out = base.join("out.exe");
+        let (n, total, _) = pack(&src, &out, "9.9.9").unwrap();
+        assert_eq!(n, files.len());
+        assert_eq!(total, files.iter().map(|(_, b)| b.len() as u64).sum::<u64>());
+        assert!(!out.with_extension("pack.tmp").exists());
+        let pl = Payload::open(&out).unwrap().expect("a payload");
+        let dst = base.join("dst");
+        pl.extract(&dst, |p, b| std::fs::write(p, b), |_| {}).unwrap();
+        for (p, b) in &files {
+            assert_eq!(&std::fs::read(dst.join(p)).unwrap(), b, "{p}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

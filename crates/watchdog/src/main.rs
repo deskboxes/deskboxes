@@ -3,8 +3,9 @@
 //! `deskboxes-watchdog --launch [core args...]`
 //! - starts `deskboxes.exe --watchdog-pid <own pid> [core args]` next to itself,
 //! - exit code 0 from the core = clean exit (quit, "Disable Deskboxes"): the watchdog exits too,
-//! - crash, abnormal exit or a hang (no answer to WM_NULL within 6 s, checked every 3 s): native
-//!   icons are restored at once, then the core is restarted, at most 3 times in 60 s,
+//! - crash, abnormal exit or a hang (no answer to WM_NULL within 6 s twice in a row, checked every
+//!   3 s; while it starts, before its first answer, only after 90 s): native icons are restored at
+//!   once, then the core is restarted, at most 3 times in 60 s,
 //! - WM_CLOSE to its "DeskboxesWatchdog" window (sent by `deskboxes --restore-icons`): stop without
 //!   restarting.
 //! Log: %LOCALAPPDATA%\Deskboxes\logs\watchdog.log.
@@ -90,8 +91,18 @@ fn supervise(child: &mut std::process::Child) -> Outcome {
     let ph = HANDLE(child.as_raw_handle());
     let pid = child.id();
     let mut last_check = Instant::now();
+    const CHECK: Duration = Duration::from_secs(3);
+    // The core answers once its first frame is up: until then it is starting, not hung (on a slow
+    // PC at sign-in that took over 6 s, and the restart showed Explorer's icons first).
+    const STARTING: Duration = Duration::from_secs(90);
+    let started = Instant::now();
+    let mut answered = false;
+    let mut misses = 0u32;
     loop {
-        let r = unsafe { MsgWaitForMultipleObjects(Some(&[ph]), false, 500, QS_ALLINPUT) };
+        // Until the next heartbeat check (the core exiting and window messages wake it sooner);
+        // while the session ends there is none, only those.
+        let wait = if unsafe { ENDING } { CHECK } else { CHECK.saturating_sub(last_check.elapsed()) };
+        let r = unsafe { MsgWaitForMultipleObjects(Some(&[ph]), false, wait.as_millis() as u32, QS_ALLINPUT) };
         pump();
         if unsafe { STOP } {
             return Outcome::Stopped;
@@ -104,11 +115,25 @@ fn supervise(child: &mut std::process::Child) -> Outcome {
             return if code == 0 { Outcome::Clean } else { Outcome::Crashed(code) };
         }
         // (While the session ends the core is busy saving: not a hang.)
-        if last_check.elapsed() >= Duration::from_secs(3) && !unsafe { ENDING } {
+        if last_check.elapsed() >= CHECK && !unsafe { ENDING } {
             last_check = Instant::now();
             if let Some(h) = core_window(pid) {
                 let ok = unsafe { SendMessageTimeoutW(h, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 6000, None) };
-                if ok.0 == 0 {
+                if ok.0 != 0 {
+                    if !answered {
+                        log(&format!("core answered after {:.1} s", started.elapsed().as_secs_f64()));
+                    }
+                    answered = true;
+                    misses = 0;
+                } else if answered {
+                    // (Twice in a row: one long step, a big file operation's start, is not a hang.)
+                    misses += 1;
+                    log(&format!("core did not answer ({misses})"));
+                    if misses >= 2 {
+                        return Outcome::Hung;
+                    }
+                } else if started.elapsed() >= STARTING {
+                    log("core never answered while starting");
                     return Outcome::Hung;
                 }
             }
@@ -196,7 +221,7 @@ fn main() {
                 deskboxes_shell::hide::restore();
             }
             Outcome::Hung => {
-                log("core hung (no answer to WM_NULL within 6 s): terminating, restoring icons, restarting");
+                log("core hung (no answer to WM_NULL): terminating, restoring icons, restarting");
                 let _ = child.kill();
                 let _ = child.wait();
                 deskboxes_shell::hide::restore();

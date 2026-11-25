@@ -78,7 +78,7 @@ impl App {
                     let l2 = lw.clone();
                     let watch = deskboxes_shell::watch::watch_one(w.into(), move || {
                         if SHOWN.lock().map(|s| s.contains(&l2)).unwrap_or(false) {
-                            crate::events::post(crate::events::Ev::Rescan);
+                            crate::events::post(crate::events::Ev::DirChanged(l2.clone()));
                         }
                     });
                     watched.insert(lw, watch);
@@ -97,18 +97,28 @@ impl App {
         if !self.layout.boxes.iter().any(|b| b.is_folder()) {
             return;
         }
-        let mut by_dir: HashMap<String, Vec<&Item>> = HashMap::new();
-        for it in self.items.values().filter(|i| i.source == Source::Folder) {
-            by_dir.entry(parent_of(&it.parsing_name).to_lowercase()).or_default().push(it);
+        // Grouped and sorted once per change of the icons (a layout change that is not one, a
+        // box moved, only fills the tabs again).
+        if self.folder_sorted.0 != self.items_gen {
+            let mut by_dir: HashMap<String, Vec<&Item>> = HashMap::new();
+            for it in self.items.values().filter(|i| i.source == Source::Folder) {
+                by_dir.entry(parent_of(&it.parsing_name).to_lowercase()).or_default().push(it);
+            }
+            let sorted = by_dir
+                .into_iter()
+                .map(|(d, mut v)| {
+                    v.sort_by(|a, b| b.is_folder().cmp(&a.is_folder()).then_with(|| natural(&a.display_name, &b.display_name)));
+                    (d, v.into_iter().map(|i| i.key.clone()).collect())
+                })
+                .collect();
+            self.folder_sorted = (self.items_gen, sorted);
         }
-        for v in by_dir.values_mut() {
-            v.sort_by(|a, b| b.is_folder().cmp(&a.is_folder()).then_with(|| natural(&a.display_name, &b.display_name)));
-        }
+        let by_dir = &self.folder_sorted.1;
         let orders = &self.layout.folder_orders;
         for b in self.layout.boxes.iter_mut().filter(|b| b.is_folder()) {
             for ti in 0..b.tabs.len() {
                 let dir = b.tab_now(ti).trim_end_matches('\\').to_lowercase();
-                let mut keys: Vec<ItemKey> = by_dir.get(&dir).map(|v| v.iter().map(|i| i.key.clone()).collect()).unwrap_or_default();
+                let mut keys: Vec<ItemKey> = by_dir.get(&dir).cloned().unwrap_or_default();
                 // An order the user made by dragging (or a Sort by): items it has first, in
                 // its order; new ones after them, sorted.
                 if let Some(o) = orders.get(&dir) {
@@ -263,6 +273,14 @@ impl App {
     /// go there (locked, a folder box's files into another box), or a box shown by name (A–Z)
     /// or filtered by a search.
     pub fn box_room_order(&self, p: Pt, keys: &[ItemKey]) -> Option<(u32, Vec<ItemKey>)> {
+        let (id, at, ..) = self.box_room_slot(p, keys)?;
+        Some((id, self.box_room_build(id, at, keys)?))
+    }
+
+    /// Where `box_room_order` would put the dragged icons: the box, the index among its other
+    /// icons, and what that index was worked out from (the icons' generation, how many it
+    /// shows, its open tab): the order itself is made again only when one of these changes.
+    pub fn box_room_slot(&self, p: Pt, keys: &[ItemKey]) -> Option<(u32, usize, u64, usize, u32)> {
         let id = self.drop_box(p)?;
         let b = self.box_by_id(id)?;
         if b.az || !self.fully_open(b) || !self.search_query().trim().is_empty() || p.y < App::content_rect(b).y || keys.is_empty() {
@@ -281,7 +299,8 @@ impl App {
         }
         let tab = b.active()?;
         let shown = self.shown_items(b, tab);
-        let mut order: Vec<ItemKey> = shown.iter().filter(|k| !keys.contains(k)).cloned().collect();
+        let set: HashSet<&ItemKey> = keys.iter().collect();
+        let others = shown.iter().filter(|k| !set.contains(k)).count();
         let m = self.metrics(Some(b));
         let cols = self.box_cols(b);
         let c = App::content_rect(b);
@@ -289,15 +308,25 @@ impl App {
         let top = c.y + 2.0 - self.shown_scroll(b.id);
         let col = (((p.x - x0) / m.cell_w).floor().max(0.0) as usize).min(cols - 1);
         let row = ((p.y - top) / m.cell_h.max(1.0)).floor().max(0.0) as usize;
-        let at = (row * cols + col).min(order.len());
-        // Its own first, in its order; then ones coming from elsewhere.
-        let mut dragged: Vec<ItemKey> = shown.iter().filter(|k| keys.contains(k)).cloned().collect();
-        let incoming: Vec<ItemKey> = keys.iter().filter(|k| !dragged.contains(k)).cloned().collect();
-        dragged.extend(incoming);
-        for (n, k) in dragged.into_iter().enumerate() {
-            order.insert(at + n, k);
-        }
-        Some((id, order))
+        let at = (row * cols + col).min(others);
+        Some((id, at, self.items_gen, shown.len(), tab.id))
+    }
+
+    /// Box `id`'s order with the dragged icons at index `at` among the others: the others up to
+    /// there, the dragged ones (its own first, in its order; then ones coming from elsewhere),
+    /// the rest of the others. Made in one pass.
+    pub fn box_room_build(&self, id: u32, at: usize, keys: &[ItemKey]) -> Option<Vec<ItemKey>> {
+        let b = self.box_by_id(id)?;
+        let shown = self.shown_items(b, b.active()?);
+        let set: HashSet<&ItemKey> = keys.iter().collect();
+        let in_box: HashSet<&ItemKey> = shown.iter().collect();
+        let mut others = shown.iter().filter(|k| !set.contains(k)).cloned();
+        let mut order: Vec<ItemKey> = Vec::with_capacity(shown.len() + keys.len());
+        order.extend(others.by_ref().take(at));
+        order.extend(shown.iter().filter(|k| set.contains(k)).cloned());
+        order.extend(keys.iter().filter(|k| !in_box.contains(k)).cloned());
+        order.extend(others);
+        Some(order)
     }
 
     /// A folder box's Sort by: its open folder in that order from now on (name: as Explorer

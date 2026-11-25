@@ -79,6 +79,10 @@ pub fn note_switch(l: &mut MonitorLayout, was_screen: &str, was_page: u32) {
 pub fn pull_from_parked(l: &mut MonitorLayout, keys: &[ItemKey]) {
     let set: HashSet<&ItemKey> = keys.iter().collect();
     for c in l.parked.values_mut() {
+        if !c.holds_any(&set) {
+            continue;
+        }
+        let c = std::sync::Arc::make_mut(c);
         c.loose.retain(|k, _| !set.contains(k));
         c.homes.retain(|k, _| !set.contains(k));
         for b in c.boxes.iter_mut().filter(|b| !b.is_folder()) {
@@ -193,7 +197,7 @@ pub fn arrange(l: &mut MonitorLayout, present: &[Present]) -> Arranged {
         if !l.pages.iter().any(|p| p.screen == s.id) {
             let id = layout::alloc_id(l);
             l.pages.push(PageMeta { id, screen: s.id.clone(), ..Default::default() });
-            l.parked.insert(id, PageContent::default());
+            l.parked.insert(id, Default::default());
         }
         l.screens.insert(s.id.clone(), s.info.clone());
     }
@@ -263,7 +267,7 @@ mod tests {
     use crate::layout::{create_box, move_to_box, placed_keys, reconcile};
 
     fn keys(n: usize) -> Vec<ItemKey> {
-        (0..n).map(|i| ItemKey(format!("s:{i}"))).collect()
+        (0..n).map(|i| ItemKey(format!("s:{i}").into())).collect()
     }
     fn screen(id: &str, w: f32, h: f32, n: u32) -> Present {
         let work = Rect::new(0.0, 0.0, w, h - 48.0);

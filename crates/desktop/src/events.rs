@@ -66,6 +66,11 @@ pub fn watch_wallpaper(hwnd: HWND) {
 }
 
 pub enum Ev {
+    /// The update installer asked for from Settings: started (Deskboxes exits for it), or not.
+    Installing {
+        started: bool,
+        relaunch: bool,
+    },
     Scanned {
         items: Vec<Item>,
         icons: Vec<(u32, IconImage)>,
@@ -79,9 +84,12 @@ pub enum Ev {
     },
     /// Something changed on disk (watcher) or after one of our operations.
     Rescan,
-    HostReady(deskboxes_ipc::HostClient),
+    /// Something changed in this folder (its watcher): only it needs listing again.
+    DirChanged(String),
+    /// (With the host's number, `App::host_count`: one replaced since is let go.)
+    HostReady(u32, deskboxes_ipc::HostClient),
     HostMsg(serde_json::Value),
-    HostGone,
+    HostGone(u32),
     /// The updater's status changed (Settings shows it).
     Update,
     /// Explorer's tooltip text for an item (empty: none).
@@ -107,6 +115,15 @@ pub enum Ev {
     },
     /// Game covers read (see `covers`): Steam app id, its cover if there is one.
     Covers(Vec<(u32, Option<IconImage>)>),
+    /// Pictures are being made after a scan (true) or all are made (false): while they are,
+    /// the items in view are asked for first (`Req::PicturesFirst`).
+    PicturesPending(bool),
+    /// Pictures made after the scan that listed their items (`worker::spawn_pictures`):
+    /// (parsing name, its icon id now), and the new icons.
+    Pictures {
+        items: Vec<(String, u32)>,
+        icons: Vec<(u32, IconImage)>,
+    },
 }
 
 static QUEUE: Mutex<Vec<Ev>> = Mutex::new(Vec::new());

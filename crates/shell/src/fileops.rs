@@ -278,6 +278,9 @@ pub fn move_back(pairs: &[(String, String)], owner: isize, no_ui: bool) -> windo
 /// Returns what came back, with its identity now at its old place (`from`).
 pub fn restore(items: &[deskboxes_core::layout::FileMove]) -> Vec<deskboxes_core::layout::FileMove> {
     let mut out = vec![];
+    // The bin's records, read once per drive for all the items whose bin file is not known (not
+    // once per item).
+    let mut bins: BinIndex = std::collections::HashMap::new();
     for m in items {
         let orig = &m.from;
         let bin = if !m.to.is_empty() {
@@ -292,7 +295,7 @@ pub fn restore(items: &[deskboxes_core::layout::FileMove]) -> Vec<deskboxes_core
             }
             Some(r)
         } else {
-            find_in_bin(orig, m.id)
+            find_in_bin(&mut bins, orig, m.id)
         };
         let Some(r) = bin else {
             log::warn!("restore: {orig} is not in the Recycle Bin");
@@ -330,14 +333,29 @@ fn notify(back: &str, gone: &std::path::Path) {
     }
 }
 
+/// Each drive's Recycle Bin records (by drive, then by original path in ASCII lower case): the
+/// deletion time and the bin file of each.
+type BinIndex = std::collections::HashMap<String, std::collections::HashMap<String, Vec<(u64, std::path::PathBuf)>>>;
+
 /// The file in this user's Recycle Bin on `orig`'s drive deleted from `orig` that is file `id`
-/// (unknown: the newest deleted from there): read from the bin's records ($I files: version,
-/// size, deletion time, then the original path).
-fn find_in_bin(orig: &str, id: Option<deskboxes_core::layout::FileId>) -> Option<std::path::PathBuf> {
-    let drive: String = orig.chars().take(3).collect();
-    let root = std::path::Path::new(&drive).join("$Recycle.Bin");
-    let mut best: Option<(u64, std::path::PathBuf)> = None;
-    for sid in std::fs::read_dir(&root).ok()?.flatten() {
+/// (unknown: the newest deleted from there, still there).
+fn find_in_bin(bins: &mut BinIndex, orig: &str, id: Option<deskboxes_core::layout::FileId>) -> Option<std::path::PathBuf> {
+    let drive: String = orig.chars().take(3).collect::<String>().to_ascii_lowercase();
+    let recs = bins.entry(drive.clone()).or_insert_with(|| read_bin(&drive));
+    recs.get(&orig.to_ascii_lowercase())?
+        .iter()
+        .filter(|(_, r)| r.exists() && id.map(|i| crate::items::file_id(&r.to_string_lossy()) == Some(i)).unwrap_or(true))
+        .max_by_key(|(when, _)| *when)
+        .map(|(_, r)| r.clone())
+}
+
+/// A drive's Recycle Bin records ($I files: version, size, deletion time, then the original
+/// path), each read once.
+fn read_bin(drive: &str) -> std::collections::HashMap<String, Vec<(u64, std::path::PathBuf)>> {
+    let mut out: std::collections::HashMap<String, Vec<(u64, std::path::PathBuf)>> = std::collections::HashMap::new();
+    let root = std::path::Path::new(drive).join("$Recycle.Bin");
+    let Ok(sids) = std::fs::read_dir(&root) else { return out };
+    for sid in sids.flatten() {
         let Ok(files) = std::fs::read_dir(sid.path()) else { continue };
         for f in files.flatten() {
             let name = f.file_name().to_string_lossy().into_owned();
@@ -346,20 +364,17 @@ fn find_in_bin(orig: &str, id: Option<deskboxes_core::layout::FileId>) -> Option
             if b.len() < 28 {
                 continue;
             }
-            let ver = u64::from_le_bytes(b[0..8].try_into().ok()?);
-            let when = u64::from_le_bytes(b[16..24].try_into().ok()?);
+            let ver = u64::from_le_bytes(b[0..8].try_into().unwrap_or_default());
+            let when = u64::from_le_bytes(b[16..24].try_into().unwrap_or_default());
             let path: Vec<u16> = if ver >= 2 {
                 b[28..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
             } else {
                 b[24..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
             };
             let end = path.iter().position(|c| *c == 0).unwrap_or(path.len());
-            let p = String::from_utf16_lossy(&path[..end]);
-            let r = sid.path().join(format!("$R{rest}"));
-            if p.eq_ignore_ascii_case(orig) && r.exists() && id.map(|i| crate::items::file_id(&r.to_string_lossy()) == Some(i)).unwrap_or(true) && best.as_ref().map(|(t, _)| when > *t).unwrap_or(true) {
-                best = Some((when, r));
-            }
+            let p = String::from_utf16_lossy(&path[..end]).to_ascii_lowercase();
+            out.entry(p).or_default().push((when, sid.path().join(format!("$R{rest}"))));
         }
     }
-    best.map(|(_, p)| p)
+    out
 }

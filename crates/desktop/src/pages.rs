@@ -1220,7 +1220,7 @@ impl App {
             }
         }
         if let Some(rest) = cmd.strip_prefix("dbx.pageitems:") {
-            let keys = self.sel.ordered(&self.order());
+            let keys = self.selected_in_order();
             if keys.is_empty() {
                 return;
             }

@@ -5,7 +5,13 @@
   1,000 items: cold start, 5 warm starts (first paint, reconciliation, memory), then an interactive
   run with 2 boxes + a tab pair: idle CPU (core + shell host), right-click -> menu visible with 1
   and with 100 items selected, file created / renamed on disk -> item shown.
-  2,000 items: rubber-band drags with draw time per frame and the interval between frames.
+  2,000 items: rubber-band drags with draw time per frame and the interval between frames, the
+  whole frame's CPU time (every screen) and the time from an input reaching the window to the end
+  of the frame that showed it (p50/p95/p99; presenting is not in it: a graphics trace measures that).
+
+  Only the processes it started are found, closed and stopped (by their ids), on one screen
+  (--one-screen). -WindowOnly leaves out the desktop-mode runs, and then measures beside a
+  Deskboxes that is already running.
 
   Runs the app NON-elevated (run-as-user). Input goes only to the app's own test window and to
   its menus. No screenshots. Removes the fixture afterwards (unless -KeepFixture).
@@ -13,7 +19,8 @@
 #>
 param(
     [ValidateSet('release', 'debug')][string]$Config = 'release',
-    [switch]$KeepFixture
+    [switch]$KeepFixture,
+    [switch]$WindowOnly
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -38,6 +45,16 @@ public static class PerfHelp {
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
+    /// The core's own window of process pid (not another Deskboxes running beside the test).
+    public static IntPtr CoreWindow(int pid) {
+        IntPtr h = IntPtr.Zero;
+        while ((h = FindWindowExW(IntPtr.Zero, h, "DeskboxesCore", null)) != IntPtr.Zero) {
+            uint p; GetWindowThreadProcessId(h, out p);
+            if (p == pid) return h;
+        }
+        return IntPtr.Zero;
+    }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     /// Visible menu windows of the shell host (WinUI popup bridges or classic #32768), larger than a stub.
     public static int Popups(int pid) {
@@ -90,17 +107,38 @@ public static class PerfHelp {
 '@
 
 $results = [ordered]@{}
+# The processes this run started (only these are found, closed and stopped).
+$script:own = New-Object 'System.Collections.Generic.List[int]'
+function Pids([string]$name) { @(Get-Process $name -ErrorAction SilentlyContinue | ForEach-Object Id) }
+function Find-New([string]$name, [int[]]$before, [int]$ms = 5000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        $p = Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id } | Select-Object -First 1
+        if ($p) { $script:own.Add($p.Id); return $p }
+        Start-Sleep -Milliseconds 20
+    }
+    $null
+}
+# The shell host the core `$p` started.
+function Host-Of($p, [int]$ms = 15000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        $c = Get-CimInstance Win32_Process -Filter "Name='deskboxes-shellhost.exe' AND ParentProcessId=$($p.Id)" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($c) { $h = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue; if ($h) { $script:own.Add($h.Id); return $h } }
+        Start-Sleep -Milliseconds 200
+    }
+    $null
+}
 function Note($k, $v) { $script:results[$k] = $v; Write-Host ("{0,-30} {1}" -f $k, ($v | ConvertTo-Json -Compress -Depth 4)) }
 function Step([string]$m) { Write-Host ("[{0:HH:mm:ss.fff}] {1}" -f (Get-Date), $m) }
 function Median([double[]]$v) { $s = @($v | Sort-Object); if (-not $s.Count) { return $null }; $s[[int][math]::Floor(($s.Count - 1) / 2)] }
 
 function Start-Core([string[]]$extra = @()) {
     Remove-Item $scene -ErrorAction SilentlyContinue
-    $a = @('--desktop-dir', $fx, '--window', '--profile', $prof, '--scene-out', $scene, '--no-ui-ops') + $extra
+    $a = @('--desktop-dir', $fx, '--window', '--one-screen', '--profile', $prof, '--scene-out', $scene, '--no-ui-ops') + $extra
+    $before = Pids deskboxes
     & $runAs --no-wait -- $Exe @a | Out-Null
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $p = $null
-    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 20; $p = Get-Process deskboxes -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    $p
+    Find-New deskboxes $before
 }
 function Get-Scene { for ($i = 0; $i -lt 20; $i++) { try { return (Get-Content $scene -Raw -Encoding utf8 | ConvertFrom-Json) } catch { Start-Sleep -Milliseconds 50 } }; $null }
 function Wait-Scene([scriptblock]$cond, [int]$ms = 8000) {
@@ -109,7 +147,7 @@ function Wait-Scene([scriptblock]$cond, [int]$ms = 8000) {
     Get-Scene
 }
 function Stop-Core($p) {
-    $core = [TestInput]::FindWindowW('DeskboxesCore', [NullString]::Value)
+    $core = [PerfHelp]::CoreWindow($p.Id)
     if ($core -ne [IntPtr]::Zero) { [TestInput]::PostMessageW($core, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
     if (-not $p.WaitForExit(8000)) { $p.Kill(); return 'killed' }
     'clean'
@@ -126,9 +164,9 @@ function Run-Timed([string]$name, [int]$exitAfter = 1500) {
 $dprof = "$prof-desk"
 function Run-Desktop([string]$name) {
     $st = Join-Path $dprof "$name.json"
-    & $runAs --no-wait -- $Exe --desktop-dir $fx --profile $dprof --no-host --exit-after 1500 --stats-out $st | Out-Null
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $p = $null
-    while (-not $p -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 20; $p = Get-Process deskboxes -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    $before = Pids deskboxes
+    & $runAs --no-wait -- $Exe --desktop-dir $fx --profile $dprof --no-host --one-screen --exit-after 1500 --stats-out $st | Out-Null
+    $p = Find-New deskboxes $before
     if ($p -and -not $p.WaitForExit(30000)) { $p.Kill() }
     $state = (& $hideTool state 2>&1) -join ' '
     if ($state -notmatch 'lv_visible=true') { & $runAs -- $Exe --restore-icons | Out-Null; $state = 'RESTORED BY --restore-icons: ' + ((& $hideTool state 2>&1) -join ' ') }
@@ -179,7 +217,8 @@ Note 'machine' ([ordered]@{
         ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
         gpu = $gpu; config = $Config
     })
-if (Get-Process deskboxes, deskboxes-watchdog -ErrorAction SilentlyContinue) { throw 'a Deskboxes process is already running' }
+# (Desktop mode would meet a Deskboxes already on the desktop: -WindowOnly measures beside one.)
+if (-not $WindowOnly -and (Get-Process deskboxes, deskboxes-watchdog -ErrorAction SilentlyContinue)) { throw 'a Deskboxes process is already running (-WindowOnly measures beside it)' }
 
 $created = @()
 try {
@@ -197,16 +236,17 @@ try {
             medianWorkingSetMb = [math]::Round((Median $warm.working_set_mb), 1)
         })
 
-    $dc = Run-Desktop 'desk-cold'; $dw = @(1..3 | ForEach-Object { Run-Desktop "desk-warm$_" })
-    Note 'n1000.desktopMode' ([ordered]@{ cold = $dc; warm = $dw; medianWarmFirstPaintMs = (Median $dw.firstPaintMs); medianWarmPrivateMb = (Median $dw.privateMb) })
+    if (-not $WindowOnly) {
+        $dc = Run-Desktop 'desk-cold'; $dw = @(1..3 | ForEach-Object { Run-Desktop "desk-warm$_" })
+        Note 'n1000.desktopMode' ([ordered]@{ cold = $dc; warm = $dw; medianWarmFirstPaintMs = (Median $dw.firstPaintMs); medianWarmPrivateMb = (Median $dw.privateMb) })
+    }
 
     # ---- 1,000 items: interactive (boxes, host) -------------------------------------------------
     Seed-Layout 600
     $st = Join-Path $prof 'interactive.json'
     $p = Start-Core @('--stats-out', $st)
     $s = Wait-Scene { param($s) $s.boxes.Count -eq 2 } 15000
-    $sw = [Diagnostics.Stopwatch]::StartNew(); $hostP = $null
-    while (-not $hostP -and $sw.ElapsedMilliseconds -lt 15000) { Start-Sleep -Milliseconds 200; $hostP = Get-Process deskboxes-shellhost -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    $hostP = Host-Of $p
     Start-Sleep -Seconds 4   # host prewarm, reconciliation, settle
     $procs = @($p, $hostP) | Where-Object { $_ }
     $c0 = ($procs | ForEach-Object { $_.Refresh(); $_.TotalProcessorTime.TotalMilliseconds } | Measure-Object -Sum).Sum
@@ -317,8 +357,10 @@ try {
     New-Fixture 2000
     $cold2 = Run-Timed 'cold2000' 2500
     Note 'n2000.cold' ([ordered]@{ firstPaintMs = $cold2.first_paint_ms; reconcileMs = $cold2.reconcile_ms; items = $cold2.items; privateMb = $cold2.private_mb })
-    $dc2 = Run-Desktop 'desk2000-cold'; $dw2 = Run-Desktop 'desk2000-warm'
-    Note 'n2000.desktopMode' ([ordered]@{ cold = $dc2; warm = $dw2 })
+    if (-not $WindowOnly) {
+        $dc2 = Run-Desktop 'desk2000-cold'; $dw2 = Run-Desktop 'desk2000-warm'
+        Note 'n2000.desktopMode' ([ordered]@{ cold = $dc2; warm = $dw2 })
+    }
     Seed-Layout 1200
     $st = Join-Path $prof 'rubber.json'
     $p = Start-Core @('--stats-out', $st, '--no-host')
@@ -340,10 +382,12 @@ try {
     Note 'n2000.rubber.exit' (Stop-Core $p)
     $sr = Get-Content $st -Raw | ConvertFrom-Json
     Note 'n2000.rubber' ([ordered]@{ frames = $sr.drag_frames; drawMsP50 = $sr.drag_draw_ms_p50; drawMsP95 = $sr.drag_draw_ms_p95; drawMsMax = $sr.drag_draw_ms_max; intervalMsP50 = $sr.drag_interval_ms_p50; intervalMsP95 = $sr.drag_interval_ms_p95; intervalMsMax = $sr.drag_interval_ms_max; privateMb = $sr.private_mb })
+    Note 'n2000.frames' ([ordered]@{ screens = $sr.screens; frames = $sr.frame_count; frameMsP50 = $sr.frame_ms_p50; frameMsP95 = $sr.frame_ms_p95; frameMsP99 = $sr.frame_ms_p99; frameMsMax = $sr.frame_ms_max; inputs = $sr.input_count; inputToFrameMsP50 = $sr.input_ms_p50; inputToFrameMsP95 = $sr.input_ms_p95; inputToFrameMsP99 = $sr.input_ms_p99; inputToFrameMsMax = $sr.input_ms_max })
 }
 finally {
     [TestInput]::Allowed.Clear(); [void][TestInput]::Allowed.Add(-1)   # refuse all input from here on
-    Get-Process deskboxes, deskboxes-shellhost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Only what this run started (a Deskboxes running beside it is left alone).
+    foreach ($id in $script:own) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
     foreach ($f in $created) { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
     if (-not $KeepFixture -and (Test-Path "$fx.fixture.json")) { & $gen remove $fx | Write-Host }
     Remove-Item $prof -Recurse -Force -ErrorAction SilentlyContinue

@@ -57,11 +57,13 @@ pub fn switch_to(l: &mut MonitorLayout, id: u32) -> bool {
     if id == l.page {
         return true;
     }
-    let Some(mut next) = l.parked.remove(&id) else { return false };
+    let Some(next) = l.parked.remove(&id) else { return false };
+    // (Copied only if an undo step shares it.)
+    let mut next = std::sync::Arc::unwrap_or_clone(next);
     std::mem::swap(&mut next.boxes, &mut l.boxes);
     std::mem::swap(&mut next.loose, &mut l.loose);
     std::mem::swap(&mut next.homes, &mut l.homes);
-    l.parked.insert(l.page, next);
+    l.parked.insert(l.page, std::sync::Arc::new(next));
     l.page = id;
     true
 }
@@ -89,7 +91,7 @@ pub fn new_page(l: &mut MonitorLayout, name: &str, at: Option<usize>) -> u32 {
         None => mine.last().and_then(|last| l.pages.iter().position(|p| p.id == *last)).map(|i| i + 1).unwrap_or(l.pages.len()),
     };
     l.pages.insert(at, PageMeta { id, name: name.trim().to_string(), screen, home: String::new() });
-    l.parked.insert(id, PageContent::default());
+    l.parked.insert(id, Default::default());
     id
 }
 
@@ -142,7 +144,7 @@ pub fn delete(l: &mut MonitorLayout, id: u32, g: &Grid) -> Option<u32> {
     if l.page == id {
         switch_to(l, to);
     }
-    let content = l.parked.remove(&id)?;
+    let content = std::sync::Arc::unwrap_or_clone(l.parked.remove(&id)?);
     l.pages.retain(|p| p.id != id);
     with_page(l, to, |l| absorb(l, content, g));
     Some(to)
@@ -158,7 +160,7 @@ pub fn merge_all(l: &mut MonitorLayout, g: &Grid) -> bool {
     let others: Vec<u32> = ids(l).into_iter().skip(1).collect();
     for id in others {
         if let Some(c) = l.parked.remove(&id) {
-            absorb(l, c, g);
+            absorb(l, std::sync::Arc::unwrap_or_clone(c), g);
         }
         l.pages.retain(|p| p.id != id);
     }
@@ -295,7 +297,7 @@ mod tests {
     use crate::layout::{create_box, move_to_box, place_of, placed_keys, reconcile};
 
     fn keys(n: usize) -> Vec<ItemKey> {
-        (0..n).map(|i| ItemKey(format!("p:{i}"))).collect()
+        (0..n).map(|i| ItemKey(format!("p:{i}").into())).collect()
     }
     fn grid() -> Grid {
         Grid::new(Rect::new(0.0, 0.0, 750.0, 500.0), 75.0, 100.0) // 10 x 5

@@ -341,42 +341,99 @@ impl Gpu {
     pub fn shadowed_label(&self, l: &TextLayout, w: f32, h: f32, scale: f32, _text: Color) -> R<Bitmap> {
         let m = LABEL_MARGIN;
         let (pw, ph) = (((w + 2.0 * m) * scale).ceil() as u32, ((h + 2.0 * m) * scale).ceil() as u32);
-        let sc = Matrix3x2 {
-            M11: scale,
-            M12: 0.0,
-            M21: 0.0,
-            M22: scale,
-            M31: 0.0,
-            M32: 0.0,
-        };
-        let id = Matrix3x2 {
-            M11: 1.0,
-            M12: 0.0,
-            M21: 0.0,
-            M22: 1.0,
-            M31: 0.0,
-            M32: 0.0,
-        };
-        let cl = unsafe {
+        let cl = self.texts_list(&[(l, 0.0, 0.0)], scale)?;
+        self.shadow_picture(&cl, pw, ph, scale)
+    }
+
+    /// The shadows of many labels at once (`shadowed_label`'s, each the same): drawn side by side
+    /// into shared pictures, a few effects and one render for all of them instead of for each
+    /// (the first frame of a desktop with 779 labels spent 112 of 126 ms on its labels' shadows,
+    /// 610 of 620 on a slow CPU). In the order given; (layout, `w`, `h` DIPs).
+    pub fn shadowed_labels(&self, items: &[(TextLayout, f32, f32)], scale: f32) -> R<Vec<Shadow>> {
+        // Pages of at most 2048 x 2048 px (a texture any device takes), the labels in rows with
+        // room between them so no blur reaches the next (the glow's blur: about 7.5 DIPs).
+        const PAGE: u32 = 2048;
+        let m = LABEL_MARGIN;
+        let gap = (8.0 * scale).ceil() as u32;
+        let mut out = Vec::with_capacity(items.len());
+        let mut i = 0;
+        while i < items.len() {
+            let (mut x, mut y, mut row_h, mut page_w) = (0u32, 0u32, 0u32, 0u32);
+            let mut placed: Vec<(usize, u32, u32, u32, u32)> = vec![];
+            while i < items.len() {
+                let (_, w, h) = &items[i];
+                let (pw, ph) = (((w + 2.0 * m) * scale).ceil() as u32, ((h + 2.0 * m) * scale).ceil() as u32);
+                if pw > PAGE || ph > PAGE {
+                    break;
+                }
+                if x > 0 && x + pw > PAGE {
+                    x = 0;
+                    y += row_h + gap;
+                    row_h = 0;
+                }
+                if y + ph > PAGE {
+                    break;
+                }
+                placed.push((i, x, y, pw, ph));
+                x += pw + gap;
+                row_h = row_h.max(ph);
+                page_w = page_w.max(x - gap);
+                i += 1;
+            }
+            if placed.is_empty() {
+                // Larger than a page: a picture of its own.
+                let (l, w, h) = &items[i];
+                let b = self.shadowed_label(l, *w, *h, scale, Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 })?;
+                let sz = unsafe { b.GetPixelSize() };
+                out.push(Shadow { bmp: b, src: rect(0.0, 0.0, sz.width as f32, sz.height as f32) });
+                i += 1;
+                continue;
+            }
+            let texts: Vec<(&TextLayout, f32, f32)> = placed.iter().map(|&(j, x, y, ..)| (&items[j].0, x as f32, y as f32)).collect();
+            let cl = self.texts_list(&texts, scale)?;
+            let page = self.shadow_picture(&cl, page_w, y + row_h, scale)?;
+            for &(_, x, y, pw, ph) in &placed {
+                out.push(Shadow { bmp: page.clone(), src: rect(x as f32, y as f32, pw as f32, ph as f32) });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Labels' glyphs in black as a command list: each at `LABEL_MARGIN` DIPs inside its place,
+    /// whose top-left is (x, y) px.
+    fn texts_list(&self, texts: &[(&TextLayout, f32, f32)], scale: f32) -> R<ID2D1CommandList> {
+        let m = LABEL_MARGIN;
+        unsafe {
             let cl = self.rdc.CreateCommandList()?;
             self.rdc.SetTarget(&cl);
             self.rdc.BeginDraw();
-            self.rdc.SetTransform(&sc);
-            let r = draw_text(&self.rdc, l, m, m, Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 });
+            let mut r = Ok(());
+            for (l, x, y) in texts {
+                self.rdc.SetTransform(&Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: *x, M32: *y });
+                r = draw_text(&self.rdc, l, m, m, Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 });
+                if r.is_err() {
+                    break;
+                }
+            }
             let e = self.rdc.EndDraw(None, None);
             self.rdc.SetTarget(None);
-            self.rdc.SetTransform(&id);
+            self.rdc.SetTransform(&Matrix3x2::identity());
             r?;
             e?;
             cl.Close()?;
-            cl
-        };
+            Ok(cl)
+        }
+    }
+
+    /// The shadow of the glyphs in `cl`, as a `pw` x `ph` px picture.
+    fn shadow_picture(&self, cl: &ID2D1CommandList, pw: u32, ph: u32, scale: f32) -> R<Bitmap> {
+        let id = Matrix3x2::identity();
         // Blurred copies of the glyphs in black; `gain` > 1 strengthens the blur's core (the
         // alpha is scaled and clamped), which gives Explorer's dark edge right at the strokes.
         let shadow = |sigma: f32, gain: f32| -> R<ID2D1Image> {
             unsafe {
                 let fx = self.rdc.CreateEffect(&CLSID_D2D1Shadow)?;
-                fx.SetInput(0, &cl, true);
+                fx.SetInput(0, cl, true);
                 fx.SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32, D2D1_PROPERTY_TYPE_FLOAT, &(sigma * scale).to_le_bytes())?;
                 let c: Vec<u8> = [0.0f32, 0.0, 0.0, 1.0].iter().flat_map(|f| f.to_le_bytes()).collect();
                 fx.SetValue(D2D1_SHADOW_PROP_COLOR.0 as u32, D2D1_PROPERTY_TYPE_VECTOR4, &c)?;
@@ -692,8 +749,39 @@ pub fn draw_frosted(dc: &ID2D1DeviceContext, icon: &Bitmap, dst: RectF, backdrop
     }
 }
 
+/// A solid brush of color `c` for `dc`. Kept per drawing context and color (a frame fills and
+/// writes with a few dozen colors, and made one brush per rectangle and label): the brushes
+/// handed out are never changed, so two in use at once are two brushes.
 pub fn brush(dc: &ID2D1DeviceContext, c: Color) -> R<ID2D1SolidColorBrush> {
-    unsafe { dc.CreateSolidColorBrush(&c, None) }
+    type Kept = Vec<(ID2D1DeviceContext, std::collections::HashMap<[u32; 4], ID2D1SolidColorBrush>)>;
+    thread_local! {
+        static KEPT: std::cell::RefCell<Kept> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()];
+    KEPT.with(|k| {
+        let mut k = k.borrow_mut();
+        // (The context is held: a new one can't be made at the address of one kept here.)
+        let i = match k.iter().position(|(d, _)| d.as_raw() == dc.as_raw()) {
+            Some(i) => i,
+            None => {
+                if k.len() >= 4 {
+                    k.remove(0);
+                }
+                k.push((dc.clone(), std::collections::HashMap::new()));
+                k.len() - 1
+            }
+        };
+        let m = &mut k[i].1;
+        if let Some(b) = m.get(&key) {
+            return Ok(b.clone());
+        }
+        if m.len() >= 512 {
+            m.clear();
+        }
+        let b = unsafe { dc.CreateSolidColorBrush(&c, None)? };
+        m.insert(key, b.clone());
+        Ok(b)
+    })
 }
 
 pub fn fill_round(dc: &ID2D1DeviceContext, r: RectF, radius: f32, c: Color) -> R<()> {
@@ -765,6 +853,21 @@ pub fn draw_bitmap_round(dc: &ID2D1DeviceContext, b: &Bitmap, dst: RectF, radius
 
 pub fn draw_bitmap(dc: &ID2D1DeviceContext, b: &Bitmap, dst: RectF, opacity: f32) {
     unsafe { dc.DrawBitmap(b, Some(&dst), opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None) }
+}
+
+/// A label's shadow (`Gpu::shadowed_labels`): its part, in px, of a picture it may share with
+/// other labels' shadows.
+#[derive(Clone)]
+pub struct Shadow {
+    pub bmp: Bitmap,
+    pub src: RectF,
+}
+
+/// A label's shadow under the label at (`x`, `y`) DIPs (its picture has `LABEL_MARGIN` around it).
+pub fn draw_shadow(dc: &ID2D1DeviceContext, s: &Shadow, x: f32, y: f32, scale: f32, opacity: f32) {
+    let m = LABEL_MARGIN;
+    let dst = rect(x - m, y - m, (s.src.right - s.src.left) / scale, (s.src.bottom - s.src.top) / scale);
+    unsafe { dc.DrawBitmap(&s.bmp, Some(&dst), opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, Some(&s.src), None) }
 }
 
 thread_local! {

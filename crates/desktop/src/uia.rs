@@ -32,11 +32,45 @@ struct Node {
     rect: [f64; 4],
 }
 
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone)]
 struct Tree {
     name: String,
     nodes: Vec<Node>,
     focus: Option<String>,
+    /// Each node by its key.
+    index: HashMap<String, usize>,
+    /// The children of each parent (None: the window's: boxes, then desktop icons), in order.
+    kids: HashMap<Option<String>, Vec<usize>>,
+    /// Each node's place among its parent's children.
+    pos: Vec<usize>,
+}
+
+impl Tree {
+    fn new(name: String, nodes: Vec<Node>) -> Tree {
+        let mut index = HashMap::with_capacity(nodes.len());
+        let mut kids: HashMap<Option<String>, Vec<usize>> = HashMap::new();
+        let mut pos = Vec::with_capacity(nodes.len());
+        for (i, n) in nodes.iter().enumerate() {
+            index.entry(n.key.clone()).or_insert(i);
+            let list = kids.entry(Self::parent_key(n)).or_default();
+            pos.push(list.len());
+            list.push(i);
+        }
+        Tree { name, nodes, focus: None, index, kids, pos }
+    }
+
+    /// The parent a node is listed under: a box's is the window, an icon's its box (or the window).
+    fn parent_key(n: &Node) -> Option<String> {
+        if n.group {
+            None
+        } else {
+            n.parent.clone()
+        }
+    }
+
+    fn node(&self, key: &str) -> Option<&Node> {
+        self.index.get(key).map(|&i| &self.nodes[i])
+    }
 }
 
 /// Each surface window's tree.
@@ -45,6 +79,11 @@ static TREES: Mutex<Option<HashMap<isize, Tree>>> = Mutex::new(None);
 fn with_tree<T>(hwnd: isize, f: impl FnOnce(&Tree) -> T) -> Option<T> {
     let g = TREES.lock().unwrap_or_else(|p| p.into_inner());
     g.as_ref()?.get(&hwnd).map(f)
+}
+
+thread_local! {
+    /// What each window's tree was last made from (`update`): the same, nothing is made again.
+    static MADE_FROM: std::cell::RefCell<HashMap<isize, u64>> = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Keep the copy of what the screen in use shows; tell a screen reader where the focus went.
@@ -57,22 +96,42 @@ pub fn update(app: &App) {
         let _ = ClientToScreen(app.hwnd, &mut o);
     }
     let s = app.scale as f64;
-    let px = |r: Rect| [o.x as f64 + r.x as f64 * s, o.y as f64 + r.y as f64 * s, r.w as f64 * s, r.h as f64 * s];
-    let mut nodes: Vec<Node> = app.layout.boxes.iter().map(|b| Node { key: format!("b{}", b.id), parent: None, name: b.title().to_string(), group: true, rect: px(b.rect) }).collect();
-    for (k, r, bx) in app.visible_cells() {
-        let Some(it) = app.items.get(&k) else { continue };
-        nodes.push(Node { key: k.0.clone(), parent: bx.map(|id| format!("b{id}")), name: it.display_name.clone(), group: false, rect: px(r) });
-    }
-    let focus = app.sel.focus.as_ref().map(|k| k.0.clone()).filter(|f| nodes.iter().any(|n| &n.key == f));
-    let tree = Tree { name: "Deskboxes".into(), nodes, focus: focus.clone() };
     let h = app.hwnd.0 as isize;
+    let cells = app.visible_cells();
+    // What the tree is made from (where the window is, its scale, the boxes' places and titles,
+    // the icons in view and where, their names' generation, the focus): every frame of a fade or
+    // a hover is the same, and nothing is made or compared then.
+    let from = {
+        use std::hash::{Hash, Hasher};
+        let mut x = std::collections::hash_map::DefaultHasher::new();
+        (o.x, o.y, app.scale.to_bits(), app.items_gen).hash(&mut x);
+        for b in &app.layout.boxes {
+            (b.id, b.rect.x.to_bits(), b.rect.y.to_bits(), b.rect.w.to_bits(), b.rect.h.to_bits(), b.title()).hash(&mut x);
+        }
+        for (k, r, bx) in &cells {
+            (k, r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits(), bx).hash(&mut x);
+        }
+        app.sel.focus.hash(&mut x);
+        x.finish()
+    };
+    if MADE_FROM.with(|m| m.borrow_mut().insert(h, from) == Some(from)) && with_tree(h, |_| ()).is_some() {
+        return;
+    }
+    let px = |r: Rect| [o.x as f64 + r.x as f64 * s, o.y as f64 + r.y as f64 * s, r.w as f64 * s, r.h as f64 * s];
+    let mut nodes: Vec<Node> = Vec::with_capacity(app.layout.boxes.len() + cells.len());
+    nodes.extend(app.layout.boxes.iter().map(|b| Node { key: format!("b{}", b.id), parent: None, name: b.title().to_string(), group: true, rect: px(b.rect) }));
+    for (k, r, bx) in cells {
+        let Some(it) = app.items.get(&k) else { continue };
+        nodes.push(Node { key: k.0.to_string(), parent: bx.map(|id| format!("b{id}")), name: it.display_name.clone(), group: false, rect: px(r) });
+    }
+    let mut tree = Tree::new("Deskboxes".into(), nodes);
+    let focus = app.sel.focus.as_ref().map(|k| k.0.to_string()).filter(|f| tree.index.contains_key(f));
+    tree.focus = focus.clone();
     let moved = {
         let mut g = TREES.lock().unwrap_or_else(|p| p.into_inner());
         let m = g.get_or_insert_with(HashMap::new);
         let was = m.get(&h).and_then(|t| t.focus.clone());
-        if m.get(&h) != Some(&tree) {
-            m.insert(h, tree);
-        }
+        m.insert(h, tree);
         was != focus
     };
     if let (true, Some(f)) = (moved, focus) {
@@ -85,6 +144,7 @@ pub fn update(app: &App) {
 
 /// The window is gone: its tree too.
 pub fn forget(hwnd: HWND) {
+    MADE_FROM.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize)));
     let mut g = TREES.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(m) = g.as_mut() {
         m.remove(&(hwnd.0 as isize));
@@ -112,26 +172,13 @@ fn none<T>() -> windows::core::Result<T> {
 }
 
 impl Elem {
-    fn node(&self) -> Option<Node> {
+    /// What `f` reads of this element's node (None: the window, or a node gone since).
+    fn with_node<T>(&self, f: impl FnOnce(&Tree, &Node) -> T) -> Option<T> {
         let k = self.key.as_ref()?;
-        with_tree(self.hwnd, |t| t.nodes.iter().find(|n| &n.key == k).cloned()).flatten()
+        with_tree(self.hwnd, |t| t.node(k).map(|n| f(t, n))).flatten()
     }
     fn make(&self, key: Option<String>) -> IRawElementProviderFragment {
         Elem { hwnd: self.hwnd, key }.into()
-    }
-    /// The keys of the children of `parent` (None: the window's: boxes, then desktop icons).
-    fn children(&self, parent: Option<&str>) -> Vec<String> {
-        with_tree(self.hwnd, |t| {
-            t.nodes
-                .iter()
-                .filter(|n| match parent {
-                    None => n.group || n.parent.is_none(),
-                    Some(p) => !n.group && n.parent.as_deref() == Some(p),
-                })
-                .map(|n| n.key.clone())
-                .collect()
-        })
-        .unwrap_or_default()
     }
 }
 
@@ -146,7 +193,7 @@ impl IRawElementProviderSimple_Impl for Elem_Impl {
     }
 
     fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> windows::core::Result<VARIANT> {
-        let Some(n) = self.node() else {
+        let Some((n, focused)) = self.with_node(|t, n| (n.clone(), t.focus.as_deref() == Some(n.key.as_str()))) else {
             // The window itself (the rest comes from its host provider).
             return Ok(match id {
                 UIA_NamePropertyId => VARIANT::from(BSTR::from(with_tree(self.hwnd, |t| t.name.clone()).unwrap_or_else(|| "Deskboxes".into()))),
@@ -154,7 +201,6 @@ impl IRawElementProviderSimple_Impl for Elem_Impl {
                 _ => VARIANT::default(),
             });
         };
-        let focused = with_tree(self.hwnd, |t| t.focus.as_deref() == Some(n.key.as_str())).unwrap_or(false);
         Ok(match id {
             UIA_NamePropertyId => VARIANT::from(BSTR::from(n.name.as_str())),
             UIA_ControlTypePropertyId => VARIANT::from(if n.group { UIA_GroupControlTypeId.0 } else { UIA_ListItemControlTypeId.0 }),
@@ -177,32 +223,37 @@ impl IRawElementProviderSimple_Impl for Elem_Impl {
 
 impl IRawElementProviderFragment_Impl for Elem_Impl {
     fn Navigate(&self, dir: NavigateDirection) -> windows::core::Result<IRawElementProviderFragment> {
-        let me = self.node();
-        if self.key.is_some() && me.is_none() {
-            return none();
-        }
-        let parent = me.as_ref().map(|n| n.parent.clone());
-        match dir {
-            NavigateDirection_Parent => match parent {
-                None => none(),
-                Some(p) => Ok(self.make(p)),
-            },
-            NavigateDirection_FirstChild | NavigateDirection_LastChild => {
-                if me.as_ref().is_some_and(|n| !n.group) {
-                    return none();
+        // (Each step is a look-up in the tree's indexes: walking all of a large box is linear.)
+        // Some(None): the window; Some(Some(k)): that node.
+        let to: Option<Option<String>> = with_tree(self.hwnd, |t| {
+            let me = match &self.key {
+                None => None,
+                Some(k) => Some(*t.index.get(k)?),
+            };
+            match dir {
+                NavigateDirection_Parent => me.map(|i| t.nodes[i].parent.clone()),
+                NavigateDirection_FirstChild | NavigateDirection_LastChild => {
+                    if me.is_some_and(|i| !t.nodes[i].group) {
+                        return None;
+                    }
+                    let kids = t.kids.get(&self.key)?;
+                    let k = if dir == NavigateDirection_FirstChild { kids.first() } else { kids.last() };
+                    k.map(|&k| Some(t.nodes[k].key.clone()))
                 }
-                let kids = self.children(self.key.as_deref());
-                let k = if dir == NavigateDirection_FirstChild { kids.first() } else { kids.last() };
-                k.map(|k| self.make(Some(k.clone()))).map_or_else(none, Ok)
+                NavigateDirection_NextSibling | NavigateDirection_PreviousSibling => {
+                    let i = me?;
+                    let sibs = t.kids.get(&Tree::parent_key(&t.nodes[i]))?;
+                    let at = t.pos[i];
+                    let j = if dir == NavigateDirection_NextSibling { at.checked_add(1) } else { at.checked_sub(1) };
+                    j.and_then(|j| sibs.get(j)).map(|&k| Some(t.nodes[k].key.clone()))
+                }
+                _ => None,
             }
-            NavigateDirection_NextSibling | NavigateDirection_PreviousSibling => {
-                let Some(p) = parent else { return none() };
-                let sibs = self.children(p.as_deref());
-                let Some(i) = sibs.iter().position(|k| Some(k) == self.key.as_ref()) else { return none() };
-                let j = if dir == NavigateDirection_NextSibling { i.checked_add(1) } else { i.checked_sub(1) };
-                j.and_then(|j| sibs.get(j)).map(|k| self.make(Some(k.clone()))).map_or_else(none, Ok)
-            }
-            _ => none(),
+        })
+        .flatten();
+        match to {
+            Some(k) => Ok(self.make(k)),
+            None => none(),
         }
     }
 
@@ -227,8 +278,8 @@ impl IRawElementProviderFragment_Impl for Elem_Impl {
     }
 
     fn BoundingRectangle(&self) -> windows::core::Result<UiaRect> {
-        match self.node() {
-            Some(n) => Ok(UiaRect { left: n.rect[0], top: n.rect[1], width: n.rect[2], height: n.rect[3] }),
+        match self.with_node(|_, n| n.rect) {
+            Some(r) => Ok(UiaRect { left: r[0], top: r[1], width: r[2], height: r[3] }),
             None => Ok(UiaRect::default()),
         }
     }

@@ -12,7 +12,7 @@
 
 use crate::app::{ease_out, header_h, App, PAD};
 use crate::textedit::TextEdit;
-use deskboxes_core::find::Query;
+use deskboxes_core::find::{Folded, Query, Scratch};
 use deskboxes_core::*;
 use deskboxes_i18n::{t, S};
 use deskboxes_render::{self as r, rgba, Color, Dc, RectF};
@@ -126,6 +126,17 @@ pub struct Search {
     pub picking: bool,
     /// "Hide the others" turned on or off; since when (fading).
     pub hide_t: Instant,
+    /// Names folded for matching, kept between keystrokes: per icon, the display name and file
+    /// name they were made from, the display name's and the file name's (None: it folds the same).
+    pub folded: std::collections::HashMap<ItemKey, FoldedName>,
+}
+
+/// An icon's names, folded for matching.
+pub struct FoldedName {
+    display: String,
+    parsing: String,
+    name: Folded,
+    file: Option<Folded>,
 }
 
 impl Default for Search {
@@ -156,6 +167,7 @@ impl Default for Search {
             hover_ctl: None,
             picking: false,
             hide_t: past,
+            folded: Default::default(),
         }
     }
 }
@@ -363,13 +375,31 @@ impl App {
             self.search.dim_t = Some(Instant::now());
             crate::anim::set(true);
         }
-        let score = |k: &ItemKey| -> Option<u32> {
+        // Names are folded once per icon (again when its name changes), and a file name that
+        // folds the same as the display name is not scored twice.
+        let mut folded = std::mem::take(&mut self.search.folded);
+        folded.retain(|k, _| self.items.contains_key(k));
+        let mut scratch = Scratch::default();
+        let mut score = |k: &ItemKey| -> Option<u32> {
             let it = self.items.get(k)?;
             if !q.ext_ok(&it.ext) {
                 return None;
             }
-            let file = std::path::Path::new(&it.parsing_name).file_name().and_then(|f| f.to_str()).unwrap_or("");
-            q.score(&it.display_name).max(q.score(file))
+            if q.words.is_empty() {
+                return Some(0);
+            }
+            let f = folded.entry(k.clone()).or_insert_with(|| FoldedName { display: String::new(), parsing: String::new(), name: Folded::default(), file: None });
+            if f.display != it.display_name || f.parsing != it.parsing_name {
+                let file = std::path::Path::new(&it.parsing_name).file_name().and_then(|f| f.to_str()).unwrap_or("");
+                let name = Folded::new(&it.display_name);
+                let file = Some(Folded::new(file)).filter(|f| !f.same(&name));
+                *f = FoldedName { display: it.display_name.clone(), parsing: it.parsing_name.clone(), name, file };
+            }
+            let a = q.score_folded(&f.name, &mut scratch);
+            match &f.file {
+                Some(file) => a.max(q.score_folded(file, &mut scratch)),
+                None => a,
+            }
         };
         // In reading order: this page's loose icons, its boxes (open tab first), then the
         // other pages'.
@@ -403,6 +433,7 @@ impl App {
             }
         }
         let mut found: Vec<(ItemKey, u32)> = seen.into_iter().filter_map(|k| score(&k).map(|s| (k, s))).collect();
+        self.search.folded = folded;
         // The type filters that would find something, with how many. Games are not Apps too.
         let is = |k: &ItemKey, cat: &str| self.items.get(k).is_some_and(|it| rules::in_category(it, cat) && (cat != "programs" || !rules::in_category(it, "games")));
         for (cat, _) in CHIPS {
@@ -716,7 +747,7 @@ impl App {
     pub fn search_caret_tick(&mut self) -> bool {
         if self.search.focused {
             self.search.caret_on = !self.search.caret_on;
-            self.invalidate();
+            self.invalidate_local();
             return true;
         }
         false

@@ -96,11 +96,17 @@ pub fn set_hidden(hidden: bool) -> IconState {
         std::thread::sleep(std::time::Duration::from_millis(25));
         s = state();
     }
-    if s.view_hidden != Some(hidden) || s.listview_visible == hidden {
+    // The toggle flips whatever Explorer has: only when its icons are on screen the other way
+    // than wanted. (Hiding while Explorer's desktop view was not there yet, at sign-in with its
+    // icons already hidden, it showed them.)
+    let on_screen_wrong = if hidden { s.listview_visible } else { !s.listview_visible && !listview().is_invalid() };
+    if (s.view_hidden != Some(hidden) || s.listview_visible == hidden) && on_screen_wrong {
         log::warn!("hide({hidden}): view call {r:?} left {s:?}; using the DefView toggle");
         toggle();
         std::thread::sleep(std::time::Duration::from_millis(300));
         s = state();
+    } else if s.view_hidden != Some(hidden) {
+        log::warn!("hide({hidden}): view call {r:?} left {s:?}; Explorer's icons are {} (no toggle)", if s.listview_visible { "on screen" } else { "not on screen" });
     }
     log::info!("native icons hidden={hidden} -> {s:?}");
     s

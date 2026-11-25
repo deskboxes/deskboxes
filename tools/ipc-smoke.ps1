@@ -47,8 +47,9 @@ try {
         $len = [byte[]]::new(4)
         $t = $pipe.ReadAsync($len, 0, 4)
         if (-not $t.Wait($timeoutMs)) { throw "no message within $timeoutMs ms" }
+        if ($t.Result -lt 4) { throw "the host closed the pipe (see %LOCALAPPDATA%\Deskboxes\logs\shellhost.log)" }
         $n = [BitConverter]::ToUInt32($len, 0); $buf = [byte[]]::new($n); $got = 0
-        while ($got -lt $n) { $got += $pipe.Read($buf, $got, $n - $got) }
+        while ($got -lt $n) { $r = $pipe.Read($buf, $got, $n - $got); if ($r -le 0) { throw "the host closed the pipe mid-message" }; $got += $r }
         [Text.Encoding]::UTF8.GetString($buf) | ConvertFrom-Json
     }
     function Expect([string]$type, [int]$timeoutMs = 10000) {

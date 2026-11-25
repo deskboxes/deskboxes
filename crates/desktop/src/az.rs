@@ -59,7 +59,10 @@ pub fn initial(name: &str) -> char {
 /// A tab's shown order, cached until its items or any item's name change: an A–Z box sorts
 /// hundreds of names, and that order is needed several times per frame and per pointer move.
 pub struct Shown {
-    pub fp: u64,
+    /// What it was made for: the icons' generation, A–Z, the search filter's generation, and
+    /// the tab's items then (compared key by key: no hashing of every name on each look).
+    pub meta: (u64, bool, Option<u64>),
+    pub src: std::rc::Rc<Vec<ItemKey>>,
     pub keys: std::rc::Rc<Vec<ItemKey>>,
     /// Each letter and the index of its first icon (A–Z boxes).
     pub firsts: std::rc::Rc<Vec<(char, usize)>>,
@@ -80,15 +83,12 @@ impl App {
     }
 
     fn shown_checked(&self, b: &BoxModel, tab: &Tab) -> (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>) {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         // "Hide the others" while searching: only the matches, closed up.
         let only = self.search_shown_filter(b);
-        (self.items_gen, b.az, tab.items.len(), only.map(|(g, _)| g)).hash(&mut h);
-        tab.items.hash(&mut h);
-        let fp = h.finish();
+        let meta = (self.items_gen, b.az, only.map(|(g, _)| g));
         if let Some(s) = self.shown_cache.borrow().get(&tab.id) {
-            if s.fp == fp {
+            // (Same length first; equal keys compare as bytes, far cheaper than hashing them.)
+            if s.meta == meta && s.src.len() == tab.items.len() && *s.src == tab.items {
                 return (s.keys.clone(), s.firsts.clone());
             }
         }
@@ -109,7 +109,10 @@ impl App {
                 }
             }
         }
-        let s = Shown { fp, keys: std::rc::Rc::new(v), firsts: std::rc::Rc::new(firsts) };
+        let keys = std::rc::Rc::new(v);
+        // (An ordinary tab whose icons are all there shows its items as they are: one copy.)
+        let src = if *keys == tab.items { keys.clone() } else { std::rc::Rc::new(tab.items.clone()) };
+        let s = Shown { meta, src, keys, firsts: std::rc::Rc::new(firsts) };
         let out = (s.keys.clone(), s.firsts.clone());
         self.shown_cache.borrow_mut().insert(tab.id, s);
         out

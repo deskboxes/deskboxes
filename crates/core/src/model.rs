@@ -9,17 +9,18 @@ use std::collections::BTreeMap;
 /// - `p:<lower-case parsing path>` when no FileId is available,
 /// - `v:<::{CLSID}>` for virtual items (This PC, Recycle Bin, ...).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ItemKey(pub String);
+/// (Shared text: a key is cloned often, into every undo step's layout too.)
+pub struct ItemKey(pub std::sync::Arc<str>);
 
 impl ItemKey {
     pub fn file(volume: u64, file_id: u128) -> Self {
-        ItemKey(format!("f:{volume:x}:{file_id:032x}"))
+        ItemKey(format!("f:{volume:x}:{file_id:032x}").into())
     }
     pub fn path(p: &str) -> Self {
-        ItemKey(format!("p:{}", p.to_lowercase()))
+        ItemKey(format!("p:{}", p.to_lowercase()).into())
     }
     pub fn virtual_item(parsing: &str) -> Self {
-        ItemKey(format!("v:{}", parsing.to_lowercase()))
+        ItemKey(format!("v:{}", parsing.to_lowercase()).into())
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -371,8 +372,9 @@ pub struct MonitorLayout {
     pub pages: Vec<PageMeta>,
     #[serde(default)]
     pub page: u32,
+    /// (Shared: the undo history's copies of the layout share the pages they did not change.)
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub parked: BTreeMap<u32, PageContent>,
+    pub parked: BTreeMap<u32, std::sync::Arc<PageContent>>,
     /// Several screens (`screens.rs`): the page each screen shows, for every screen but the one
     /// whose page is `page` (that one is shown there).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -423,6 +425,18 @@ pub struct PageContent {
     pub loose: BTreeMap<ItemKey, Cell>,
     #[serde(default)]
     pub homes: BTreeMap<ItemKey, Cell>,
+}
+
+impl PageContent {
+    /// Holds one of `keys` (loose, pushed aside or in a box).
+    pub fn holds_any(&self, keys: &std::collections::HashSet<&ItemKey>) -> bool {
+        self.loose.keys().chain(self.homes.keys()).any(|k| keys.contains(k)) || self.boxes.iter().flat_map(|b| &b.tabs).flat_map(|t| &t.items).any(|k| keys.contains(k))
+    }
+
+    /// Holds an item not in `keys` (loose, pushed aside or in a box that is not a folder's).
+    pub fn holds_other_than(&self, keys: &std::collections::HashSet<&ItemKey>) -> bool {
+        self.loose.keys().chain(self.homes.keys()).any(|k| !keys.contains(k)) || self.boxes.iter().filter(|b| !b.is_folder()).flat_map(|b| &b.tabs).flat_map(|t| &t.items).any(|k| !keys.contains(k))
+    }
 }
 
 /// A sorting rule: icons matching the condition go into tab `target` (a tab id).

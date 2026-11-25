@@ -17,6 +17,10 @@ use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_
 
 pub enum Req {
     Scan,
+    /// Something changed in these folders (`dir_key`): they are listed again, the others'
+    /// entries are taken from the last listing (a full scan at the start, after the icon size or
+    /// Explorer's filters changed, and for anything else).
+    ScanDirs(Vec<String>),
     Rename { path: String, new_name: String },
     Delete { paths: Vec<String>, recycle: bool },
     Paste { folder: Option<String>, link: bool, pt: (i32, i32) },
@@ -32,6 +36,19 @@ pub enum Req {
     UndoFiles { op: FileOp, undo: bool },
     /// Icons for boxes that show them at `px`: (desktop icon id, parsing name, attributes).
     IconsAt { px: u32, items: Vec<(u32, String, u32)> },
+    /// Thumbnails and folder previews made after a scan was published (`spawn_pictures`), for
+    /// the items of picture job `n`: (parsing name, the picture; None: none could be made).
+    Pictures { n: u64, made: Vec<(String, Option<IconImage>)> },
+    /// These items are in view: their pictures, if still to be made, are made next.
+    PicturesFirst(Vec<String>),
+}
+
+/// Pictures still to be made for a scan (`spawn_pictures`): (parsing name, a thumbnail).
+type PictureQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(String, bool)>>>;
+
+/// A folder as `Req::ScanDirs` names it.
+pub fn dir_key(p: &str) -> String {
+    p.trim_end_matches('\\').to_lowercase()
 }
 
 fn file_name(p: &str) -> String {
@@ -77,15 +94,33 @@ fn undo_files(op: &FileOp, undo: bool, owner: isize, no_ui: bool) -> Option<File
             let copies: Vec<&FileMove> = v.iter().filter(|m| !m.to.is_empty() && still(m, &m.to)).collect();
             let paths: Vec<String> = copies.iter().map(|m| m.to.clone()).collect();
             (!paths.is_empty()).then(|| fileops::delete_logged(&paths, true, owner, no_ui).ok()).flatten().map(|d| {
-                FileOp::Copied(copies.iter().filter(|m| d.iter().any(|d| d.from.eq_ignore_ascii_case(&m.to))).map(|m| FileMove::new(m.from.clone(), m.to.clone(), None)).collect())
+                // (What went, looked up by path as Windows compares them: not a search per copy.)
+                let gone: std::collections::HashSet<String> = d.iter().map(|d| d.from.to_ascii_lowercase()).collect();
+                FileOp::Copied(copies.iter().filter(|m| gone.contains(&m.to.to_ascii_lowercase())).map(|m| FileMove::new(m.from.clone(), m.to.clone(), None)).collect())
             })
         }
         (FileOp::Copied(v), false) => {
-            // Copied again: each copy where it was (the folder it was copied into).
-            let mut out = vec![];
+            // Copied again: each copy where it was (the folder it was copied into). The copies
+            // into one folder go in one operation, in their order; a file copied twice into one
+            // folder goes in another (as it went the first time: two copies, two names).
+            let mut groups: Vec<(String, Vec<String>)> = vec![];
             for m in v {
                 let Some(dir) = std::path::Path::new(&m.to).parent() else { continue };
-                if let Ok(d) = fileops::transfer_logged(std::slice::from_ref(&m.from), &dir.to_string_lossy(), true, owner, no_ui) {
+                // (One gone since would stop its whole operation: left out, as it failed alone.)
+                if !std::path::Path::new(&m.from).exists() {
+                    log::warn!("redo copy: {} is gone", m.from);
+                    continue;
+                }
+                let dir = dir.to_string_lossy().into_owned();
+                match groups.iter_mut().find(|(d, from)| d.eq_ignore_ascii_case(&dir) && !from.iter().any(|f| f.eq_ignore_ascii_case(&m.from))) {
+                    Some((_, from)) => from.push(m.from.clone()),
+                    None => groups.push((dir, vec![m.from.clone()])),
+                }
+            }
+            let mut out = vec![];
+            for (dir, from) in groups {
+                // (What did go is kept: Windows tells each copy it made, and its name.)
+                if let Ok(d) = fileops::transfer_logged(&from, &dir, true, owner, no_ui) {
                     out.extend(moves(&d));
                 }
             }
@@ -119,10 +154,15 @@ fn recycle(files: &[(String, Option<FileId>)], owner: isize, no_ui: bool) -> Opt
     }
     let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
     let d = fileops::delete_logged(&paths, true, owner, no_ui).ok()?;
+    // Each file's identity by its path as Windows compares them (one look-up per record).
+    let mut ids: HashMap<String, Option<FileId>> = HashMap::with_capacity(files.len());
+    for (p, i) in files {
+        ids.entry(p.to_ascii_lowercase()).or_insert(*i);
+    }
     let v: Vec<FileMove> = d
         .iter()
         .map(|d| {
-            let before = files.iter().find(|(p, _)| p.eq_ignore_ascii_case(&d.from)).and_then(|(_, i)| *i);
+            let before = ids.get(&d.from.to_ascii_lowercase()).copied().flatten();
             let id = if d.to.is_empty() { before } else { id_of(&d.to).or(before) };
             FileMove::new(d.from.clone(), d.to.clone(), id)
         })
@@ -166,7 +206,8 @@ pub fn start(cfg: Config) -> WorkerTx {
     let (tx, rx) = channel();
     let ev = unsafe { CreateEventW(None, false, false, None).expect("worker event") };
     let evi = ev.0 as isize;
-    std::thread::Builder::new().name("shell-worker".into()).spawn(move || run(cfg, rx, evi)).expect("spawn shell worker");
+    let own = WorkerTx { tx: tx.clone(), ev: evi };
+    std::thread::Builder::new().name("shell-worker".into()).spawn(move || run(cfg, rx, evi, own)).expect("spawn shell worker");
     WorkerTx { tx, ev: evi }
 }
 
@@ -328,7 +369,7 @@ impl IconCache {
     }
 
     /// Same, with the system icon index already known (resolved off this thread).
-    fn get_with(&mut self, parsing: &str, attrs: u32, (ix, ov): (i32, u32), fresh: &mut Vec<(u32, IconImage)>) -> u32 {
+    fn get_with(&mut self, parsing: &str, attrs: u32, sys: (i32, u32), fresh: &mut Vec<(u32, IconImage)>) -> u32 {
         let px = self.px;
         if let Some(thumb) = self.image_kind(parsing, attrs) {
             let img = match self.prefetch.remove(parsing) {
@@ -337,18 +378,30 @@ impl IconCache {
                 None => icons::folder_image(parsing, px),
             };
             if let Some(img) = img {
-                let mut img = fit(img, px);
-                if ov != 0 && img.w == img.h {
-                    if let Some(o) = self.overlays.entry(ov).or_insert_with(|| icons::overlay_icon(ov, overlay_px(px))).clone() {
-                        composite(&mut img, &o);
-                    }
-                }
-                let id = self.next;
-                self.next += 1;
-                fresh.push((id, img));
-                return id;
+                return self.picture(img, sys.1, fresh);
             }
         }
+        self.plain(parsing, sys, fresh)
+    }
+
+    /// A thumbnail or folder preview as an icon (fitted, with its overlay): its new id.
+    fn picture(&mut self, img: IconImage, ov: u32, fresh: &mut Vec<(u32, IconImage)>) -> u32 {
+        let px = self.px;
+        let mut img = fit(img, px);
+        if ov != 0 && img.w == img.h {
+            if let Some(o) = self.overlays.entry(ov).or_insert_with(|| icons::overlay_icon(ov, overlay_px(px))).clone() {
+                composite(&mut img, &o);
+            }
+        }
+        let id = self.next;
+        self.next += 1;
+        fresh.push((id, img));
+        id
+    }
+
+    /// The item's own icon or its type's (no picture of its own).
+    fn plain(&mut self, parsing: &str, (ix, ov): (i32, u32), fresh: &mut Vec<(u32, IconImage)>) -> u32 {
+        let px = self.px;
         // Index -1 (no system icon), or a type whose icon is per file (shortcuts, programs, .ico):
         // extract per item, never shared. Off the STA, SHGetFileInfo gives every .url the same
         // index, so sharing by index showed one game's icon on all Steam shortcuts (2026-11-19).
@@ -426,6 +479,52 @@ fn make_images(jobs: &[(&str, bool)], px: u32) -> Vec<(String, Option<IconImage>
     made
 }
 
+/// Thumbnails and folder previews for a scan already published, made on a few STA threads of
+/// their own: handed back to the worker (`Req::Pictures`) a batch at a time, so the first ones
+/// show while the rest are made and the worker stays free for file operations meanwhile.
+fn spawn_pictures(jobs: Vec<(String, bool)>, px: u32, n: u64, to: WorkerTx) -> PictureQueue {
+    let count = jobs.len();
+    let queue: PictureQueue = std::sync::Arc::new(std::sync::Mutex::new(jobs.into_iter().collect()));
+    let q = queue.clone();
+    let r = std::thread::Builder::new().name("pictures".into()).spawn(move || {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6).min(count.div_ceil(4)).max(1);
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let (q, to) = (&q, WorkerTx { tx: to.tx.clone(), ev: to.ev });
+                s.spawn(move || {
+                    use windows::Win32::System::Com::*;
+                    let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                    let mut v = Vec::new();
+                    let mut since = Instant::now();
+                    loop {
+                        // (Taken from the front: items in view are moved there, `PicturesFirst`.)
+                        let job = q.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+                        let Some((p, thumb)) = job else { break };
+                        let img = if thumb { icons::thumbnail(&p, px) } else { icons::folder_image(&p, px) };
+                        v.push((p, img));
+                        if v.len() >= 32 || since.elapsed().as_millis() >= 200 {
+                            let _ = to.send(Req::Pictures { n, made: std::mem::take(&mut v) });
+                            since = Instant::now();
+                        }
+                    }
+                    if !v.is_empty() {
+                        let _ = to.send(Req::Pictures { n, made: v });
+                    }
+                    if init.is_ok() {
+                        unsafe { CoUninitialize() };
+                    }
+                });
+            }
+        });
+        log::info!("made {count} picture(s) after the scan on {threads} threads in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    });
+    if let Err(e) = r {
+        log::warn!("pictures: no thread: {e}");
+    }
+    queue
+}
+
 /// The image cropped to its non-transparent pixels.
 fn trim(img: &IconImage) -> IconImage {
     let (mut x0, mut y0, mut x1, mut y1) = (img.w, img.h, 0, 0);
@@ -492,7 +591,7 @@ fn resolve_parallel(entries: &[&Entry]) -> Vec<(Item, (i32, u32))> {
     })
 }
 
-fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
+fn run(cfg: Config, rx: Receiver<Req>, ev: isize, own: WorkerTx) {
     unsafe {
         let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
@@ -523,6 +622,18 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
         prefetch: HashMap::new(),
     };
     let mut sized: HashMap<u32, IconCache> = HashMap::new();
+    // Items waiting for their picture (`spawn_pictures`): parsing name -> (the job it is in,
+    // its overlay). A newer job for the same item replaces it; results of an older one are
+    // dropped.
+    let mut waiting: HashMap<String, (u64, u32)> = HashMap::new();
+    let mut picture_job: u64 = 0;
+    // The queues of pictures still being made (emptied ones are let go).
+    let mut picture_queues: Vec<PictureQueue> = Vec::new();
+    // Each folder's entries as last listed (`dir_key`), and the filters they were listed with.
+    let mut listed: HashMap<String, Vec<Entry>> = HashMap::new();
+    let mut listed_with: Option<(bool, bool)> = None;
+    // The virtual items (Recycle Bin, This PC…) as last posted.
+    let mut last_virtual: Option<Vec<Item>> = None;
     let mut first = true;
     let mut batch: Vec<Req> = Vec::new();
     // Folders whose picture Windows handed back flattened (`icons::take_flat`): how often each
@@ -554,15 +665,19 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
             }
             continue;
         }
-        // Coalesce: a scan followed later in the batch by another scan is redundant.
+        // Coalesce: a scan followed later in the batch by another scan is redundant (done once,
+        // where the last one is: of everything if any asked for that, else of the folders all
+        // of them name).
         let reqs = std::mem::take(&mut batch);
-        let last_scan = reqs.iter().rposition(|r| matches!(r, Req::Scan));
+        let last_scan = reqs.iter().rposition(|r| matches!(r, Req::Scan | Req::ScanDirs(_)));
+        let full_scan = reqs.iter().any(|r| matches!(r, Req::Scan));
+        let dirty: std::collections::HashSet<String> = reqs.iter().filter_map(|r| if let Req::ScanDirs(v) = r { Some(v.iter().map(|d| dir_key(d))) } else { None }).flatten().collect();
         for (i, req) in reqs.into_iter().enumerate() {
-            if matches!(req, Req::Scan) && Some(i) != last_scan {
+            if matches!(req, Req::Scan | Req::ScanDirs(_)) && Some(i) != last_scan {
                 continue;
             }
             match req {
-                Req::Scan => {
+                Req::Scan | Req::ScanDirs(_) => {
                     let t0 = Instant::now();
                     let f = items::filters();
                     let mut dirs = cfg.dirs.clone();
@@ -570,7 +685,32 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                         path: p.into(),
                         source: deskboxes_core::Source::Folder,
                     }));
-                    let (mut entries, failed) = items::scan(&dirs, f);
+                    // Only the folders that changed are listed again; the others' entries are the
+                    // ones last listed (unchanged entries then reuse their items, as always).
+                    let scoped = !full_scan && !first && listed_with == Some((f.show_hidden, f.show_super_hidden));
+                    let mut entries = Vec::new();
+                    let mut failed = Vec::new();
+                    let mut next_listed = HashMap::with_capacity(dirs.len());
+                    let mut listed_now = 0usize;
+                    for d in &dirs {
+                        let key = dir_key(&d.path.display().to_string());
+                        let kept = if scoped && !dirty.contains(&key) { listed.remove(&key) } else { None };
+                        let (es, fl) = match kept {
+                            Some(es) => (es, Vec::new()),
+                            None => {
+                                listed_now += 1;
+                                items::scan(std::slice::from_ref(d), f)
+                            }
+                        };
+                        entries.extend(es.iter().cloned());
+                        // (One that could not be listed is listed again next time.)
+                        if fl.is_empty() {
+                            next_listed.insert(key, es);
+                        }
+                        failed.extend(fl);
+                    }
+                    listed = next_listed;
+                    listed_with = Some((f.show_hidden, f.show_super_hidden));
                     // A folder that could not be listed keeps what was known of it (its icons
                     // are not taken for deleted and lose their boxes).
                     for dir in &failed {
@@ -600,21 +740,34 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                     let resolved = todo.len();
                     let todo_entries: Vec<&Entry> = todo.iter().map(|&i| &entries[i]).collect();
                     let t_res = Instant::now();
-                    // The shell lookups and the pictures at the same time (both on threads of their own).
+                    // Many pictures to make (a cold start, a folder of photos): the items are
+                    // published with their type's icon first and the pictures follow, made on
+                    // threads of their own (`Req::Pictures`); a slow thumbnail handler holds up
+                    // neither the inventory nor a file operation. A few are made here, as before.
                     let jobs = ic.image_jobs(&todo_entries.iter().map(|e| (e.path.as_str(), e.attrs)).collect::<Vec<_>>());
-                    let px = ic.px;
-                    let (res, res_ms, made) = std::thread::scope(|s| {
-                        let pics = s.spawn(|| make_images(&jobs, px));
-                        let res = resolve_parallel(&todo_entries);
-                        let res_ms = t_res.elapsed().as_secs_f64() * 1000.0;
-                        (res, res_ms, pics.join().unwrap_or_default())
-                    });
-                    ic.prefetch.extend(made);
+                    let later = jobs.len() >= 8;
+                    let res = resolve_parallel(&todo_entries);
+                    let res_ms = t_res.elapsed().as_secs_f64() * 1000.0;
+                    if later {
+                        picture_job += 1;
+                    }
+                    let pictured: std::collections::HashSet<&str> = if later { jobs.iter().map(|(p, _)| *p).collect() } else { Default::default() };
                     for (&i, (mut it, sys)) in todo.iter().zip(res) {
-                        it.icon = ic.get_with(&entries[i].path, entries[i].attrs, sys, &mut fresh);
+                        let path = &entries[i].path;
+                        it.icon = if pictured.contains(path.as_str()) {
+                            waiting.insert(path.clone(), (picture_job, sys.1));
+                            ic.plain(path, sys, &mut fresh)
+                        } else {
+                            ic.get_with(path, entries[i].attrs, sys, &mut fresh)
+                        };
                         slots[i] = Some(it);
                     }
-                    ic.prefetch.clear();
+                    if later {
+                        let owned: Vec<(String, bool)> = jobs.iter().map(|(p, t)| (p.to_string(), *t)).collect();
+                        picture_queues.retain(|q| !q.lock().map(|q| q.is_empty()).unwrap_or(true));
+                        picture_queues.push(spawn_pictures(owned, ic.px, picture_job, WorkerTx { tx: own.tx.clone(), ev: own.ev }));
+                        post(Ev::PicturesPending(true));
+                    }
                     for (e, item) in entries.into_iter().zip(slots) {
                         let item = item.expect("every entry resolved");
                         out.push(item.clone());
@@ -623,25 +776,38 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                     if resolved > 0 {
                         log::info!("resolved {resolved} entr(ies) through the shell in {res_ms:.1} ms (parallel)");
                     }
+                    // Entries gone since the last scan (the ones still listed were taken out).
+                    let removed = cache.len();
                     cache = next_cache;
                     // Hard links: two names of one file share its identity. Each name is an icon
                     // of its own: the second and later get their name added to the key.
                     let mut seen: std::collections::HashSet<deskboxes_core::ItemKey> = std::collections::HashSet::with_capacity(out.len());
                     for it in out.iter_mut() {
                         if !seen.insert(it.key.clone()) {
-                            it.key = deskboxes_core::ItemKey(format!("{}|{}", it.key.0, it.parsing_name.to_lowercase()));
+                            it.key = deskboxes_core::ItemKey(format!("{}|{}", it.key.0, it.parsing_name.to_lowercase()).into());
                             seen.insert(it.key.clone());
                         }
                     }
+                    let mut virt = Vec::new();
                     if cfg.virtual_items {
                         for mut v in items::virtual_items() {
                             v.icon = ic.get(&v.parsing_name, &mut fresh);
+                            virt.push(v.clone());
                             out.push(v);
                         }
                     }
+                    // Nothing new, nothing gone, nothing changed (the Recycle Bin's icon included):
+                    // the UI is not handed the same inventory again (a watcher's echo of a write
+                    // that changed nothing listed, an attribute flicker).
+                    let same = !first && resolved == 0 && removed == 0 && fresh.is_empty() && last_virtual.as_ref() == Some(&virt);
+                    last_virtual = Some(virt);
+                    if same {
+                        log::info!("PHASE scan items={} unchanged listed={listed_now}/{} total_ms={:.1}", out.len(), dirs.len(), t0.elapsed().as_secs_f64() * 1000.0);
+                        continue;
+                    }
                     let native = view::native_view(first && cfg.import_positions);
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    log::info!("PHASE scan items={} resolved={resolved} new_icons={} fast_path_ms={t_scan:.1} total_ms={ms:.1}", out.len(), fresh.len());
+                    log::info!("PHASE scan items={} resolved={resolved} new_icons={} listed={listed_now}/{} fast_path_ms={t_scan:.1} total_ms={ms:.1}", out.len(), fresh.len(), dirs.len());
                     let keep: Vec<u32> = ic.by_sys.values().chain(sized.values().flat_map(|c| c.by_sys.values())).copied().collect();
                     post(Ev::Scanned {
                         items: out,
@@ -653,6 +819,39 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                         keep,
                     });
                     first = false;
+                }
+                Req::Pictures { n, made } => {
+                    // Each item still waiting for this job's picture, still listed: its icon now.
+                    let mut fresh = Vec::new();
+                    let mut changed: Vec<(String, u32)> = Vec::new();
+                    for (path, img) in made {
+                        if waiting.get(&path).is_none_or(|w| w.0 != n) {
+                            continue;
+                        }
+                        let Some((_, ov)) = waiting.remove(&path) else { continue };
+                        let Some(img) = img else { continue };
+                        let Some((_, item)) = cache.get_mut(&path) else { continue };
+                        let id = ic.picture(img, ov, &mut fresh);
+                        item.icon = id;
+                        changed.push((path, id));
+                    }
+                    if !changed.is_empty() {
+                        post(Ev::Pictures { items: changed, icons: fresh });
+                    }
+                    if waiting.is_empty() {
+                        picture_queues.clear();
+                        post(Ev::PicturesPending(false));
+                    }
+                }
+                Req::PicturesFirst(paths) => {
+                    // In the order given, before the rest (the ones not waiting are not there).
+                    let want: std::collections::HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+                    for q in &picture_queues {
+                        let mut q = q.lock().unwrap_or_else(|p| p.into_inner());
+                        let (first, rest): (Vec<_>, Vec<_>) = q.drain(..).partition(|(p, _)| want.contains(p.as_str()));
+                        q.extend(first);
+                        q.extend(rest);
+                    }
                 }
                 Req::Folders(v) => folders = v,
                 Req::Rename { path, new_name } => {
@@ -715,6 +914,8 @@ fn run(cfg: Config, rx: Receiver<Req>, ev: isize) {
                     };
                     cache.clear();
                     sized.clear();
+                    waiting.clear();
+                    listed.clear();
                     // The next scan replaces every icon (as a first scan does).
                     first = true;
                     batch.push(Req::Scan);

@@ -81,6 +81,9 @@ pub struct ViewState {
     types: RefCell<HashMap<String, String>>,
     /// (item, column, width) -> its text laid out (0 date, 1 type, 2 size, 3 the tile's lines).
     texts: RefCell<HashMap<(ItemKey, u8), String>>,
+    /// Those texts (and Details' column names) laid out: (text, width, lines) -> the layout, made
+    /// once instead of on every paint (a wide Details box laid out three per row per frame).
+    layouts: RefCell<HashMap<(String, i32, u32), TextLayout>>,
     /// Ctrl+wheel over a box: the turn not used yet (a notch is 120; touchpads send less).
     pub wheel: i32,
     /// Game covers (the Covers view).
@@ -95,6 +98,7 @@ impl ViewState {
     }
     pub fn forget_texts(&self) {
         self.texts.borrow_mut().clear();
+        self.layouts.borrow_mut().clear();
     }
 }
 
@@ -210,7 +214,7 @@ impl App {
         }
         let text = self.items.get(key)?.display_name.clone();
         let l = self.gpu.label(&self.label_tf, &text, w, self.line_h, 1, false).ok()?;
-        self.labels.insert(k, l.clone());
+        self.remember_label(k, l.clone());
         Some(l)
     }
 
@@ -273,6 +277,33 @@ impl App {
             self.views.sized.insert((base, px), id);
         }
         self.invalidate();
+    }
+
+    /// Pictures made after a scan (`Ev::Pictures`): uploaded, and the items show them.
+    pub fn apply_pictures(&mut self, items: Vec<(String, u32)>, icons: Vec<(u32, deskboxes_core::snapshot::IconImage)>) {
+        for (id, img) in icons {
+            self.uploads.remove(&id);
+            match self.gpu.bitmap(&img) {
+                Ok(b) => {
+                    self.bitmaps.insert(id, b);
+                }
+                Err(e) => log::warn!("icon upload: {e}"),
+            }
+            self.icon_imgs.insert(id, std::sync::Arc::new(img));
+        }
+        let now: HashMap<&str, u32> = items.iter().map(|(p, id)| (p.as_str(), *id)).collect();
+        let mut n = 0;
+        for it in self.items.values_mut() {
+            if let Some(&id) = now.get(it.parsing_name.as_str()) {
+                it.icon = id;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.items_gen += 1;
+            self.snapshot_dirty = true;
+            self.invalidate();
+        }
     }
 
     /// Box `id` shows its icons as `view` at `size` ("" and 0: as the desktop). Not an undo step
@@ -411,7 +442,20 @@ impl App {
         if text.is_empty() || w < 8.0 {
             return Ok(());
         }
-        let l = self.gpu.label(&self.label_tf, text, w, self.line_h, lines, false)?;
+        let key = (text.to_string(), (w * 4.0) as i32, lines);
+        let kept = self.views.layouts.borrow().get(&key).cloned();
+        let l = match kept {
+            Some(l) => l,
+            None => {
+                let l = self.gpu.label(&self.label_tf, text, w, self.line_h, lines, false)?;
+                let mut m = self.views.layouts.borrow_mut();
+                if m.len() >= 4000 {
+                    m.clear();
+                }
+                m.insert(key, l.clone());
+                l
+            }
+        };
         let x = if right { x + (w - deskboxes_render::text_width(&l)).max(0.0) } else { x };
         if shadow {
             deskboxes_render::draw_text_shadowed(dc, &l, x, y, c)

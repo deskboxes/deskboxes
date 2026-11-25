@@ -73,7 +73,8 @@ pub fn watch_one(dir: PathBuf, on_change: impl Fn() + Send + 'static) -> Watch {
     w
 }
 
-pub fn watch(dirs: Vec<PathBuf>, on_change: impl Fn() + Send + Sync + Clone + 'static) {
+/// Watch these folders for good; `on_change` is told which one changed.
+pub fn watch(dirs: Vec<PathBuf>, on_change: impl Fn(&std::path::Path) + Send + Sync + Clone + 'static) {
     for d in dirs {
         let cb = on_change.clone();
         std::thread::Builder::new()
@@ -105,7 +106,7 @@ pub fn watch(dirs: Vec<PathBuf>, on_change: impl Fn() + Send + Sync + Clone + 's
                         let _ = CloseHandle(h);
                         return;
                     }
-                    cb();
+                    cb(&d);
                 }
             })
             .expect("spawn watcher");

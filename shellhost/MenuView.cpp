@@ -348,6 +348,7 @@ namespace dbx
         bool aborted = false;   // given up on before it opened (see AbortView)
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer openCheck{ nullptr };
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer seenCheck{ nullptr };
+        int unseen = 0;         // seenCheck ticks that found nothing of it on a screen
         bool closed = false;    // its Closed came
     };
     static std::shared_ptr<View> g_view;
@@ -860,7 +861,9 @@ namespace dbx
             double ms = NowMs() - t0;
             Log(L"menu view opened in %.1f ms (model %.1f ms)", ms, v->m->msTotal);
             if (v->ev.opened) v->ev.opened(ms);
-            // A moment later: is any of it on a screen (see MenuShowsNothing)?
+            // A moment later: is any of it on a screen (see MenuShowsNothing)? Asked twice, half
+            // a second apart: a menu closed with Escape or a click hides its window before its
+            // Closed comes, and one check could land in between (a quick Escape recycled the host).
             v->seenCheck = v->window.DispatcherQueue().CreateTimer();
             v->seenCheck.Interval(std::chrono::milliseconds(250));
             v->seenCheck.IsRepeating(false);
@@ -868,6 +871,12 @@ namespace dbx
             {
                 auto v = wv.lock();
                 if (!v || v->closed || !v->flyout || !MenuShowsNothing(*v)) return;
+                if (++v->unseen < 2)
+                {
+                    v->seenCheck.Interval(std::chrono::milliseconds(500));
+                    v->seenCheck.Start();
+                    return;
+                }
                 Log(L"menu view: opened, but nothing of it is on a screen");
                 if (auto nothing = v->ev.nothingShown) { v->ev.nothingShown = nullptr; nothing(); }
                 try { v->flyout.Hide(); } catch (winrt::hresult_error const&) {}

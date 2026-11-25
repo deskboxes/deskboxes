@@ -78,8 +78,18 @@ pub fn load_layout_checked(dir: &Path, topology: &str) -> Result<Option<MonitorL
 }
 
 pub fn save_layout(dir: &Path, topology: &str, m: &MonitorLayout) -> std::io::Result<()> {
-    let l = Layout { schema: LAYOUT_SCHEMA, topology: topology.to_string(), monitor: m.clone() };
-    write_atomic(&layout_path(dir, topology), &serde_json::to_vec_pretty(&l).unwrap_or_default())
+    write_atomic(&layout_path(dir, topology), &layout_bytes(topology, m))
+}
+
+/// A layout file's contents (as `Layout` writes them, without copying the layout).
+pub fn layout_bytes(topology: &str, m: &MonitorLayout) -> Vec<u8> {
+    #[derive(serde::Serialize)]
+    struct LayoutRef<'a> {
+        schema: u32,
+        topology: &'a str,
+        monitor: &'a MonitorLayout,
+    }
+    serde_json::to_vec_pretty(&LayoutRef { schema: LAYOUT_SCHEMA, topology, monitor: m }).unwrap_or_default()
 }
 
 /// Civil date (UTC) from days since 1970-01-01 (H. Hinnant's algorithm).
@@ -157,6 +167,13 @@ pub fn backup_layouts_daily(layouts: &Path, backups: &Path) -> std::io::Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_bytes_match_the_layout_file() {
+        let mut m = MonitorLayout::default();
+        m.loose.insert(crate::model::ItemKey("k".into()), crate::geom::Cell { col: 2, row: 3 });
+        let l = Layout { schema: LAYOUT_SCHEMA, topology: "t".into(), monitor: m.clone() };
+        assert_eq!(layout_bytes("t", &m), serde_json::to_vec_pretty(&l).unwrap());
+    }
     #[test]
     fn civil() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));

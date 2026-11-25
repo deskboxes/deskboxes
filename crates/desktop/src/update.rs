@@ -427,6 +427,28 @@ pub fn install_pending(dir: &Path, relaunch: bool) -> bool {
     }
 }
 
+/// `install_pending` asked from Settings: on a thread of its own (the installer is read whole for
+/// its checksum), once at a time; the UI hears how it went (`Ev::Installing`) and exits only once
+/// the installer started.
+pub fn install_pending_soon(dir: PathBuf, relaunch: bool) {
+    static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if INSTALLING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        log::info!("update: already being installed");
+        return;
+    }
+    let job = move || {
+        let started = install_pending(&dir, relaunch);
+        if !started {
+            INSTALLING.store(false, std::sync::atomic::Ordering::Release);
+        }
+        crate::events::post(crate::events::Ev::Installing { started, relaunch });
+    };
+    if let Err(e) = std::thread::Builder::new().name("install".into()).spawn(job) {
+        log::warn!("update: no thread to install with: {e}");
+        INSTALLING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn sha256_file(p: &Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(p).ok()?;

@@ -10,6 +10,7 @@
 use crate::app::{accent, ease_out, App};
 use deskboxes_core::*;
 use deskboxes_render::{rgba, Color};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Icons coming back (or blending in again) when the pointer enters (or leaves) a box, s.
@@ -57,6 +58,77 @@ pub fn blend_text(text: Color, c: Color, t: f32) -> Color {
     let target = if lum > 0.5 { mix(c, WHITE, 0.55) } else { shade(c, 0.45) };
     let m = mix(text, target, t);
     Color { a: text.a, ..m }
+}
+
+/// Recolored icons (tinted, blended into the wallpaper's color), by icon id, color and kind:
+/// held to a byte budget, the ones used longest ago going first (a few at a time, so icons in
+/// view are kept), and those of icons that are gone let go.
+#[derive(Default)]
+pub struct FxCache {
+    map: HashMap<(u32, u32, u8), (deskboxes_render::Bitmap, usize, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl FxCache {
+    /// GPU memory for recolored icons, at most.
+    const BUDGET: usize = 96 << 20;
+
+    pub fn get(&mut self, k: &(u32, u32, u8)) -> Option<deskboxes_render::Bitmap> {
+        self.tick += 1;
+        let t = self.tick;
+        self.map.get_mut(k).map(|(b, _, used)| {
+            *used = t;
+            b.clone()
+        })
+    }
+
+    pub fn insert(&mut self, k: (u32, u32, u8), b: deskboxes_render::Bitmap) {
+        let sz = unsafe { b.GetPixelSize() };
+        let n = (sz.width as usize * sz.height as usize * 4).max(1);
+        if self.bytes + n > Self::BUDGET {
+            // The quarter used longest ago goes (not all: the icons in view stay made).
+            let mut by_age: Vec<((u32, u32, u8), u64, usize)> = self.map.iter().map(|(k, (_, n, t))| (*k, *t, *n)).collect();
+            by_age.sort_unstable_by_key(|e| e.1);
+            let target = Self::BUDGET * 3 / 4;
+            for (old, _, size) in by_age {
+                if self.bytes + n <= target {
+                    break;
+                }
+                self.map.remove(&old);
+                self.bytes -= size;
+            }
+        }
+        self.tick += 1;
+        if let Some((_, old, _)) = self.map.insert(k, (b, n, self.tick)) {
+            self.bytes -= old;
+        }
+        self.bytes += n;
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+
+    /// Let go of the recolored copies of icons no longer in use.
+    pub fn retain_icons(&mut self, live: impl Fn(u32) -> bool) {
+        let mut freed = 0;
+        self.map.retain(|(id, _, _), (_, n, _)| {
+            let keep = live(*id);
+            if !keep {
+                freed += *n;
+            }
+            keep
+        });
+        self.bytes -= freed;
+    }
+}
+
+/// A start time whose fade is already over.
+fn settled() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(std::time::Duration::from_secs_f32(REVEAL_S * 2.0)).unwrap_or(now)
 }
 
 /// Pack a color to 5 bits per channel (cache key) and back.
@@ -131,8 +203,10 @@ impl App {
     /// The desktop got or lost the keyboard focus.
     pub fn set_desk_active(&mut self, on: bool) {
         if self.desk_active.0 != on {
-            self.desk_active = (on, Instant::now());
-            if self.settings.icons.blend && self.settings.icons.full_when_active {
+            // (Nothing blends that would show it: settled at once, no frames.)
+            let shows = self.settings.icons.full_when_active && (self.blends(None) || self.layout.boxes.iter().any(|b| self.blends(Some(b))));
+            self.desk_active = (on, if shows { Instant::now() } else { settled() });
+            if shows {
                 crate::anim::set(true);
                 self.invalidate();
             }
@@ -161,9 +235,15 @@ impl App {
         // From where its resize edge starts, just outside it (as `hit_test`).
         let on = self.layout.boxes.iter().rev().find(|b| self.shown_rect(b).inflate(crate::app::EDGE / 2.0).contains(p)).map(|b| b.id);
         if on != self.blend_hover.0 {
-            self.blend_hover = (on, self.blend_hover.0, Instant::now());
-            crate::anim::set(true);
-            self.invalidate();
+            // Frames only when the box left or entered shows it (its icons or itself blend and
+            // come back on hover); else the new state holds at once.
+            let s = &self.settings.icons;
+            let shows = s.full_on_hover && [on, self.blend_hover.0].into_iter().flatten().any(|id| self.box_by_id(id).is_some_and(|b| self.blends(Some(b))));
+            self.blend_hover = (on, self.blend_hover.0, if shows { Instant::now() } else { settled() });
+            if shows {
+                crate::anim::set(true);
+                self.invalidate();
+            }
         }
     }
 
@@ -205,22 +285,19 @@ impl App {
     pub fn fx_bitmap(&self, id: u32, src: &deskboxes_render::Bitmap, c: Color, kind: u8) -> Option<deskboxes_render::Bitmap> {
         let (q, cq) = quantize(c);
         let key = (id, q, kind);
-        if let Some(b) = self.fx_cache.borrow().get(&key) {
-            return Some(b.clone());
+        if let Some(b) = self.fx_cache.borrow_mut().get(&key) {
+            return Some(b);
         }
         let ramp = if kind == 0 { tint_ramp(cq) } else { blend_ramp(cq) };
         let b = self.gpu.recolor(src, ramp).map_err(|e| log::warn!("recolor icon: {e}")).ok()?;
-        let mut cache = self.fx_cache.borrow_mut();
-        if cache.len() > 4000 {
-            cache.clear();
-        }
-        cache.insert(key, b.clone());
+        self.fx_cache.borrow_mut().insert(key, b.clone());
         Some(b)
     }
 
     /// The wallpaper's color behind a point (surface DIPs), from a small blurred copy.
     pub fn wall_color_at(&self, p: Pt) -> Color {
-        let Some((w, h, px, step)) = &self.wall_grid else { return rgba(128, 128, 128, 1.0) };
+        let mut g = self.wall_grid.borrow_mut();
+        let Some((w, h, px, step)) = &*g.get_or_insert_with(|| self.make_wall_grid()) else { return rgba(128, 128, 128, 1.0) };
         let (ox, oy) = self.mon_offset();
         let x = (((p.x - ox) * self.scale / step).floor().max(0.0) as u32).min(w.saturating_sub(1));
         let y = (((p.y - oy) * self.scale / step).floor().max(0.0) as u32).min(h.saturating_sub(1));

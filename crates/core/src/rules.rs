@@ -2,6 +2,7 @@
 //! extension, age or size. Rules only change the layout (where an icon is shown); files are
 //! never touched.
 
+#[cfg(test)]
 use crate::layout::{move_to_tab, place_of};
 use crate::model::*;
 
@@ -289,12 +290,78 @@ pub fn target(l: &MonitorLayout, it: &Item, now: u64) -> Option<u32> {
 /// Put `items` where the rules say (in the given order). `fresh` = they just appeared on the
 /// desktop: those matching no rule go to the "new icons" tab, if one is set. Items already in
 /// their tab stay where they are. Returns whether anything moved.
+///
+/// Done as one batch: the rules' tabs and every item's tab are looked up once, the moving items
+/// leave their places in one pass, and each tab gets its newcomers at the end, in input order
+/// (what moving them one by one gives, without walking the whole layout per item).
 pub fn apply(l: &mut MonitorLayout, items: &[&Item], fresh: bool, now: u64) -> bool {
+    use std::collections::{HashMap, HashSet};
+    // Tabs icons can be sent to (plain boxes on any page): tab id -> (page, box id, tab index).
+    let mut tabs: HashMap<u32, (u32, u32, usize)> = HashMap::new();
+    for (p, b) in crate::pages::all_boxes(l).filter(|(_, b)| !b.is_folder()) {
+        for (i, t) in b.tabs.iter().enumerate() {
+            tabs.entry(t.id).or_insert((p, b.id, i));
+        }
+    }
+    let rules: Vec<&Rule> = l.rules.iter().filter(|r| tabs.contains_key(&r.target)).collect();
+    let fallback = if fresh { l.new_items_to.filter(|t| tabs.contains_key(t)) } else { None };
+    // The tab each wanted item is in now.
+    let wanted: HashSet<&ItemKey> = items.iter().map(|it| &it.key).collect();
+    let mut in_tab: HashMap<&ItemKey, u32> = HashMap::new();
+    for (_, b) in crate::pages::all_boxes(l) {
+        for t in &b.tabs {
+            for k in t.items.iter().filter(|k| wanted.contains(k)) {
+                in_tab.entry(k).or_insert(t.id);
+            }
+        }
+    }
+    let mut seen: HashSet<&ItemKey> = HashSet::new();
+    let mut moves: Vec<(u32, ItemKey)> = vec![];
+    for it in items {
+        if !seen.insert(&it.key) {
+            continue;
+        }
+        let dest = rules.iter().find(|r| matches(r, it, now)).map(|r| r.target).or(fallback);
+        let Some(tab) = dest else { continue };
+        if in_tab.get(&it.key) == Some(&tab) {
+            continue;
+        }
+        moves.push((tab, it.key.clone()));
+    }
+    if moves.is_empty() {
+        return false;
+    }
+    drop(in_tab);
+    drop(seen);
+    let keys: Vec<ItemKey> = moves.iter().map(|(_, k)| k.clone()).collect();
+    crate::layout::remove_everywhere(l, &keys);
+    // Each tab's group, in input order.
+    let mut groups: Vec<(u32, Vec<ItemKey>)> = vec![];
+    let mut group_of: HashMap<u32, usize> = HashMap::new();
+    for (tab, k) in moves {
+        let gi = *group_of.entry(tab).or_insert_with(|| {
+            groups.push((tab, vec![]));
+            groups.len() - 1
+        });
+        groups[gi].1.push(k);
+    }
+    for (tab, ks) in groups {
+        let (page, box_id, ti) = tabs[&tab];
+        let boxes = if page == l.page { Some(&mut l.boxes) } else { l.parked.get_mut(&page).map(|c| &mut std::sync::Arc::make_mut(c).boxes) };
+        if let Some(t) = boxes.and_then(|bs| bs.iter_mut().find(|b| b.id == box_id)).and_then(|b| b.tabs.get_mut(ti)) {
+            t.items.extend(ks);
+        }
+    }
+    true
+}
+
+/// The one-item-at-a-time `apply` the batch replaces (kept for the equivalence tests).
+#[cfg(test)]
+pub(crate) fn apply_each(l: &mut MonitorLayout, items: &[&Item], fresh: bool, now: u64) -> bool {
     let mut changed = false;
     for it in items {
         let dest = target(l, it, now).or(if fresh { l.new_items_to.filter(|t| crate::pages::sortable_tab(l, *t).is_some()) } else { None });
         let Some(tab) = dest else { continue };
-        // (The tab may be on another desktop page: done there.)
         let Some((page, box_id, ti)) = crate::pages::find_tab(l, tab) else { continue };
         let there = crate::pages::with_page(l, page, |l| matches!(place_of(l, &it.key), Some(Place::Box { tab: t, .. }) if t == tab)).unwrap_or(false);
         if there {
@@ -566,5 +633,58 @@ mod tests {
         l.new_items_to = Some(docs_t);
         assert!(apply(&mut l, &[&c], true, now));
         assert_eq!(place_of(&l, &c.key), Some(Place::Box { box_id: docs, tab: docs_t }));
+    }
+
+    /// The batch gives what moving items one at a time gave: mixed destinations, items already
+    /// in their tab (or in the wrong one), tabs on another page, a rule for a folder box (passed
+    /// over), the "new icons" tab and an item listed twice.
+    #[test]
+    fn batched_apply_matches_one_by_one() {
+        use crate::pages::{find_item, new_page, switch_to};
+        let now = now_filetime();
+        let g = Grid::new(Rect::new(0.0, 0.0, 1500.0, 1000.0), 75.0, 100.0);
+        let names = ["a.pdf", "b.docx", "c.txt", "d.png", "e.lnk", "f.pdf", "g.txt", "h.jpg", "i.xlsx", "j.zip", "k.pdf", "l.txt"];
+        let its: Vec<Item> = names
+            .iter()
+            .map(|n| if n.ends_with(".lnk") { shortcut(n, r"C:\Apps\x.exe") } else { item(n, ItemKind::File, 10, now) })
+            .collect();
+        let keys: Vec<ItemKey> = its.iter().map(|i| i.key.clone()).collect();
+        let mut l = MonitorLayout::default();
+        reconcile(&mut l, &keys, &g);
+        let first = l.page;
+        let docs = create_box(&mut l, Rect::new(600.0, 0.0, 150.0, 300.0), "Docs", BoxStyle::default());
+        crate::layout::add_tab(&mut l, docs, "PDF");
+        let fb = crate::layout::create_folder_box(&mut l, Rect::new(900.0, 0.0, 150.0, 300.0), "F", BoxStyle::default(), r"C:\F");
+        let (docs_t, pdf_t) = (l.boxes[0].tabs[0].id, l.boxes[0].tabs[1].id);
+        let fb_t = l.boxes.iter().find(|b| b.id == fb).unwrap().tabs[0].id;
+        let p2 = new_page(&mut l, "", None);
+        switch_to(&mut l, p2);
+        let pics = create_box(&mut l, Rect::new(0.0, 500.0, 150.0, 300.0), "Pics", BoxStyle::default());
+        let pics_t = l.boxes[0].tabs[0].id;
+        create_box(&mut l, Rect::new(300.0, 500.0, 150.0, 300.0), "New", BoxStyle::default());
+        let new_t = l.boxes[1].tabs[0].id;
+        // k.pdf in the pictures tab (wrong), d.png there (right).
+        move_to_tab(&mut l, &[keys[10].clone(), keys[3].clone()], pics, 0, None);
+        switch_to(&mut l, first);
+        // f.pdf already in the PDF tab, between residents.
+        move_to_tab(&mut l, &[keys[2].clone(), keys[5].clone(), keys[6].clone()], docs, 1, None);
+        new_rule(&mut l, "type", "pdf", fb_t);
+        new_rule(&mut l, "type", "pdf", pdf_t);
+        new_rule(&mut l, "type", "documents", docs_t);
+        new_rule(&mut l, "type", "images", pics_t);
+        l.new_items_to = Some(new_t);
+        let order: Vec<&Item> = [4, 0, 9, 3, 7, 1, 10, 5, 0, 11, 8, 2, 6].iter().map(|&i| &its[i]).collect();
+        for fresh in [false, true] {
+            let (mut a, mut b) = (l.clone(), l.clone());
+            assert_eq!(apply(&mut a, &order, fresh, now), apply_each(&mut b, &order, fresh, now));
+            assert_eq!(a, b, "fresh = {fresh}");
+            assert!(!apply(&mut a, &order, fresh, now));
+            assert!(!apply_each(&mut b, &order, fresh, now));
+        }
+        let mut a = l.clone();
+        apply(&mut a, &order, false, now);
+        assert_eq!(find_item(&a, &keys[10]).map(|x| x.1), Some(Place::Box { box_id: docs, tab: pdf_t }));
+        assert_eq!(find_item(&a, &keys[7]).map(|x| (x.0, x.1)), Some((p2, Place::Box { box_id: pics, tab: pics_t })));
+        assert_eq!(a.boxes[0].tabs[1].items, [keys[5].clone(), keys[0].clone(), keys[10].clone()]);
     }
 }

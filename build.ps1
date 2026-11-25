@@ -18,6 +18,9 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 if ($Installer) { $Release = $true; $Only = 'all' }
 $config = if ($Release) { 'Release' } else { 'Debug' }
+# Cargo's output folder: CARGO_TARGET_DIR when set (cargo honors it too), e.g. to build a release
+# while copies from target\release are running and hold their files.
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
 # A shell started before rustup was installed may not have cargo on PATH yet.
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path "$env:USERPROFILE\.cargo\bin\cargo.exe")) {
     $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
@@ -54,7 +57,7 @@ if ($Only -in 'all', 'rust') {
     # manifest and logo, packed unsigned (registered per user by the installer, files from the
     # install folder).
     Step "pack menu package ($config)" {
-        $tdir = Join-Path $root "target\$($config.ToLower())"
+        $tdir = Join-Path $target $config.ToLower()
         $pk = Join-Path $root "out\$config\menu-package"
         if (Test-Path $pk) { Remove-Item $pk -Recurse -Force }
         New-Item -ItemType Directory -Force $pk | Out-Null
@@ -83,7 +86,7 @@ if ($Installer) {
             New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
             Copy-Item $_.FullName $dst
         }
-        foreach ($exe in 'deskboxes.exe', 'deskboxes-watchdog.exe', 'deskboxes_menu.dll', 'deskboxes-menu.msix', 'menu-logo.png') { Copy-Item (Join-Path $root "target\release\$exe") $stage }
+        foreach ($exe in 'deskboxes.exe', 'deskboxes-watchdog.exe', 'deskboxes_menu.dll', 'deskboxes-menu.msix', 'menu-logo.png') { Copy-Item (Join-Path $target "release\$exe") $stage }
         # The Visual C++ runtime next to the programs (app-local, as Microsoft's redist.txt allows),
         # so the end user's PC needs no Visual C++ Redistributable.
         $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -95,9 +98,9 @@ if ($Installer) {
     }
     Step 'pack installer' {
         $ver = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-        $p = Start-Process (Join-Path $root 'target\release\deskboxes-setup.exe') -ArgumentList '--pack', "`"$stage`"", "`"$setupOut`"", '--app-version', $ver -NoNewWindow -Wait -PassThru
+        $p = Start-Process (Join-Path $target 'release\deskboxes-setup.exe') -ArgumentList '--pack', "`"$stage`"", "`"$setupOut`"", '--app-version', $ver -NoNewWindow -Wait -PassThru
         $global:LASTEXITCODE = $p.ExitCode
     }
     Write-Host ("Installer: {0} ({1:n1} MB)" -f $setupOut, ((Get-Item $setupOut).Length / 1MB)) -ForegroundColor Green
 }
-Write-Host "Build finished: out\$config\ and target\$($config.ToLower())\" -ForegroundColor Green
+Write-Host "Build finished: out\$config\ and $(Join-Path $target $config.ToLower())\" -ForegroundColor Green

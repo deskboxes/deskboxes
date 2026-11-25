@@ -14,7 +14,11 @@ use deskboxes_render::{Bitmap, Gpu, Surface, TextLayout};
 use deskboxes_shell::{autostart, hide, items, reg, turnon, wallpaper};
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// What a box-drag preview was made for (see `App::preview_footprint`): each box's covered
+/// columns and rows, the grid, and the page, icons' generation and loose / pushed-aside counts.
+pub type PreviewKey = (Vec<(i32, i32, i32, i32)>, (i32, i32, u32, u32, u32, u32), (u32, u64, usize, usize));
 use std::path::PathBuf;
 use std::time::Instant;
 use windows::core::{w, PCWSTR};
@@ -61,7 +65,12 @@ pub const T_ABOVE_DRAG: usize = 19;
 const T_MENU_WAIT: usize = 20;
 /// How long a menu may take to show before the shell host counts as stuck, ms (a cold menu with
 /// slow shell extensions on a slow PC takes a few seconds; a stuck host never shows one).
-const MENU_WAIT_MS: u32 = 8000;
+/// The stages of a menu's wait (`menu_wait_due`): the host's reader has it ("got"), its UI thread
+/// is building it ("building"), then shown. Each its own limit, so a slow PC is not taken for a
+/// stuck host (a host taken for stuck is replaced, and the menu shown again once only).
+const MENU_GOT_MS: u32 = 5000;
+const MENU_START_MS: u32 = 20000;
+const MENU_BUILD_MS: u32 = 30000;
 /// Labels of icons out of view are made while idle.
 pub const T_PREP: usize = 40;
 /// Settings changed from the settings window are written a moment later (sliders send many).
@@ -70,6 +79,8 @@ const T_SAVE_SETTINGS: usize = 41;
 const T_WALLPAPER: usize = 42;
 /// The taskbar check again, a moment after the desktop got the front.
 const T_TASKBAR: usize = 43;
+/// Explorer's desktop view was not there to hide its icons (at sign-in): asked again.
+const T_HIDE_RETRY: usize = 44;
 /// The layout file's name: one for every screen setup.
 pub const LAYOUT_NAME: &str = "desktop";
 /// Hover highlights fading in, s.
@@ -102,7 +113,7 @@ const SNAP_GLIDE_S: f32 = 0.09;
 /// An icon that has just disappeared from the desktop (deleted, moved away), drawn fading out.
 pub struct Vanish {
     pub icon: Option<deskboxes_render::Bitmap>,
-    pub label: Option<(deskboxes_render::TextLayout, Option<deskboxes_render::Bitmap>)>,
+    pub label: Option<(deskboxes_render::TextLayout, Option<deskboxes_render::Shadow>)>,
     pub icon_rect: Rect,
     pub label_at: Pt,
     pub in_box: Option<u32>,
@@ -341,6 +352,21 @@ pub struct Stats {
     pub drag_interval_ms_p50: f64,
     pub drag_interval_ms_p95: f64,
     pub drag_interval_ms_max: f64,
+    /// Screens drawn (one per monitor in use).
+    pub screens: usize,
+    /// Whole frames (every screen drawn, the accessibility copy): CPU time on the UI thread.
+    pub frame_count: usize,
+    pub frame_ms_p50: f64,
+    pub frame_ms_p95: f64,
+    pub frame_ms_p99: f64,
+    pub frame_ms_max: f64,
+    /// From an input message (pointer, button, key, wheel) reaching the window to the end of the
+    /// frame that showed it (handed to the compositor; presenting is not in it).
+    pub input_count: usize,
+    pub input_ms_p50: f64,
+    pub input_ms_p95: f64,
+    pub input_ms_p99: f64,
+    pub input_ms_max: f64,
 }
 
 pub struct App {
@@ -368,8 +394,15 @@ pub struct App {
     pub items: HashMap<ItemKey, Item>,
     /// Bumped whenever `items` changes (cached orders and layouts check it).
     pub items_gen: u64,
+    /// Folder boxes' items, grouped by folder (lowercase) and sorted, for `items_gen` (see
+    /// `fill_folder_boxes`).
+    pub folder_sorted: (u64, HashMap<String, Vec<ItemKey>>),
     /// `items_gen` all labels were made for (`prep_more`).
     pub prep_gen: u64,
+    /// The labels `prep_more` still has to make, for `prep_queue_gen`, and how far it got.
+    pub prep_queue: Vec<(ItemKey, Rect, Option<u32>)>,
+    pub prep_queue_gen: u64,
+    pub prep_pos: usize,
     /// Settings changed and not yet written (`save_settings_soon`).
     pub settings_dirty: bool,
     /// Each tab's shown order (A–Z sorted), cached: see `az::Shown`.
@@ -378,7 +411,15 @@ pub struct App {
     /// without checking its fingerprint again (hashing every item) on each use.
     pub paint_memo: RefCell<Option<HashMap<u32, (std::rc::Rc<Vec<ItemKey>>, std::rc::Rc<Vec<(char, usize)>>)>>>,
     pub bitmaps: HashMap<u32, Bitmap>,
-    pub icon_imgs: HashMap<u32, IconImage>,
+    /// Snapshot icons not on the GPU yet: a start uploads those in view before the first frame
+    /// (`upload_in_view`), the rest a slice at a time while idle (`prep_more`).
+    pub uploads: BTreeSet<u32>,
+    /// The worker is making pictures after a scan (`Ev::PicturesPending`), and what was last
+    /// asked of it to make first (a hash of the items in view).
+    pub pictures_pending: bool,
+    pub pictures_asked: u64,
+    /// (Shared with a snapshot being written: never copied for it.)
+    pub icon_imgs: HashMap<u32, std::sync::Arc<IconImage>>,
     pub layout: MonitorLayout,
     pub hist: History,
     /// The layout file's name ("desktop": one for every screen setup).
@@ -390,6 +431,14 @@ pub struct App {
     pub cur: usize,
     /// A screen not in use is being drawn (no pointer feedback, search or tooltips on it).
     pub paint_inactive: bool,
+    /// Changes on disk waiting for `T_FS`: everything to list again, or these folders
+    /// (`worker::dir_key`).
+    pub fs_dirty: (bool, HashSet<String>),
+    /// The screens not in use need drawing again (something changed that may show there; set by
+    /// `invalidate`, not by `invalidate_local`).
+    pub others_dirty: bool,
+    /// Something on a screen not in use animated in its last frame (it is drawn again).
+    pub others_anim: bool,
     /// The screens as last found (a display change that keeps them changes nothing).
     pub screens_sig: String,
     /// Fixture screens (`--screens`), as test windows.
@@ -399,10 +448,15 @@ pub struct App {
     pub drag: Drag,
     pub scroll: HashMap<u32, f32>,
     pub labels: HashMap<(ItemKey, bool, i32), TextLayout>,
+    /// The label widths each icon has layouts for, used longest ago first (`remember_label`).
+    pub label_widths: HashMap<ItemKey, Vec<i32>>,
     /// Our icons being dragged through OLE (out of our window and maybe back): keys and start.
     pub own_drag: Option<(Vec<ItemKey>, Pt)>,
     /// Desktop labels pre-rendered with their shadow (same keys as `labels`).
-    pub label_bmps: HashMap<(ItemKey, bool, i32), deskboxes_render::Bitmap>,
+    pub label_bmps: HashMap<(ItemKey, bool, i32), deskboxes_render::Shadow>,
+    /// Labels whose shadow is to be made (`make_shadows`), and their keys.
+    pub shadow_queue: Vec<((ItemKey, bool, i32), deskboxes_render::TextLayout, f32, f32)>,
+    pub shadow_queued: HashSet<(ItemKey, bool, i32)>,
     /// Boxes' own views: icons at other sizes, type names, Details texts.
     pub views: crate::views::ViewState,
     pub label_tf: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
@@ -423,9 +477,11 @@ pub struct App {
     pub wall_used: (String, i32, u32),
     /// A small blurred copy of the wallpaper as pixels: w, h, BGRA, monitor px per sample (the
     /// color behind a blending icon).
-    pub wall_grid: Option<(u32, u32, Vec<u8>, f32)>,
+    /// Made the first time an icon blends in (`wall_color_at`), not with every wallpaper: None
+    /// not made yet, Some(None) could not be made.
+    pub wall_grid: RefCell<Option<WallGrid>>,
     /// Recolored icons (tint, blending), keyed by icon, color and kind: see `iconfx`.
-    pub fx_cache: RefCell<HashMap<(u32, u32, u8), Bitmap>>,
+    pub fx_cache: RefCell<crate::iconfx::FxCache>,
     pub light: bool,
     pub worker: worker::WorkerTx,
     pub host: Option<deskboxes_ipc::HostClient>,
@@ -464,7 +520,14 @@ pub struct App {
     pub box_edit: Option<BoxEdit>,
     /// What the settings window last got (boxes, styles, default style, language): resent when
     /// the layout changes it, so an open window stays current.
+    settings_open_request: Option<u32>,
     pub settings_sent: String,
+    /// The language the host has Settings' fixed texts in (strings, color and category names,
+    /// known folders): later refreshes leave them out (None: send them with the next one).
+    settings_static_sent: Option<Lang>,
+    /// Saved layouts' and backups' box counts, by file, with the file's time and size they were
+    /// read at (see `saved::box_count`).
+    pub saved_meta: RefCell<HashMap<std::path::PathBuf, ((Option<std::time::SystemTime>, u64), Option<usize>)>>,
     /// The update status in the data last sent to the settings window (JSON).
     pub update_sent: String,
     /// Rolled-up boxes opened because the pointer is on them.
@@ -511,19 +574,26 @@ pub struct App {
     /// Leave Explorer's icons hidden on the way out: Deskboxes comes straight back (the session
     /// ends with the autostart intact, or an update installs and starts it again).
     pub keep_hidden: bool,
+    /// Tries left to hide Explorer's icons (`T_HIDE_RETRY`).
+    pub hide_tries: u32,
     /// No snapshot to show yet (first run): keep Explorer's icons until the first scan is drawn,
     /// so the desktop is never empty while the cold scan runs.
     pub hide_after_scan: bool,
     /// The icon snapshot is out of date (items or icons changed since it was written).
     pub snapshot_dirty: bool,
     /// The snapshot being written (waited for on the way out).
-    pub snapshot_job: Option<std::thread::JoinHandle<()>>,
     /// The page a drop or paste waiting for its files was made on.
     pub pending_drop_page: Option<u32>,
     /// The menu being shown is a replay of one a stuck shell host never showed (and the one
     /// waited for is: `menu_wait_replay`).
     pub replaying_menu: bool,
     pub menu_wait_replay: bool,
+    /// How far the menu waited for got (`menu_progress`).
+    pub menu_stage: &'static str,
+    /// Shell hosts started (for unique pipe names), and when one may be started again after
+    /// several failed in a row (`start_host`).
+    pub host_count: u32,
+    pub host_backoff: Option<Instant>,
     /// The box of the icon last clicked (None: a loose one): which folder box a folder in it
     /// opens in, when the same folder shows in two.
     pub item_box: Option<u32>,
@@ -537,11 +607,20 @@ pub struct App {
     pub diag: bool,
     pub drag_draw_times: Vec<f32>,
     pub drag_intervals: Vec<f32>,
+    /// Whole frames' CPU times (`Stats::frame_ms_*`).
+    pub frame_times: Vec<f32>,
+    /// Input to the end of its frame (`Stats::input_ms_*`), and the first input not drawn yet
+    /// (with `anim::requests()` then: one that asked for no frame is not timed).
+    pub input_times: Vec<f32>,
+    pub input_at: Option<(Instant, u64)>,
     pub last_drag_frame: Option<Instant>,
     pub taskbar_created: u32,
     /// Loose icons as they would settle with the box being moved or resized where it is now
     /// (they step aside live, and back).
     pub preview_loose: Option<std::collections::BTreeMap<ItemKey, Cell>>,
+    /// The last box-drag preview and what it was made for (`update_preview`); any change of the
+    /// layout drops it.
+    pub preview_cache: Option<(PreviewKey, std::collections::BTreeMap<ItemKey, Cell>)>,
     /// Our icons dragged in between two loose ones: the dragged icons, where they would go in
     /// and which way the icons there move to make room (shown in `preview_loose`).
     pub room: Option<(Vec<ItemKey>, Cell, (i32, i32))>,
@@ -549,6 +628,8 @@ pub struct App {
     /// them where they would go (the cell under the pointer); shown once the pointer rests
     /// (`box_room`), the others gliding aside as on the desktop.
     pub(crate) box_want: Option<(u32, Vec<ItemKey>, std::rc::Rc<Vec<ItemKey>>)>,
+    /// The slot `box_want` was made for (`box_room_slot`): pointer moves inside it reuse it.
+    box_want_slot: Option<(u32, usize, u64, usize, u32)>,
     pub box_room: Option<(u32, Vec<ItemKey>, std::rc::Rc<Vec<ItemKey>>)>,
     /// Boxes whose icons glide when their order changes (one icons are being dragged in), and
     /// for each icon where it was in the box's content (unscrolled) and its glide.
@@ -853,35 +934,63 @@ struct WallPrefetch {
     color: u32,
     img: Option<(IconImage, (u32, u32))>,
     ms: f64,
+    /// Read from `wallcache` (not decoded).
+    cached: bool,
 }
 
 static WALL_PREFETCH: std::sync::Mutex<Option<std::thread::JoinHandle<WallPrefetch>>> = std::sync::Mutex::new(None);
 
-fn start_wallpaper_prefetch(mon: RECT) {
+/// A small blurred copy of the wallpaper as pixels: w, h, BGRA, monitor px per sample.
+pub type WallGrid = Option<(u32, u32, Vec<u8>, f32)>;
+
+/// A changed wallpaper being decoded off the UI thread (`start_wallpaper_change`), per monitor
+/// (its left, top): the change's number (a newer one replaces it), the signature it is for, and
+/// the result when it is ready (`wallpaper_ready` shows it; until then the old one stays).
+struct WallChange {
+    at: (i32, i32),
+    n: u64,
+    sig: String,
+    done: Option<WallPrefetch>,
+}
+
+static WALL_CHANGES: std::sync::Mutex<Vec<WallChange>> = std::sync::Mutex::new(Vec::new());
+
+/// The decode of a wallpaper (at its on-screen size on a `mw` x `mh` monitor, never larger).
+fn decode_wallpaper(path: &str, pos: i32, mw: f32, mh: f32) -> Option<(IconImage, (u32, u32))> {
+    if path.is_empty() {
+        return None;
+    }
+    deskboxes_render::decode_image_cpu(path, |iw, ih| {
+        let r = deskboxes_render::wallpaper_rect(pos, iw as f32, ih as f32, mw, mh);
+        ((r.right - r.left) / iw as f32).max((r.bottom - r.top) / ih as f32)
+    })
+    .map_err(|e| log::warn!("wallpaper {path}: {e}"))
+    .ok()
+}
+
+fn start_wallpaper_prefetch(mon: RECT, cache: std::path::PathBuf) {
     let (mw, mh) = ((mon.right - mon.left) as f32, (mon.bottom - mon.top) as f32);
     let h = std::thread::spawn(move || {
         let t = Instant::now();
-        let init = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
         let (mut path, mut pos, color) = wallpaper::from_registry();
         if let Ok(p) = std::env::var("DESKBOXES_WALLPAPER") {
             path = p;
             pos = 4;
         }
-        // Decoded at its on-screen size, never larger.
-        let img = if path.is_empty() {
-            None
-        } else {
-            deskboxes_render::decode_image_cpu(&path, |iw, ih| {
-                let r = deskboxes_render::wallpaper_rect(pos, iw as f32, ih as f32, mw, mh);
-                ((r.right - r.left) / iw as f32).max((r.bottom - r.top) / ih as f32)
-            })
-            .map_err(|e| log::warn!("wallpaper {path}: {e}"))
-            .ok()
-        };
+        // As decoded at the last start, if the picture and the screen are the same.
+        let key = if path.is_empty() { None } else { crate::wallcache::key(&path, pos, mw, mh) };
+        if let Some(img) = key.as_deref().and_then(|k| crate::wallcache::read(&cache, k)) {
+            return WallPrefetch { path, pos, color, img: Some(img), ms: t.elapsed().as_secs_f64() * 1000.0, cached: true };
+        }
+        let init = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+        let img = decode_wallpaper(&path, pos, mw, mh);
         if init.is_ok() {
             unsafe { windows::Win32::System::Com::CoUninitialize() };
         }
-        WallPrefetch { path, pos, color, img, ms: t.elapsed().as_secs_f64() * 1000.0 }
+        if let (Some(k), Some((im, orig))) = (key, &img) {
+            crate::wallcache::write_later(cache, k, im.clone(), *orig);
+        }
+        WallPrefetch { path, pos, color, img, ms: t.elapsed().as_secs_f64() * 1000.0, cached: false }
     });
     if let Ok(mut g) = WALL_PREFETCH.lock() {
         *g = Some(h);
@@ -973,7 +1082,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     // The wallpaper read and decoded on its own thread from here on: at sign-in that took most of
     // the time before the first frame (2.4 s of 2.7 s on the dev PC), and nothing was on screen
     // until it was done.
-    start_wallpaper_prefetch(primary_monitor().0);
+    start_wallpaper_prefetch(primary_monitor().0, paths.snapshot.with_file_name("wallpaper.cache"));
     let since_sign_in = if real_desktop { seconds_since_sign_in() } else { None };
     let desktop_mode = !args.window;
     let fixture = args.desktop_dir.clone();
@@ -995,18 +1104,38 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let snap = snap.filter(|s| s.source_id == source_id);
 
     // 2. Devices and the surface.
-    let gpu = match Gpu::new() {
-        Ok(g) => g,
-        Err(e) => {
-            log::error!("no graphics device: {e}; native icons stay visible");
-            hide::restore();
-            return 3;
+    // (At sign-in the graphics driver can come late: tried again for a while before Explorer's
+    // icons are shown, which are hidden still from the last session.)
+    let gpu = {
+        let tg = Instant::now();
+        let limit = if real_desktop { 20.0 } else { 0.0 };
+        loop {
+            match Gpu::new() {
+                Ok(g) => {
+                    if tg.elapsed().as_secs_f64() > 0.5 {
+                        log::info!("graphics device after {:.1} s", tg.elapsed().as_secs_f64());
+                    }
+                    break g;
+                }
+                Err(e) if tg.elapsed().as_secs_f64() < limit => {
+                    log::warn!("no graphics device yet: {e}; trying again");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => {
+                    log::error!("no graphics device: {e}; native icons stay visible");
+                    hide::restore();
+                    return 3;
+                }
+            }
         }
     };
     log::info!("MEM after graphics devices: private/working set {:.1?} MB", mem_mb());
     let t_devices = t0.elapsed().as_secs_f64() * 1000.0;
     // The screens: the main one is made now, the others once it is on screen.
     let mut monitors = crate::screens::monitors();
+    if args.one_screen {
+        monitors.truncate(1);
+    }
     let fixture_screens = args.screens.clone().unwrap_or_default();
     let (mon_full, work_px) = match monitors.first() {
         Some(m) if desktop_mode => (m.rect, m.work),
@@ -1026,6 +1155,17 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         monitors.push(crate::screens::Monitor { id: "main".into(), name: String::new(), n: 1, rect: mon_full, work: work_px, dpi: 96 });
     }
     let test_rect = (!desktop_mode).then(|| monitors[0].rect);
+    // Started before Explorer's desktop is there (a fast sign-in, Explorer restarting): waited
+    // for, rather than failing and showing its icons.
+    if desktop_mode {
+        let tw = Instant::now();
+        while hide::progman().is_invalid() && tw.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if tw.elapsed().as_secs_f64() > 0.3 {
+            log::info!("waited {:.1} s for Explorer's desktop", tw.elapsed().as_secs_f64());
+        }
+    }
     let (hwnd, origin_px) = match create_surface_window(desktop_mode, mon_full, test_rect) {
         Ok(x) => x,
         Err(e) => {
@@ -1148,10 +1288,17 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         items: HashMap::new(),
         items_gen: 0,
         prep_gen: u64::MAX,
+        folder_sorted: (u64::MAX, HashMap::new()),
+        prep_queue: vec![],
+        prep_queue_gen: u64::MAX,
+        prep_pos: 0,
         settings_dirty: false,
         shown_cache: RefCell::new(HashMap::new()),
         paint_memo: RefCell::new(None),
         bitmaps: HashMap::new(),
+        uploads: BTreeSet::new(),
+        pictures_pending: false,
+        pictures_asked: 0,
         icon_imgs: HashMap::new(),
         layout: lay,
         hist: History::default(),
@@ -1160,6 +1307,9 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         screens: vec![],
         cur: 0,
         paint_inactive: false,
+        fs_dirty: (false, HashSet::new()),
+        others_dirty: true,
+        others_anim: false,
         screens_sig: crate::screens::signature(&monitors),
         fixture_screens,
         sel: Selection::default(),
@@ -1167,8 +1317,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         drag: Drag::None,
         scroll: HashMap::new(),
         labels: HashMap::new(),
+        label_widths: HashMap::new(),
         own_drag: None,
         label_bmps: HashMap::new(),
+        shadow_queue: Vec::new(),
+        shadow_queued: HashSet::new(),
         views: Default::default(),
         label_tf,
         title_tf,
@@ -1182,8 +1335,8 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         wall_src: None,
         wall_sig: String::new(),
         wall_used: Default::default(),
-        wall_grid: None,
-        fx_cache: RefCell::new(HashMap::new()),
+        wall_grid: RefCell::new(None),
+        fx_cache: RefCell::new(Default::default()),
         light,
         worker,
         host: None,
@@ -1207,7 +1360,10 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         pending_rename: None,
         pending_new: None,
         box_edit: None,
+        settings_open_request: None,
         settings_sent: String::new(),
+        settings_static_sent: None,
+        saved_meta: RefCell::new(HashMap::new()),
         update_sent: String::new(),
         revealed: Default::default(),
         open_t: HashMap::new(),
@@ -1234,12 +1390,15 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         scanned_once: false,
         quitting: false,
         keep_hidden: false,
+        hide_tries: 0,
         hide_after_scan: false,
         snapshot_dirty: false,
-        snapshot_job: None,
         pending_drop_page: None,
         replaying_menu: false,
         menu_wait_replay: false,
+        menu_stage: "sent to",
+        host_count: 0,
+        host_backoff: None,
         item_box: None,
         frame_ok: false,
         template_pending,
@@ -1248,11 +1407,16 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         diag: false,
         drag_draw_times: Vec::new(),
         drag_intervals: Vec::new(),
+        frame_times: Vec::new(),
+        input_times: Vec::new(),
+        input_at: None,
         last_drag_frame: None,
         taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         preview_loose: None,
+        preview_cache: None,
         room: None,
         box_want: None,
+        box_want_slot: None,
         box_room: None,
         glide_boxes: BTreeSet::new(),
         box_glide_at: HashMap::new(),
@@ -1300,11 +1464,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     let t_init = t0.elapsed().as_secs_f64() * 1000.0;
     if let Some(s) = snap {
         app.stats.snapshot_items = s.items.len();
+        // Uploaded as they come into view (the first frame's before it is drawn), the rest
+        // while idle: icons on other pages or scrolled away do not hold up the first frame.
         for (i, img) in s.icons.into_iter().enumerate() {
-            if let Ok(b) = app.gpu.bitmap(&img) {
-                app.bitmaps.insert(i as u32, b);
-            }
-            app.icon_imgs.insert(i as u32, img);
+            app.uploads.insert(i as u32);
+            app.icon_imgs.insert(i as u32, std::sync::Arc::new(img));
         }
         for it in s.items {
             app.items.insert(it.key.clone(), it);
@@ -1345,12 +1509,13 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         let s = hide::set_hidden(true);
         app.stats.hide_ms = th.elapsed().as_secs_f64() * 1000.0;
         log::info!("PHASE hide_icons ms={:.1} state={s:?}", app.stats.hide_ms);
+        app.hide_again_if(&s);
     }
     app.screens = vec![crate::screens::ScreenRt::empty(monitors[0].clone())];
     app.add_other_screens(monitors);
     app.folder_sync();
     let _ = app.worker.send(Req::Scan);
-    deskboxes_shell::watch::watch(dirs.iter().map(|d| d.path.clone()).collect(), || events::post(Ev::Rescan));
+    deskboxes_shell::watch::watch(dirs.iter().map(|d| d.path.clone()).collect(), |d| events::post(Ev::DirChanged(d.display().to_string())));
     if !app.args.no_host {
         SetTimer(Some(msg_hwnd), T_HOST, 300, None);
     }
@@ -1389,10 +1554,15 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
 }
 
 impl App {
-    /// This monitor's wallpaper from Explorer (`IDesktopWallpaper`): (file, position, color).
-    fn monitor_wallpaper(&self) -> (String, i32, u32) {
-        let mons = wallpaper::monitors();
-        let m = mons.iter().find(|m| m.rect.left == self.mon.left && m.rect.top == self.mon.top).or(mons.first()).cloned();
+    /// This monitor's entry in Explorer's list (`wallpaper::monitors`).
+    fn monitor_of<'a>(&self, mons: &'a [wallpaper::MonitorWallpaper]) -> Option<&'a wallpaper::MonitorWallpaper> {
+        mons.iter().find(|m| m.rect.left == self.mon.left && m.rect.top == self.mon.top).or(mons.first())
+    }
+
+    /// This monitor's wallpaper from Explorer's list (`IDesktopWallpaper`, read once for every
+    /// screen): (file, position, color).
+    fn monitor_wallpaper_in(&self, mons: &[wallpaper::MonitorWallpaper]) -> (String, i32, u32) {
+        let m = self.monitor_of(mons).cloned();
         let (mut path, mut pos, color) = m.map(|m| (m.path, m.position, m.color)).unwrap_or_default();
         // DESKBOXES_WALLPAPER: a test copy on another picture (filled), for screenshots.
         if let Ok(p) = std::env::var("DESKBOXES_WALLPAPER") {
@@ -1403,20 +1573,29 @@ impl App {
     }
 
     pub fn load_wallpaper(&mut self) {
+        // At start: what the prefetch thread read and decoded (see `start_wallpaper_prefetch`).
+        let pre = WALL_PREFETCH.lock().ok().and_then(|mut g| g.take()).and_then(|h| h.join().ok());
+        self.load_wallpaper_with(pre, None);
+    }
+
+    /// Show a wallpaper: `pre` read and decoded already (else here), `sig` its signature when
+    /// known (`wallpaper_sig_in`).
+    fn load_wallpaper_with(&mut self, pre: Option<WallPrefetch>, sig: Option<String>) {
         let (mw, mh) = ((self.mon.right - self.mon.left) as u32, (self.mon.bottom - self.mon.top) as u32);
         let t = Instant::now();
         let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
-        // At start: what the prefetch thread read and decoded (see `start_wallpaper_prefetch`).
-        let pre = WALL_PREFETCH.lock().ok().and_then(|mut g| g.take()).and_then(|h| h.join().ok());
         let prefetched = pre.is_some();
+        let mut mons_read = None;
         let (path, pos, color, img, how) = match pre {
             Some(p) => {
                 let img = p.img.and_then(|(im, o)| self.gpu.bitmap(&im).map_err(|e| log::warn!("wallpaper upload: {e}")).ok().map(|b| (b, o)));
-                let how = format!("prefetched in {:.0} ms, waited {:.0} ms", p.ms, ms(t));
+                let how = format!("{} in {:.0} ms, waited {:.0} ms", if p.cached { "read from the cache" } else { "prefetched" }, p.ms, ms(t));
                 (p.path, p.pos, p.color, img, how)
             }
             None => {
-                let (path, pos, color) = self.monitor_wallpaper();
+                let mons = wallpaper::monitors();
+                let (path, pos, color) = self.monitor_wallpaper_in(&mons);
+                mons_read = Some(mons);
                 let t_info = ms(t);
                 // Decoded at its on-screen size, never larger.
                 let img = if path.is_empty() {
@@ -1455,17 +1634,12 @@ impl App {
             .map_err(|e| log::warn!("wallpaper surface: {e}"))
             .ok();
         self.backdrops.clear();
-        const GRID: u32 = 16;
-        self.wall_grid = self
-            .gpu
-            .blurred_wallpaper(img.as_ref().map(|(b, o)| (b, *o)), bg, pos, mw, mh, GRID, 40.0 * self.scale)
-            .and_then(|b| self.gpu.pixels_of(&b))
-            .map(|(w, h, px)| (w, h, px, GRID as f32))
-            .map_err(|e| log::warn!("wallpaper colors: {e}"))
-            .ok();
+        *self.wall_grid.get_mut() = None;
         self.fx_cache.borrow_mut().clear();
         self.wall_src = Some((img, bg, pos, mw, mh));
-        if prefetched {
+        if let Some(s) = sig {
+            self.wall_sig = s;
+        } else if prefetched {
             // Read from the registry, not from Explorer: Explorer's answer is checked a little
             // later (`wallpaper_check`), when it is less busy and the desktop is on screen.
             self.wall_sig = String::new();
@@ -1473,7 +1647,8 @@ impl App {
                 SetTimer(Some(self.msg_hwnd), T_WALLPAPER, 3000, None);
             }
         } else {
-            self.wall_sig = Self::wallpaper_sig();
+            let mons = mons_read.unwrap_or_else(wallpaper::monitors);
+            self.wall_sig = self.wallpaper_sig_in(&mons);
         }
         let t_fx = ms(t_draw);
         self.ensure_backdrops();
@@ -1513,39 +1688,120 @@ impl App {
         }
     }
 
-    /// What the wallpaper is now (file, its time and size, layout, color): a change means load
-    /// it again. Windows does not always tell top-level windows (Settings › Personalization).
-    pub fn wallpaper_sig() -> String {
-        let mons = wallpaper::monitors();
-        let mut s = String::new();
-        for m in &mons {
-            let meta = std::fs::metadata(&m.path).ok();
-            let t = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis()).unwrap_or(0);
-            let n = meta.map(|m| m.len()).unwrap_or(0);
-            s.push_str(&format!("{}|{t}|{n}|{}|{};", m.path, m.position, m.color));
-        }
-        s
+    /// What this monitor's wallpaper is now (file, its time and size, layout, color): a change
+    /// means load it again. Windows does not always tell top-level windows (Settings ›
+    /// Personalization). Another monitor's wallpaper changing does not change it.
+    pub fn wallpaper_sig_in(&self, mons: &[wallpaper::MonitorWallpaper]) -> String {
+        let Some(m) = self.monitor_of(mons) else { return "-".into() };
+        let meta = std::fs::metadata(&m.path).ok();
+        let t = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis()).unwrap_or(0);
+        let n = meta.map(|m| m.len()).unwrap_or(0);
+        format!("{}|{t}|{n}|{}|{};", m.path, m.position, m.color)
     }
 
-    /// The wallpaper may have changed: load it again if it did.
-    pub fn wallpaper_check(&mut self) {
-        let sig = Self::wallpaper_sig();
+    /// The wallpaper may have changed (`mons`: Explorer's list, read once for every screen):
+    /// decode it again off the UI thread if it did; the old one stays until it is ready.
+    pub fn wallpaper_check(&mut self, mons: &[wallpaper::MonitorWallpaper]) {
+        let sig = self.wallpaper_sig_in(mons);
         if sig == self.wall_sig {
             return;
         }
         // The first check after a start that drew the wallpaper the registry names: Explorer's
         // answer is the same one (the usual case), nothing to load again.
-        if self.wall_sig.is_empty() && self.monitor_wallpaper() == self.wall_used {
+        let want = self.monitor_wallpaper_in(mons);
+        if self.wall_sig.is_empty() && want == self.wall_used {
             self.wall_sig = sig;
             return;
         }
         log::info!("wallpaper changed");
-        self.load_wallpaper();
-        self.fx_cache.borrow_mut().clear();
+        self.start_wallpaper_change(want, sig);
+    }
+
+    /// Decode this monitor's new wallpaper on a thread of its own (`wallpaper_ready` shows it).
+    fn start_wallpaper_change(&mut self, (path, pos, color): (String, i32, u32), sig: String) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let at = (self.mon.left, self.mon.top);
+        let (mw, mh) = ((self.mon.right - self.mon.left) as f32, (self.mon.bottom - self.mon.top) as f32);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut g = WALL_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
+            // (Already being decoded for this same change.)
+            if g.iter().any(|c| c.at == at && c.sig == sig) {
+                return;
+            }
+            g.retain(|c| c.at != at);
+            g.push(WallChange { at, n, sig: sig.clone(), done: None });
+        }
+        let owner = self.msg_hwnd.0 as isize;
+        let job = {
+            let path = path.clone();
+            move || {
+                let t = Instant::now();
+                let init = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+                let img = decode_wallpaper(&path, pos, mw, mh);
+                if init.is_ok() {
+                    unsafe { windows::Win32::System::Com::CoUninitialize() };
+                }
+                let p = WallPrefetch { path, pos, color, img, ms: t.elapsed().as_secs_f64() * 1000.0, cached: false };
+                let mut g = WALL_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
+                // (Dropped when a newer change for this monitor came meanwhile.)
+                if let Some(c) = g.iter_mut().find(|c| c.at == at && c.n == n) {
+                    c.done = Some(p);
+                    drop(g);
+                    unsafe {
+                        let _ = PostMessageW(Some(HWND(owner as _)), crate::events::WM_APP_WALLPAPER, WPARAM(1), LPARAM(0));
+                    }
+                }
+            }
+        };
+        if let Err(e) = std::thread::Builder::new().name("wallpaper".into()).spawn(job) {
+            log::warn!("wallpaper: no thread ({e}): decoded here");
+            WALL_CHANGES.lock().unwrap_or_else(|p| p.into_inner()).retain(|c| c.at != at);
+            self.load_wallpaper_with(None, Some(sig));
+            self.invalidate();
+        }
+    }
+
+    /// Wallpapers decoded after a change (`start_wallpaper_change`): shown on their screens.
+    pub fn wallpaper_ready(&mut self) {
+        let mut done: Vec<((i32, i32), String, WallPrefetch)> = {
+            let mut g = WALL_CHANGES.lock().unwrap_or_else(|p| p.into_inner());
+            let (ready, waiting): (Vec<WallChange>, Vec<WallChange>) = std::mem::take(&mut *g).into_iter().partition(|c| c.done.is_some());
+            *g = waiting;
+            ready.into_iter().filter_map(|c| Some((c.at, c.sig, c.done?))).collect()
+        };
+        if done.is_empty() {
+            return;
+        }
+        self.for_each_screen(|a| {
+            if let Some(i) = done.iter().position(|d| d.0 == (a.mon.left, a.mon.top)) {
+                let (_, sig, p) = done.remove(i);
+                a.load_wallpaper_with(Some(p), Some(sig));
+            }
+        });
         self.invalidate();
     }
 
+    /// The wallpaper's small blurred copy (`wall_grid`), made from the wallpaper kept.
+    pub fn make_wall_grid(&self) -> WallGrid {
+        const GRID: u32 = 16;
+        let (img, bg, pos, mw, mh) = self.wall_src.as_ref()?;
+        self.gpu
+            .blurred_wallpaper(img.as_ref().map(|(b, o)| (b, *o)), *bg, *pos, *mw, *mh, GRID, 40.0 * self.scale)
+            .and_then(|b| self.gpu.pixels_of(&b))
+            .map(|(w, h, px)| (w, h, px, GRID as f32))
+            .map_err(|e| log::warn!("wallpaper colors: {e}"))
+            .ok()
+    }
+
     pub fn invalidate(&mut self) {
+        self.others_dirty = true;
+        crate::anim::request_frame();
+    }
+
+    /// A frame for a change only the screen in use shows (hover, a caret blink, a drag's
+    /// feedback): the other screens are not drawn again for it.
+    pub fn invalidate_local(&mut self) {
         crate::anim::request_frame();
     }
 
@@ -1721,16 +1977,23 @@ impl App {
     /// screen); onto an icon that takes them in (a folder, a program), a box or open space,
     /// nothing moves.
     pub fn make_room(&mut self, p: Option<Pt>, keys: &[ItemKey]) {
-        // In their own folder box: its order.
-        let bw = p.and_then(|p| self.box_room_order(p, keys)).map(|(id, o)| (id, keys.to_vec(), std::rc::Rc::new(o)));
-        let at = if bw.is_some() { None } else { p.filter(|p| self.drop_onto_item(*p, keys).is_none()).and_then(|p| self.grid_insert_at(p, keys)) };
+        // In a box: its order. Worked out only when the slot under the pointer changes (moves
+        // inside one slot, many per second, reuse it).
+        let slot = p.and_then(|p| self.box_room_slot(p, keys));
+        let reuse = slot.is_some() && slot == self.box_want_slot && self.box_want.as_ref().is_some_and(|(_, k, _)| k.as_slice() == keys);
+        let bw = if reuse { None } else { slot.and_then(|(id, at, ..)| self.box_room_build(id, at, keys).map(|o| (id, keys.to_vec(), std::rc::Rc::new(o)))) };
+        let at = if reuse || bw.is_some() { None } else { p.filter(|p| self.drop_onto_item(*p, keys).is_none()).and_then(|p| self.grid_insert_at(p, keys)) };
         let same_grid = at == self.room.as_ref().map(|(_, c, r)| (*c, *r));
-        let same_box = bw.as_ref().map(|(i, _, o)| (*i, o.clone())) == self.box_want.as_ref().map(|(i, _, o)| (*i, o.clone()));
+        let same_box = reuse || bw.as_ref().map(|(i, _, o)| (*i, o)) == self.box_want.as_ref().map(|(i, _, o)| (*i, o));
         if same_grid && same_box {
+            self.box_want_slot = if self.box_want.is_some() { slot } else { None };
             return;
         }
         self.room = at.map(|(c, dir)| (keys.to_vec(), c, dir));
-        self.box_want = bw;
+        if !reuse {
+            self.box_want = bw;
+        }
+        self.box_want_slot = if self.box_want.is_some() { slot } else { None };
         if self.room.is_none() && self.preview_loose.take().is_some() {
             self.invalidate();
         }
@@ -1760,12 +2023,13 @@ impl App {
             self.invalidate();
         }
         let Some((keys, at, dir)) = self.room.clone() else { return };
-        let mut l = self.layout.clone();
+        let mut l = self.placement_copy();
         layout::insert_along(&mut l, &keys, at, dir, &self.grid);
         layout::settle(&mut l, &self.grid);
         // The gap stays empty: the dragged icons go there only when dropped (they are with the
         // pointer). They stay where they were, unless an icon making room moved in there.
-        let others: std::collections::HashSet<Cell> = l.loose.iter().filter(|(k, _)| !keys.contains(k)).map(|(_, c)| *c).collect();
+        let dragged: HashSet<&ItemKey> = keys.iter().collect();
+        let others: HashSet<Cell> = l.loose.iter().filter(|(k, _)| !dragged.contains(k)).map(|(_, c)| *c).collect();
         for k in &keys {
             match self.layout.loose.get(k) {
                 Some(c) if !others.contains(c) => {
@@ -1873,6 +2137,43 @@ impl App {
         self.visible_cells().into_iter().map(|(k, _, _)| k).collect()
     }
 
+    /// The selected icons in display order, the focused one first: `sel.ordered(&order())`
+    /// without laying out every icon on the desktop for it (a menu for one icon went through
+    /// every row of every open box first). Loose icons by their cell, then each open box's.
+    pub fn selected_in_order(&self) -> Vec<ItemKey> {
+        let set = &self.sel.set;
+        if set.is_empty() {
+            return vec![];
+        }
+        // (The set is in key order, as the loose map is: equal cells keep that order.)
+        let mut loose: Vec<(i32, &ItemKey)> = set
+            .iter()
+            .filter_map(|k| self.layout.loose.get(k).filter(|_| self.items.contains_key(k)).map(|c| (self.grid.index_of(*c), k)))
+            .collect();
+        loose.sort_by_key(|(i, _)| *i);
+        let mut v: Vec<ItemKey> = loose.into_iter().map(|(_, k)| k.clone()).collect();
+        if v.len() < set.len() {
+            for b in &self.layout.boxes {
+                if !self.fully_open(b) {
+                    continue;
+                }
+                let Some(tab) = b.active() else { continue };
+                let items = match &self.box_room {
+                    Some((id, _, order)) if *id == b.id => order.clone(),
+                    _ => self.shown_items(b, tab),
+                };
+                v.extend(items.iter().filter(|k| set.contains(*k)).cloned());
+            }
+        }
+        if let Some(f) = &self.sel.focus {
+            if let Some(i) = v.iter().position(|k| k == f) {
+                let k = v.remove(i);
+                v.insert(0, k);
+            }
+        }
+        v
+    }
+
     /// Icon rect and label rect of an item in a cell (of a box with metrics `m`).
     pub fn item_parts(&self, key: &ItemKey, cell: Rect, full: bool, m: &crate::views::Metrics) -> (Rect, Rect) {
         if m.row() {
@@ -1912,8 +2213,44 @@ impl App {
         }
         let text = self.items.get(key)?.display_name.clone();
         let l = self.gpu.label(&self.label_tf, &text, w, self.line_h, if full { 0 } else { 2 }, true).ok()?;
-        self.labels.insert(k, l.clone());
+        self.remember_label(k, l.clone());
         Some(l)
+    }
+
+    /// Keep a label layout. An icon keeps them for a few widths only (a box being resized meets
+    /// a new width on every move): the width used longest ago goes, with its shadow pictures.
+    pub fn remember_label(&mut self, k: (ItemKey, bool, i32), l: TextLayout) {
+        const WIDTHS: usize = 4;
+        let ws = self.label_widths.entry(k.0.clone()).or_default();
+        if let Some(i) = ws.iter().position(|w| *w == k.2) {
+            ws.remove(i);
+        }
+        ws.push(k.2);
+        if ws.len() > WIDTHS {
+            let old = ws.remove(0);
+            for full in [false, true] {
+                let gone = (k.0.clone(), full, old);
+                self.labels.remove(&gone);
+                self.label_bmps.remove(&gone);
+                for s in &mut self.screens {
+                    s.label_bmps.remove(&gone);
+                }
+            }
+        }
+        self.labels.insert(k, l);
+    }
+
+    /// Forget the labels of these icons (renamed or gone), on every screen.
+    pub fn forget_labels(&mut self, keys: &HashSet<ItemKey>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.labels.retain(|k, _| !keys.contains(&k.0));
+        self.label_bmps.retain(|k, _| !keys.contains(&k.0));
+        for s in &mut self.screens {
+            s.label_bmps.retain(|k, _| !keys.contains(&k.0));
+        }
+        self.label_widths.retain(|k, _| !keys.contains(k));
     }
 
     pub fn hit_rect(&self, key: &ItemKey, cell: Rect, m: &crate::views::Metrics) -> Rect {
@@ -2029,12 +2366,20 @@ impl App {
             n += 1;
             let r = self.grid.cell_rect(*c);
             let tgt = Pt { x: r.x, y: r.y };
-            if let Some(prev) = at.insert(k.clone(), tgt) {
-                if prev != tgt && !self.no_glide.contains(k) {
-                    let from = glide_pos(glide.get(k), prev, now);
-                    glide.insert(k.clone(), (from, now));
-                } else if prev != tgt {
-                    glide.remove(k);
+            // (An icon where it was costs a lookup: no key is copied on an ordinary frame.)
+            match at.get_mut(k) {
+                Some(prev) if *prev == tgt => {}
+                Some(prev) => {
+                    let was = std::mem::replace(prev, tgt);
+                    if !self.no_glide.contains(k) {
+                        let from = glide_pos(glide.get(k), was, now);
+                        glide.insert(k.clone(), (from, now));
+                    } else {
+                        glide.remove(k);
+                    }
+                }
+                None => {
+                    at.insert(k.clone(), tgt);
                 }
             }
         }
@@ -2106,13 +2451,66 @@ impl App {
 
     /// Recompute where loose icons would settle with the dragged box where it is now.
     pub(crate) fn update_preview(&mut self) {
-        // Settling works on the page shown alone: the other pages are not copied along (on every
-        // pointer move of a box drag, with many full pages, that was most of the work).
-        let parked = std::mem::take(&mut self.layout.parked);
-        let mut l = self.layout.clone();
-        self.layout.parked = parked;
+        // Settling depends only on which grid cells the boxes cover: a move of a few pixels that
+        // covers the same cells gives the same result, kept from the last one.
+        let key = self.preview_footprint();
+        if let Some((k, loose)) = &self.preview_cache {
+            if *k == key {
+                self.preview_loose = Some(loose.clone());
+                return;
+            }
+        }
+        // Settling works on the page shown alone, and on the boxes' places, not their icons: the
+        // other pages, the tabs' item lists, rules and folder orders are not copied along (on
+        // every pointer move of a box drag, that was most of the work).
+        let mut l = self.placement_copy();
         layout::settle(&mut l, &self.grid);
+        self.preview_cache = Some((key, l.loose.clone()));
         self.preview_loose = Some(l.loose);
+    }
+
+    /// The page shown as far as where loose icons go is concerned: its boxes' places (without
+    /// their tabs' icons) and its loose and pushed-aside icons; nothing of the other pages,
+    /// rules or folder orders (for previews made on pointer moves).
+    fn placement_copy(&mut self) -> MonitorLayout {
+        let tabs: Vec<Vec<Tab>> = self.layout.boxes.iter_mut().map(|b| std::mem::take(&mut b.tabs)).collect();
+        let boxes = self.layout.boxes.clone();
+        for (b, t) in self.layout.boxes.iter_mut().zip(tabs) {
+            b.tabs = t;
+        }
+        MonitorLayout { boxes, loose: self.layout.loose.clone(), homes: self.layout.homes.clone(), ..Default::default() }
+    }
+
+    /// What a box-drag preview depends on: the grid cells each box covers (as `settle` counts
+    /// them: a cell's inner part touching the box), the grid, and the loose icons' state.
+    fn preview_footprint(&self) -> PreviewKey {
+        let g = &self.grid;
+        let covered = |lo: f32, hi: f32, n: i32, at: &dyn Fn(i32) -> (f32, f32)| -> (i32, i32) {
+            let v: Vec<i32> = (0..n).filter(|&i| {
+                let (a, b) = at(i);
+                a < hi && lo < b
+            }).collect();
+            (v.first().copied().unwrap_or(-1), v.last().copied().unwrap_or(-1))
+        };
+        let boxes = self
+            .layout
+            .boxes
+            .iter()
+            .map(|b| {
+                let r = b.rect;
+                let cols = covered(r.x, r.right(), g.cols, &|c| {
+                    let cr = g.cell_rect(Cell { col: c, row: 0 }).inflate(-4.0);
+                    (cr.x, cr.right())
+                });
+                let rows = covered(r.y, r.bottom(), g.rows, &|row| {
+                    let cr = g.cell_rect(Cell { col: 0, row }).inflate(-4.0);
+                    (cr.y, cr.bottom())
+                });
+                (cols.0, cols.1, rows.0, rows.1)
+            })
+            .collect();
+        let grid = (g.cols, g.rows, g.origin.x.to_bits(), g.origin.y.to_bits(), g.cell_w.to_bits(), g.cell_h.to_bits());
+        (boxes, grid, (self.layout.page, self.items_gen, self.layout.loose.len(), self.layout.homes.len()))
     }
 
     /// Whether anything is animating (keeps the frame clock running).
@@ -2409,18 +2807,33 @@ impl App {
 
     /// The icons a selection band touches: in its box (`scope`), or loose on the desktop.
     fn band_hits(&self, band: Rect, scope: Option<u32>) -> BTreeSet<ItemKey> {
-        self.cells_in_view()
-            .into_iter()
-            .filter(|(k, cell, b)| {
-                // (A cell far from the band can't be touched: its long name reaches a cell down at most.)
-                if *b != scope || !cell.intersects(&band.inflate(self.grid.cell_h)) {
-                    return false;
-                }
-                let visible = b.and_then(|id| self.box_by_id(id)).map(|bx| Self::content_rect(bx).intersects(cell)).unwrap_or(true);
-                visible && self.hit_rect(k, *cell, &self.metrics_of(*b)).intersects(&band)
-            })
-            .map(|(k, _, _)| k)
-            .collect()
+        // (A cell far from the band can't be touched: its long name reaches a cell down at most.)
+        let near = band.inflate(self.grid.cell_h);
+        match scope {
+            // Loose icons: only those in cells near the band are looked at further.
+            None => {
+                let m = self.metrics_of(None);
+                self.layout
+                    .loose
+                    .iter()
+                    .filter_map(|(k, c)| {
+                        let cell = self.grid.cell_rect(*c);
+                        (cell.intersects(&near) && self.items.contains_key(k) && self.hit_rect(k, cell, &m).intersects(&band)).then(|| k.clone())
+                    })
+                    .collect()
+            }
+            // A box's icons: only its rows in view.
+            Some(id) => {
+                let Some(bx) = self.box_by_id(id).filter(|bx| self.fully_open(bx)) else { return BTreeSet::new() };
+                let c = Self::content_rect(bx);
+                let m = self.metrics_of(Some(id));
+                self.box_cells_in(bx, c.y, c.bottom())
+                    .into_iter()
+                    .filter(|(_, k, cell)| cell.intersects(&near) && c.intersects(cell) && self.hit_rect(k, *cell, &m).intersects(&band))
+                    .map(|(_, k, _)| k)
+                    .collect()
+            }
+        }
     }
 
     /// Something dragged over us (our icons or files from an app): a rolled-up box opens, a tab
@@ -2919,12 +3332,13 @@ impl App {
         if self.is_tucked(None) || (self.is_above() && !self.hit_desk) {
             return Hit::Empty;
         }
+        // (The cell first: only the icons in the cell at the point are looked up at all.)
         for (k, c) in self.layout.loose.iter() {
-            if !self.items.contains_key(k) || self.search_hides(k) {
+            let cell = self.grid.cell_rect(*c);
+            if !cell.inflate(2.0).contains(p) || !self.items.contains_key(k) || self.search_hides(k) {
                 continue;
             }
-            let cell = self.grid.cell_rect(*c);
-            if cell.inflate(2.0).contains(p) && self.hit_rect(k, cell, &self.metrics(None)).contains(p) {
+            if self.hit_rect(k, cell, &self.metrics(None)).contains(p) {
                 return Hit::Item { key: k.clone(), in_box: None };
             }
         }
@@ -2975,7 +3389,7 @@ impl App {
         let before = self.layout.clone();
         if self.apply_rules(None, false) {
             layout::evict_from_boxes(&mut self.layout, &self.grid);
-            self.hist.record(&before);
+            self.hist.record_owned(before);
             self.layout_changed();
         }
         log::info!("sort now: {} rule(s)", self.layout.rules.len());
@@ -3015,19 +3429,20 @@ impl App {
         }
         layout::evict_from_boxes(&mut self.layout, &self.grid);
         if self.layout != before {
-            self.hist.record(&before);
+            self.hist.record_owned(before);
             self.layout_changed();
         }
     }
 
     pub fn layout_changed(&mut self) {
+        self.preview_cache = None;
         // The page shown on another screen now (undo, a saved layout): that screen in use.
         self.screen_sync();
         // Another page now (undo, a saved layout): it slides in.
         self.page_check_shown();
         // Undo, a saved layout or a deleted box can change what folder boxes show.
         self.folder_sync();
-        if self.host.is_some() && self.settings_sig() != self.settings_sent {
+        if self.settings_open_request.is_some() && self.settings_sig() != self.settings_sent {
             self.send_settings(false, None);
         }
         if self.multi_screen() {
@@ -3056,10 +3471,13 @@ impl App {
     }
 
     pub fn save(&mut self) {
-        let _ = persist::backup_layouts_daily(&self.paths.layouts, &self.paths.backups);
-        if let Err(e) = persist::save_layout(&self.paths.layouts, &self.topology, &self.layout) {
-            log::warn!("save layout: {e}");
-        }
+        // Written (after the day's backup) by the saver thread: here only copied.
+        crate::saver::layout(crate::saver::LayoutJob {
+            layouts: self.paths.layouts.clone(),
+            backups: self.paths.backups.clone(),
+            topology: self.topology.clone(),
+            layout: self.layout.clone(),
+        });
         self.save_snapshot();
         self.write_scene();
     }
@@ -3077,7 +3495,7 @@ impl App {
         let mut ids: Vec<u32> = self.icon_imgs.keys().copied().filter(|id| used.contains(id)).collect();
         ids.sort();
         let remap: HashMap<u32, u32> = ids.iter().enumerate().map(|(i, id)| (*id, i as u32)).collect();
-        let s = Snapshot {
+        let s = deskboxes_core::snapshot::SnapshotParts {
             source_id: match &self.args.desktop_dir {
                 Some(d) => format!("fixture:{}", d.display()),
                 None => "desktop".into(),
@@ -3097,19 +3515,7 @@ impl App {
                 .collect(),
             icons: ids.iter().map(|id| self.icon_imgs[id].clone()).collect(),
         };
-        let path = self.paths.snapshot.clone();
-        // (One write at a time: two would share the temporary file.)
-        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let r = std::thread::Builder::new().name("snapshot".into()).spawn(move || {
-            let _g = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = persist::write_atomic(&path, &s.encode()) {
-                log::warn!("save snapshot: {e}");
-            }
-        });
-        match r {
-            Ok(j) => self.snapshot_job = Some(j),
-            Err(e) => log::warn!("save snapshot: no thread: {e}"),
-        }
+        crate::saver::snapshot(crate::saver::SnapshotJob { path: self.paths.snapshot.clone(), snap: s });
     }
 
     /// Test/diagnostic output: every visible item and box in screen pixels.
@@ -3225,6 +3631,8 @@ impl App {
         let (n_img, n_bmp) = (self.icon_imgs.len(), self.bitmaps.len());
         self.icon_imgs.retain(|id, _| live.contains(id));
         self.bitmaps.retain(|id, _| live.contains(id));
+        self.uploads.retain(|id| live.contains(id));
+        self.fx_cache.borrow_mut().retain_icons(|id| live.contains(&id));
         let (d_img, d_bmp) = (n_img - self.icon_imgs.len(), n_bmp - self.bitmaps.len());
         if d_img + d_bmp > 0 {
             log::info!("icons let go: {d_img} image(s), {d_bmp} bitmap(s); {} / {} kept", self.icon_imgs.len(), self.bitmaps.len());
@@ -3234,41 +3642,54 @@ impl App {
 
     fn apply_scan(&mut self, items: Vec<Item>, icons: Vec<(u32, IconImage)>, native: Option<deskboxes_shell::view::NativeView>, ms: f64, first: bool) {
         let t = Instant::now();
-        // What the icon snapshot holds may have changed.
-        self.snapshot_dirty = true;
+        // What the icon snapshot holds changed (new icons, items that are not the same): a scan
+        // that found everything as it was writes nothing.
+        if !icons.is_empty() || items.len() != self.items.len() || items.iter().any(|it| self.items.get(&it.key) != Some(it)) {
+            self.snapshot_dirty = true;
+        }
         if first && !self.seeded {
             // The worker numbers icons independently of an unusable snapshot: replace the table.
             self.bitmaps.clear();
             self.icon_imgs.clear();
+            self.uploads.clear();
             self.views.forget_icons();
         }
         self.views.forget_texts();
         for (id, img) in icons {
+            self.uploads.remove(&id);
             match self.gpu.bitmap(&img) {
                 Ok(b) => {
                     self.bitmaps.insert(id, b);
                 }
                 Err(e) => log::warn!("icon upload: {e}"),
             }
-            self.icon_imgs.insert(id, img);
+            self.icon_imgs.insert(id, std::sync::Arc::new(img));
         }
         let old: BTreeSet<ItemKey> = self.items.keys().cloned().collect();
         self.capture_vanishing(&items, first);
-        let mut renamed = false;
+        // Labels of renamed and departed icons go (only theirs: the rest stay made).
+        let mut stale: HashSet<ItemKey> = HashSet::new();
         let mut new_items = HashMap::with_capacity(items.len());
         for it in items {
             if let Some(o) = self.items.get(&it.key) {
-                renamed |= o.display_name != it.display_name;
+                if o.display_name != it.display_name {
+                    stale.insert(it.key.clone());
+                }
             }
             new_items.insert(it.key.clone(), it);
         }
+        stale.extend(self.items.keys().filter(|k| !new_items.contains_key(*k)).cloned());
         self.items = new_items;
         self.capture_appearing(&old, first);
         self.items_gen += 1;
         self.shown_cache.borrow_mut().clear();
-        if renamed || first {
+        if first {
             self.labels.clear();
+            self.views.forget_texts();
+            self.label_widths.clear();
             self.clear_label_bmps_all();
+        } else {
+            self.forget_labels(&stale);
         }
         if let Some(nv) = &native {
             if nv.spacing.0 > 0 && nv.spacing.1 > 0 {
@@ -3290,7 +3711,7 @@ impl App {
         // New items from a drop go where they were dropped.
         let present: Vec<ItemKey> = {
             let mut v: Vec<&Item> = self.items.values().filter(|i| i.source != Source::Folder).collect();
-            v.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+            v.sort_by_cached_key(|i| i.display_name.to_lowercase());
             v.into_iter().map(|i| i.key.clone()).collect()
         };
         let mut dropped: Vec<ItemKey> = vec![];
@@ -3399,6 +3820,7 @@ impl App {
             let s = hide::set_hidden(true);
             self.stats.hide_ms = th.elapsed().as_secs_f64() * 1000.0;
             log::info!("PHASE hide_icons (after first scan) ms={:.1} state={s:?}", self.stats.hide_ms);
+            self.hide_again_if(&s);
             return;
         }
         if let Some(k) = self.pending_rename.take() {
@@ -3412,19 +3834,36 @@ impl App {
         let by_path: HashMap<String, ItemKey> = self.items.values().map(|i| (i.parsing_name.to_lowercase(), i.key.clone())).collect();
         let lv = hide::listview();
         let mut n = 0;
-        for (p, x, y) in pos {
-            let Some(k) = by_path.get(&p.to_lowercase()) else { continue };
-            let mut pt = POINT { x: *x, y: *y };
+        // The list view's client origin on screen, once (unless it is mirrored: then per icon).
+        let to_screen = |x: i32, y: i32| {
+            let mut pt = POINT { x, y };
             unsafe {
                 let _ = ClientToScreen(lv, &mut pt);
             }
+            pt
+        };
+        let (o, o1) = (to_screen(0, 0), to_screen(1, 1));
+        let plain = o1.x - o.x == 1 && o1.y - o.y == 1;
+        // Cells taken, and by how many icons (the first one there keeps it).
+        let mut taken: HashMap<Cell, usize> = HashMap::new();
+        for c in self.layout.loose.values() {
+            *taken.entry(*c).or_default() += 1;
+        }
+        for (p, x, y) in pos {
+            let Some(k) = by_path.get(&p.to_lowercase()) else { continue };
+            let pt = if plain { POINT { x: o.x + x, y: o.y + y } } else { to_screen(*x, *y) };
             let d = self.screen_to_dip(pt.x, pt.y);
             let c = self.grid.cell_at(Pt {
                 x: d.x + self.grid.cell_w / 2.0 - self.grid.origin.x.min(0.0),
                 y: d.y + self.grid.cell_h / 2.0 - 1.0,
             });
-            if !self.layout.loose.values().any(|v| *v == c) {
-                self.layout.loose.insert(k.clone(), c);
+            if taken.get(&c).is_none_or(|n| *n == 0) {
+                *taken.entry(c).or_default() += 1;
+                if let Some(was) = self.layout.loose.insert(k.clone(), c) {
+                    if let Some(n) = taken.get_mut(&was) {
+                        *n -= 1;
+                    }
+                }
                 n += 1;
             }
         }
@@ -3438,14 +3877,41 @@ impl App {
             log::error!("shell host not found next to {}; context menus unavailable", exe_dir().display());
             return;
         };
+        if self.host.is_some() || self.quitting {
+            return;
+        }
         // A new host holds no prefetch.
         self.host_prefetch = None;
+        // Failing again and again: a pause, then tried again (it used to give up until Deskboxes
+        // started again, leaving the desktop without context menus).
+        if let Some(t) = self.host_backoff {
+            if t > Instant::now() {
+                let ms = (t - Instant::now()).as_millis().max(100) as u32;
+                unsafe {
+                    SetTimer(Some(self.msg_hwnd), T_HOST_RETRY, ms, None);
+                }
+                return;
+            }
+            self.host_backoff = None;
+        }
         self.host_starts.retain(|t| t.elapsed().as_secs() < 60);
         if self.host_starts.len() >= 5 {
-            log::error!("shell host restarted 5 times in a minute; giving up until next start");
+            log::error!("shell host restarted 5 times in a minute; trying again in 30 s");
+            self.host_starts.clear();
+            self.host_backoff = Some(Instant::now() + std::time::Duration::from_secs(30));
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), T_HOST_RETRY, 30_000, None);
+            }
             return;
         }
         self.host_starts.push(Instant::now());
+        // One host at a time: one that never connected (a slow start) is ended, not left to
+        // hold on (its pipe name is its own too).
+        if let Some(mut c) = self.host_child.take() {
+            let _ = c.kill();
+            let _ = c.wait_timeout_ms(500);
+        }
+        self.host_count += 1;
         let session = {
             let mut s = 0u32;
             unsafe {
@@ -3453,7 +3919,7 @@ impl App {
             }
             s
         };
-        let name = format!("deskboxes-host-{session}-{}", std::process::id());
+        let name = format!("deskboxes-host-{session}-{}-{}", std::process::id(), self.host_count);
         match deskboxes_ipc::spawn_host(&exe, &name) {
             Ok(c) => {
                 log::info!("shell host started pid={} {}", c.id(), exe.display());
@@ -3466,18 +3932,19 @@ impl App {
         }
         let lang = self.lang.code();
         let light = self.light;
+        let n = self.host_count;
         std::thread::spawn(move || {
-            match deskboxes_ipc::HostClient::connect(&name, std::time::Duration::from_secs(15), |m| match m {
+            match deskboxes_ipc::HostClient::connect(&name, std::time::Duration::from_secs(30), move |m| match m {
                 Some(v) => events::post(Ev::HostMsg(v)),
-                None => events::post(Ev::HostGone),
+                None => events::post(Ev::HostGone(n)),
             }) {
                 Ok(c) => {
                     let _ = c.send("hello", json!({ "proto": deskboxes_ipc::PROTO, "lang": lang, "theme": if light { "light" } else { "dark" } }));
-                    events::post(Ev::HostReady(c));
+                    events::post(Ev::HostReady(n, c));
                 }
                 Err(e) => {
                     log::error!("cannot connect to the shell host: {e}");
-                    events::post(Ev::HostGone);
+                    events::post(Ev::HostGone(n));
                 }
             }
         });
@@ -3488,7 +3955,7 @@ impl App {
     }
 
     fn selection_paths(&self) -> Vec<String> {
-        self.sel.ordered(&self.order()).iter().filter_map(|k| self.items.get(k)).map(|i| i.parsing_name.clone()).collect()
+        self.selected_in_order().iter().filter_map(|k| self.items.get(k)).map(|i| i.parsing_name.clone()).collect()
     }
 
     fn menu_request(&self, hit: &Hit, at: Pt, new_rect: Option<Rect>) -> Value {
@@ -3669,19 +4136,51 @@ impl App {
     /// Send the settings window its data; `open` shows it, otherwise an open one is refreshed.
     pub fn send_settings(&mut self, open: bool, focus_box: Option<u32>) {
         let Some(h) = self.host.clone() else { return };
+        if !open && self.settings_open_request.is_none() { return; }
         // What is sent is noted before it is built: the updater changes its status on its own
         // thread, and a change made meanwhile (a download going from 100% to "ready") must still
         // count as not sent, or Settings kept showing 100% until it was opened again.
         let sig = self.settings_sig();
         let upd = crate::update::status();
         let style = |st: &BoxStyle| json!({ "color": st.color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)).unwrap_or_default(), "opacity": st.opacity, "blur": st.blur });
-        let strings: serde_json::Map<String, Value> = settings_strings(self.lang).into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
-        let colors: Vec<Value> = BOX_COLORS
+        // The fixed texts go with an open, a new language or a new host only: a refresh (one per
+        // change made in the window) leaves them out and the host keeps the ones it has.
+        let with_static = open || self.settings_static_sent != Some(self.lang);
+        let strings: serde_json::Map<String, Value> = if with_static { settings_strings(self.lang).into_iter().map(|(k, v)| (k.to_string(), json!(v))).collect() } else { Default::default() };
+        let colors: Vec<Value> = if !with_static {
+            vec![]
+        } else {
+            BOX_COLORS
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, (r, g, b)))| json!({ "name": color_name(self.lang, i), "rgb": format!("#{r:02X}{g:02X}{b:02X}") }))
+                .collect()
+        };
+        // (`rect` and `folder`: Home's map of the desktop.)
+        let boxes: Vec<Value> = self
+            .layout
+            .boxes
             .iter()
-            .enumerate()
-            .map(|(i, (_, _, (r, g, b)))| json!({ "name": color_name(self.lang, i), "rgb": format!("#{r:02X}{g:02X}{b:02X}") }))
+            .map(|b| {
+                json!({ "id": b.id, "title": b.title(), "style": style(&b.style), "az": b.az, "tint": b.tint, "blend": b.blend, "stayVisible": b.stay_visible,
+                        "rect": [b.rect.x.round(), b.rect.y.round(), b.rect.w.round(), b.rect.h.round()], "folder": b.is_folder() })
+            })
             .collect();
-        let boxes: Vec<Value> = self.layout.boxes.iter().map(|b| json!({ "id": b.id, "title": b.title(), "style": style(&b.style), "az": b.az, "tint": b.tint, "blend": b.blend, "stayVisible": b.stay_visible })).collect();
+        // The screen this page is on (its size in DIPs, as the boxes' rects are) and its wallpaper.
+        let desk = {
+            let (w, h) = self
+                .layout
+                .pages
+                .iter()
+                .find(|p| p.id == self.layout.page)
+                .and_then(|p| self.layout.screens.get(&p.screen))
+                .map(|s| (s.w, s.h))
+                .filter(|s| s.0 > 0.0 && s.1 > 0.0)
+                .unwrap_or(self.size_dip);
+            let (path, pos, color) = deskboxes_shell::wallpaper::from_registry();
+            json!({ "w": w.round(), "h": h.round(), "wallpaper": path, "pos": pos,
+                    "color": format!("#{:02X}{:02X}{:02X}", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF) })
+        };
         // Tabs rules can send icons to: each tab by its title (a plain box: the box title), on
         // every desktop page (another page's: its name after it).
         let cur_page = self.layout.page;
@@ -3704,17 +4203,34 @@ impl App {
                 })
             })
             .collect();
-        let categories: Vec<Value> = deskboxes_core::rules::CATEGORIES
-            .iter()
-            .map(|(id, _)| json!({ "id": id, "name": category_name(self.lang, id) }))
-            .collect();
+        let categories: Vec<Value> = if !with_static {
+            vec![]
+        } else {
+            deskboxes_core::rules::CATEGORIES.iter().map(|(id, _)| json!({ "id": id, "name": category_name(self.lang, id) })).collect()
+        };
+        let known: Vec<Value> = if !with_static {
+            vec![]
+        } else {
+            items::known_folders()
+                .iter()
+                .map(|(n, p)| {
+                    json!({ "id": n, "path": p.display().to_string(), "name": t(self.lang, match *n {
+                        "documents" => S::KfDocuments,
+                        "downloads" => S::KfDownloads,
+                        "pictures" => S::KfPictures,
+                        "music" => S::KfMusic,
+                        _ => S::KfVideos,
+                    }) })
+                })
+                .collect()
+        };
         let rules: Vec<Value> = self
             .layout
             .rules
             .iter()
             .map(|r| json!({ "id": r.id, "enabled": r.enabled, "kind": r.kind, "op": r.op, "value": r.value, "target": r.target }))
             .collect();
-        let body = json!({
+        let mut body = json!({
             "open": open,
             "focusBox": focus_box,
             "page": if open { self.settings_page.take() } else { None },
@@ -3738,13 +4254,7 @@ impl App {
             "above": { "hotkey": self.settings.above.hotkey, "corner": self.settings.above.corner, "dim": self.settings.above.dim, "hotkeyOk": self.above_hotkey_ok },
             "pages": self.pages_json(),
             "folderBoxes": {
-                "known": items::known_folders().iter().map(|(n, p)| json!({ "id": n, "path": p.display().to_string(), "name": t(self.lang, match *n {
-                    "documents" => S::KfDocuments,
-                    "downloads" => S::KfDownloads,
-                    "pictures" => S::KfPictures,
-                    "music" => S::KfMusic,
-                    _ => S::KfVideos,
-                }) })).collect::<Vec<_>>(),
+                "known": known,
                 "list": self.layout.boxes.iter().filter(|b| b.is_folder()).map(|b| json!({ "id": b.id, "title": b.title(), "path": b.folder })).collect::<Vec<_>>(),
             },
             "saved": {
@@ -3773,7 +4283,19 @@ impl App {
             },
             "default": style(&self.settings.default_style),
             "boxes": boxes,
+            "desk": desk,
         });
+        if !with_static {
+            // (Left out: the host keeps what it has. See ShowSettings in shellhost/Settings.cpp.)
+            if let Some(o) = body.as_object_mut() {
+                o.remove("strings");
+                o.remove("colors");
+                o.remove("categories");
+                if let Some(f) = o.get_mut("folderBoxes").and_then(|f| f.as_object_mut()) {
+                    f.remove("known");
+                }
+            }
+        }
         if open {
             if let Some(c) = &self.host_child {
                 unsafe {
@@ -3781,8 +4303,17 @@ impl App {
                 }
             }
         }
-        if let Err(e) = h.send("settings", body) {
-            log::warn!("settings: {e}");
+        match h.send("settings", body) {
+            Ok(id) if open => self.settings_open_request = Some(id),
+            Ok(_) => {}
+            Err(e) => {
+                self.settings_static_sent = None;
+                log::warn!("settings: {e}");
+                return;
+            }
+        }
+        if with_static {
+            self.settings_static_sent = Some(self.lang);
         }
         self.settings_sent = sig;
         self.update_sent = serde_json::to_string(&upd).unwrap_or_default();
@@ -3965,15 +4496,9 @@ impl App {
                 }
                 "now" => crate::update::check_now(),
                 "install" => {
+                    // Checked and started off this thread (`Ev::Installing` says how it went).
                     let relaunch = self.args.desktop_dir.is_none() && !self.args.window;
-                    if crate::update::install_pending(&self.paths.update, relaunch) {
-                        // The installer starts Deskboxes again: Explorer's icons stay hidden
-                        // through it (it shows them if the update fails).
-                        self.keep_hidden = relaunch;
-                        unsafe {
-                            let _ = PostMessageW(Some(self.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                        }
-                    }
+                    crate::update::install_pending_soon(self.paths.update.clone(), relaunch);
                 }
                 _ => {}
             },
@@ -4084,7 +4609,7 @@ impl App {
                 let st = self.settings.default_style.clone();
                 // Every page's boxes (one undo step).
                 self.change_layout(|l, _| {
-                    for b in l.boxes.iter_mut().chain(l.parked.values_mut().flat_map(|c| c.boxes.iter_mut())) {
+                    for b in l.boxes.iter_mut().chain(l.parked.values_mut().flat_map(|c| std::sync::Arc::make_mut(c).boxes.iter_mut())) {
                         b.style = st.clone();
                     }
                 });
@@ -4186,7 +4711,7 @@ impl App {
         let folder_items = items.iter().any(|p| self.items.values().any(|i| i.source == Source::Folder && i.parsing_name == *p));
         if !folder_items {
             v.push(json!({ "id": "dbx.boxfromsel", "text": t(self.lang, S::BoxFromSelection), "glyph": "\u{E8A9}", "placement": "beforeProperties" }));
-            if self.pages_on() && self.icons_movable(&self.sel.ordered(&self.order()), None) {
+            if self.pages_on() && self.icons_movable(&self.selected_in_order(), None) {
                 v.push(self.move_to_page_entry("dbx.pageitems:", Some("beforeProperties")));
             }
         }
@@ -4415,7 +4940,12 @@ impl App {
 
     pub(crate) fn show_menu(&mut self, hit: Hit, at: Pt, keyboard: bool, new_rect: Option<Rect>) {
         let Some(h) = self.host.clone() else {
-            log::warn!("context menu requested before the shell host is ready");
+            // Shown once a host is there (started now if none is starting).
+            log::warn!("context menu asked for while no shell host is ready: shown when one is");
+            self.menu_replay = Some((Instant::now(), MenuAsk { hit, at, keyboard, new_rect }));
+            if self.host_child.is_none() && !self.args.no_host {
+                self.start_host();
+            }
             return;
         };
         // (Our own entries only: the page name's menu.)
@@ -4446,8 +4976,9 @@ impl App {
                 self.menu_last_ask = Some((id, ask.clone()));
                 self.menu_wait = Some((id, ask));
                 self.menu_wait_replay = self.replaying_menu;
+                self.menu_stage = "sent to";
                 unsafe {
-                    SetTimer(Some(self.msg_hwnd), T_MENU_WAIT, MENU_WAIT_MS, None);
+                    SetTimer(Some(self.msg_hwnd), T_MENU_WAIT, MENU_GOT_MS, None);
                 }
             }
             Err(e) => log::warn!("show menu: {e}"),
@@ -4471,7 +5002,12 @@ impl App {
             let _ = KillTimer(Some(self.msg_hwnd), T_MENU_WAIT);
         }
         let Some((id, ask)) = self.menu_wait.take() else { return };
-        log::warn!("menu {id} not shown in {MENU_WAIT_MS} ms: the shell host is stuck; starting a new one");
+        let ms = match self.menu_stage {
+            "sent to" => MENU_GOT_MS,
+            "got by" => MENU_START_MS,
+            _ => MENU_BUILD_MS,
+        };
+        log::warn!("menu {id} {} the shell host, nothing more within {ms} ms: it is stuck; starting a new one", self.menu_stage);
         self.replace_host(id, ask);
     }
 
@@ -4491,9 +5027,21 @@ impl App {
         }
     }
 
+    /// The host moved menu `id` on (`stage`): the wait for its next step starts.
+    fn menu_progress(&mut self, id: f64, stage: &'static str, next_ms: u32) {
+        if self.menu_wait.as_ref().is_some_and(|(w, _)| *w as f64 == id) {
+            self.menu_stage = stage;
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), T_MENU_WAIT, next_ms, None);
+            }
+        }
+    }
+
     fn on_host_msg(&mut self, v: Value) {
         let t = v["t"].as_str().unwrap_or("");
         match t {
+            "got" => self.menu_progress(v["id"].as_f64().unwrap_or(-1.0), "got by", MENU_START_MS),
+            "building" => self.menu_progress(v["id"].as_f64().unwrap_or(-1.0), "being built by", MENU_BUILD_MS),
             "ready" => {
                 self.stats.host_ready_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
                 log::info!("PHASE host_ready ms={:.1}", self.stats.host_ready_ms);
@@ -4559,6 +5107,11 @@ impl App {
                 }
             }
             "log" => log::info!("host: {}", v["msg"]),
+            "settingsClosed" => {
+                if self.settings_open_request.map(f64::from) == v["id"].as_f64() {
+                    self.settings_open_request = None;
+                }
+            }
             "setting" => self.apply_setting(&v),
             _ => {}
         }
@@ -4578,7 +5131,7 @@ impl App {
         match cmd {
             c if c.starts_with("dbx.page") => self.page_command(c, box_id),
             "rename" => {
-                if let Some(k) = self.sel.ordered(&self.order()).first().cloned() {
+                if let Some(k) = self.selected_in_order().first().cloned() {
                     self.begin_rename(RenameTarget::Item(k));
                 }
             }
@@ -4616,7 +5169,7 @@ impl App {
                 }
             }
             "dbx.boxfromsel" => {
-                let keys = self.sel.ordered(&self.order());
+                let keys = self.selected_in_order();
                 if keys.is_empty() {
                     return;
                 }
@@ -5005,6 +5558,8 @@ impl App {
         self.seeded = false;
         self.views.forget_icons();
         self.labels.clear();
+        self.views.forget_texts();
+        self.label_widths.clear();
         self.clear_label_bmps_all();
         log::info!("icon size -> {dip} DIP ({} px)", self.icon_px);
         // Explorer's desktop gets the size too only when this is the real desktop (a fixture
@@ -5429,7 +5984,7 @@ impl App {
         let before = self.layout.clone();
         if self.apply_rules(Some(&one), true) {
             layout::evict_from_boxes(&mut self.layout, &self.grid);
-            self.hist.record(&before);
+            self.hist.record_owned(before);
             self.layout_changed();
             log::info!("rules: sorted the new icon after its rename");
         }
@@ -5439,6 +5994,8 @@ impl App {
 
     fn on_lbutton_down(&mut self, p: Pt, dbl: bool) {
         self.hide_tip();
+        // A press: any let-go of this button still to be swallowed was lost (`page_button_up`).
+        self.pages.swallow_up &= !1;
         if self.above_click_outside(p) {
             return;
         }
@@ -5575,12 +6132,12 @@ impl App {
         let fb = self.folder_back_at(p);
         if fb != self.folder_back_hover {
             self.folder_back_hover = fb;
-            self.invalidate();
+            self.invalidate_local();
         }
         let tb = self.title_btn_at(p);
         if tb != self.title_btn_hover {
             self.title_btn_hover = tb;
-            self.invalidate();
+            self.invalidate_local();
         }
         if self.box_edit.as_ref().map(|b| b.selecting).unwrap_or(false) {
             if let Some(i) = self.box_edit_pos(p) {
@@ -5588,7 +6145,7 @@ impl App {
                     be.ed.move_to(i, true);
                 }
                 self.restart_caret();
-                self.invalidate();
+                self.invalidate_local();
             }
             return After::None;
         }
@@ -5599,6 +6156,8 @@ impl App {
             self.page_edge_over(Some(p));
         }
         let drag = std::mem::replace(&mut self.drag, Drag::None);
+        // (A drag starting changes the selection, which other screens show; moving one does not.)
+        let starting = matches!(drag, Drag::Pending { .. });
         let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXDRAG) as f32 / self.scale, GetSystemMetrics(SM_CYDRAG) as f32 / self.scale) };
         self.drag = match drag {
             Drag::Pending {
@@ -5628,7 +6187,7 @@ impl App {
                             }
                             self.ole_fallback = false;
                             Drag::Items {
-                                keys: self.sel.ordered(&self.order()),
+                                keys: self.selected_in_order(),
                                 start,
                                 cur: p,
                             }
@@ -5810,7 +6369,7 @@ impl App {
                             SetTimer(Some(self.msg_hwnd), T_HDRCHECK, 250, None);
                         }
                     }
-                    self.invalidate();
+                    self.invalidate_local();
                 }
                 self.update_hdr_btn(p, hh);
                 match hh {
@@ -5838,7 +6397,7 @@ impl App {
                         }
                     }
                     self.hover = h;
-                    self.invalidate();
+                    self.invalidate_local();
                 }
                 if !self.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
@@ -5853,8 +6412,10 @@ impl App {
                 Drag::None
             }
         };
-        if !matches!(self.drag, Drag::None) {
+        if starting {
             self.invalidate();
+        } else if !matches!(self.drag, Drag::None) {
+            self.invalidate_local();
         }
         After::None
     }
@@ -6171,6 +6732,9 @@ impl App {
 
     fn on_rbutton_down(&mut self, p: Pt) {
         self.hide_tip();
+        // A press: a let-go of the right button still to be swallowed was lost (the pages menu
+        // opened on the press took it): else this click would open no menu.
+        self.pages.swallow_up &= !2;
         if self.above_click_outside(p) {
             return;
         }
@@ -6204,6 +6768,7 @@ impl App {
 
     fn on_rbutton_up(&mut self, p: Pt) {
         if self.page_button_up(true) {
+            log::info!("right button let go: taken by a page gesture, no menu");
             return;
         }
         let drag = std::mem::replace(&mut self.drag, Drag::None);
@@ -6218,7 +6783,7 @@ impl App {
             Drag::RightRubber { start, cur, scope } => {
                 // Icons the band selected: their menu (Explorer's). None: the menu of where it
                 // started: the box's, or the desktop's with "Create box here" the band's size.
-                if let Some(k) = self.sel.ordered(&self.order()).first().cloned() {
+                if let Some(k) = self.selected_in_order().first().cloned() {
                     self.sel.focus = Some(k.clone());
                     hit = Hit::Item { key: k, in_box: scope };
                     None
@@ -6540,10 +7105,9 @@ impl App {
         self.end_rename(false);
         self.flush_settings();
         self.save();
-        // The snapshot is written on a thread of its own: finished before the process goes.
-        if let Some(j) = self.snapshot_job.take() {
-            let _ = j.join();
-        }
+        // The layout and the snapshot are written on a thread of their own: finished before the
+        // process goes.
+        crate::saver::flush(std::time::Duration::from_secs(15));
         if let Some(h) = &self.host {
             let _ = h.send("quit", json!({}));
         }
@@ -6560,17 +7124,46 @@ impl App {
         log::info!("exit");
     }
 
+    /// Explorer's icons not hidden yet (its desktop view was not there): tried again each second,
+    /// for half a minute.
+    fn hide_again_if(&mut self, s: &hide::IconState) {
+        if s.view_hidden == Some(true) {
+            self.hide_tries = 0;
+            return;
+        }
+        if self.hide_tries == 0 {
+            self.hide_tries = 30;
+        }
+        self.hide_tries -= 1;
+        if self.hide_tries > 0 {
+            unsafe {
+                SetTimer(Some(self.msg_hwnd), T_HIDE_RETRY, 1000, None);
+            }
+        } else {
+            log::warn!("Explorer's icons could not be hidden: {s:?}");
+        }
+    }
+
     fn write_stats(&mut self) {
         (self.stats.private_mb, self.stats.working_set_mb) = mem_mb();
-        fn pct(v: &[f32]) -> (f64, f64, f64) {
+        fn pct4(v: &[f32]) -> (f64, f64, f64, f64) {
             if v.is_empty() {
-                return (0.0, 0.0, 0.0);
+                return (0.0, 0.0, 0.0, 0.0);
             }
             let mut v = v.to_vec();
             v.sort_by(|a, b| a.total_cmp(b));
             let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64;
-            (q(0.5), q(0.95), q(1.0))
+            (q(0.5), q(0.95), q(0.99), q(1.0))
         }
+        fn pct(v: &[f32]) -> (f64, f64, f64) {
+            let (a, b, _, d) = pct4(v);
+            (a, b, d)
+        }
+        self.stats.screens = self.screens.len().max(1);
+        self.stats.frame_count = self.frame_times.len();
+        (self.stats.frame_ms_p50, self.stats.frame_ms_p95, self.stats.frame_ms_p99, self.stats.frame_ms_max) = pct4(&self.frame_times);
+        self.stats.input_count = self.input_times.len();
+        (self.stats.input_ms_p50, self.stats.input_ms_p95, self.stats.input_ms_p99, self.stats.input_ms_max) = pct4(&self.input_times);
         self.stats.draw_count = self.draw_times.len();
         (self.stats.draw_ms_p50, self.stats.draw_ms_p95, self.stats.draw_ms_max) = pct(&self.draw_times);
         self.stats.drag_frames = self.drag_draw_times.len();
@@ -6602,7 +7195,17 @@ impl WaitTimeout for std::process::Child {
 
 extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
+        let asked = crate::anim::requests();
         let r = dispatch(h, m, w, l);
+        // An input that changed nothing on screen: not timed (else the next frame, for anything,
+        // would count the wait since).
+        if crate::anim::requests() == asked && matches!(m, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MOUSEWHEEL | WM_KEYDOWN | WM_CHAR) {
+            with(|app| {
+                if app.input_at.is_some_and(|(_, n)| n == asked) {
+                    app.input_at = None;
+                }
+            });
+        }
         match r {
             Some(Some(v)) => v,
             _ => DefWindowProcW(h, m, w, l),
@@ -6672,6 +7275,10 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             }
         }
         let is_surface = h == app.hwnd;
+        // (Input reaching the window: timed to the end of the frame that shows it.)
+        if is_surface && app.input_at.is_none() && matches!(m, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MOUSEWHEEL | WM_KEYDOWN | WM_CHAR) {
+            app.input_at = Some((Instant::now(), crate::anim::requests()));
+        }
         if is_surface && (m == WM_SETFOCUS || m == WM_KILLFOCUS) {
             app.set_desk_active(m == WM_SETFOCUS);
         }
@@ -6861,10 +7468,16 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                             app.apply_scan(items, icons, native, ms, first);
                             app.evict_icons(&keep);
                         }
-                        Ev::Rescan => {
+                        Ev::DirChanged(d) => {
+                            app.fs_dirty.1.insert(crate::worker::dir_key(&d));
                             SetTimer(Some(app.msg_hwnd), T_FS, 75, None);
                         }
-                        Ev::HostReady(c) => {
+                        Ev::Rescan => {
+                            app.fs_dirty.0 = true;
+                            SetTimer(Some(app.msg_hwnd), T_FS, 75, None);
+                        }
+                        Ev::HostReady(n, _) if n != app.host_count => log::info!("shell host {n} connected after it was replaced: let go"),
+                        Ev::HostReady(_, c) => {
                             app.host = Some(c);
                             // The menu the stuck host never showed, if it was asked for just now.
                             if let Some((t0, ask)) = app.menu_replay.take() {
@@ -6882,6 +7495,22 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         Ev::FileStepDone { op, undo } => app.on_file_step_done(op, undo),
                         Ev::IconsAt { px, map, icons } => app.apply_sized_icons(px, map, icons),
                         Ev::Covers(v) => app.apply_covers(v),
+                        Ev::Installing { started: false, .. } => {}
+                        Ev::Installing { started: true, relaunch } => {
+                            // The installer starts Deskboxes again: Explorer's icons stay hidden
+                            // through it (it shows them if the update fails).
+                            app.keep_hidden = relaunch;
+                            let _ = PostMessageW(Some(app.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                        Ev::Pictures { items, icons } => app.apply_pictures(items, icons),
+                        Ev::PicturesPending(on) => {
+                            app.pictures_pending = on;
+                            app.pictures_asked = 0;
+                            if on {
+                                app.invalidate();
+                            }
+                        }
+                        Ev::Update if app.settings_open_request.is_none() => {}
                         Ev::Update => {
                             // (The update status is compared on its own too: a setting applied from
                             // the window notes the whole state as sent without sending it.)
@@ -6890,13 +7519,17 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                                 app.send_settings(false, None);
                             }
                         }
-                        Ev::HostGone => {
+                        Ev::HostGone(n) if n != app.host_count => {}
+                        Ev::HostGone(_) => {
                             if !app.quitting {
                                 log::warn!("shell host disconnected; restarting it");
                                 app.host = None;
+                                app.settings_open_request = None;
+                                app.settings_static_sent = None;
                                 app.menu = None;
                                 app.menu_wait = None;
                                 let _ = KillTimer(Some(app.msg_hwnd), T_MENU_WAIT);
+                                // (Ended if it still runs: `wait_timeout_ms` kills it.)
                                 if let Some(mut c) = app.host_child.take() {
                                     let _ = c.wait_timeout_ms(200);
                                 }
@@ -6919,6 +7552,11 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
             }
             crate::events::WM_APP_FOREGROUND => {
                 app.on_foreground(HWND(l.0 as _));
+                Some(LRESULT(0))
+            }
+            // wParam 1: a changed wallpaper decoded (`start_wallpaper_change`).
+            crate::events::WM_APP_WALLPAPER if w.0 == 1 => {
+                app.wallpaper_ready();
                 Some(LRESULT(0))
             }
             crate::events::WM_APP_WALLPAPER => {
@@ -6952,7 +7590,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                         if let Some(be) = app.box_edit.as_mut() {
                             be.caret_on = !be.caret_on;
                             SetTimer(Some(h), T_CARET, GetCaretBlinkTime().clamp(250, 1200), None);
-                            app.invalidate();
+                            app.invalidate_local();
                         } else if app.search_caret_tick() {
                             SetTimer(Some(h), T_CARET, GetCaretBlinkTime().clamp(250, 1200), None);
                         }
@@ -6964,13 +7602,23 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                     }
                     T_SAVE_SETTINGS => app.flush_settings(),
                     T_TASKBAR => keep_taskbar_on_top(),
+                    T_HIDE_RETRY => {
+                        let _ = KillTimer(Some(h), T_HIDE_RETRY);
+                        if !app.quitting {
+                            let s = hide::set_hidden(true);
+                            app.hide_again_if(&s);
+                        }
+                    }
                     T_WALLPAPER => {
                         let _ = KillTimer(Some(h), T_WALLPAPER);
-                        app.for_each_screen(|a| a.wallpaper_check());
+                        let mons = wallpaper::monitors();
+                        app.for_each_screen(|a| a.wallpaper_check(&mons));
                     }
                     crate::screens::T_SCREENS => app.screens_due(),
                     T_FS => {
-                        let _ = app.worker.send(Req::Scan);
+                        // Only the folders that changed, unless something asked for everything.
+                        let (all, dirs) = std::mem::take(&mut app.fs_dirty);
+                        let _ = app.worker.send(if all || dirs.is_empty() { Req::Scan } else { Req::ScanDirs(dirs.into_iter().collect()) });
                     }
                     T_EXIT => {
                         let _ = PostMessageW(Some(app.msg_hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));

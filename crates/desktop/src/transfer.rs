@@ -167,7 +167,7 @@ impl App {
             .filter(|(_, it)| matches!(it.source, Source::User | Source::Public | Source::Fixture))
             .filter_map(|(k, it)| {
                 let name = Path::new(&it.parsing_name).file_name()?.to_string_lossy().to_lowercase();
-                Some((k.0.clone(), ExportItem { name, public: it.source == Source::Public }))
+                Some((k.0.to_string(), ExportItem { name, public: it.source == Source::Public }))
             })
             .collect();
         let mut saved = BTreeMap::new();
@@ -253,7 +253,7 @@ impl App {
             .items
             .iter()
             .filter(|(_, it)| matches!(it.source, Source::User | Source::Public | Source::Fixture))
-            .filter_map(|(k, it)| Some((k.0.clone(), Path::new(&it.parsing_name).file_name()?.to_string_lossy().to_lowercase(), it.source == Source::Public)))
+            .filter_map(|(k, it)| Some((k.0.to_string(), Path::new(&it.parsing_name).file_name()?.to_string_lossy().to_lowercase(), it.source == Source::Public)))
             .collect();
         let profile_now = std::env::var("USERPROFILE").unwrap_or_default();
         let remap = Remap {
@@ -293,9 +293,12 @@ impl App {
             log::warn!("import settings: {err}");
         }
         self.layout = layout;
+        // (After any save still being written, which this one must not be written under.)
+        crate::saver::flush(std::time::Duration::from_secs(15));
         if let Err(err) = persist::save_layout(&self.paths.layouts, &self.topology, &self.layout) {
             log::warn!("import layout: {err}");
         }
+        crate::saver::forget_written();
         // Start again on the imported files: the watchdog does it (as after an Explorer restart
         // with nothing on screen); a test window starts itself.
         if self.args.watchdog_pid.is_none() {

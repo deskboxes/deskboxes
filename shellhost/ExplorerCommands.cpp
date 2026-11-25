@@ -104,6 +104,8 @@ namespace dbx
         if (g_regsLoaded || g_scan.valid()) return;
         g_scan = std::async(std::launch::async, [done]
         {
+            // Background work: menus and Settings come first.
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
             auto v = ScanPackaged();
             winrt::uninit_apartment();

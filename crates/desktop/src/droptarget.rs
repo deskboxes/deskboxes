@@ -46,6 +46,8 @@ pub struct DropTarget {
     helper: Option<IDropTargetHelper>,
     /// The drag caption we set last (type, text, place).
     caption_set: RefCell<Option<(DROPIMAGETYPE, String, String)>>,
+    /// Items whose own drop target could not be made, this drag (not tried again on each move).
+    failed: RefCell<std::collections::HashSet<String>>,
 }
 
 impl DropTarget {
@@ -57,23 +59,52 @@ impl DropTarget {
             data: RefCell::new(None),
             helper,
             caption_set: RefCell::new(None),
+            failed: RefCell::new(Default::default()),
         }
         .into()
     }
 }
 
-/// The target at a point: an item's own drop target (not one of the dragged items), else, for our
-/// own drag, a layout move, else the folder background's drop target.
-fn target_at(hwnd: HWND, pt: &POINTL) -> Option<Target> {
+/// What would take a drag at a point, worked out without making a drop target: the target is
+/// made (the item's shell name parsed, its handler bound) only when this changes, not on every
+/// DragOver over the same item or background.
+enum Want {
+    /// An item's own drop target (its key, its shell name, the caption's place).
+    Item(String, String, Dest),
+    Own,
+    /// A folder box's folder.
+    Folder(String),
+    /// The folder background (the fixture folder in test mode), by the caption's name.
+    Bg(Option<String>, String),
+    Nothing,
+}
+
+impl Want {
+    /// The key the target made for it would have (`Target::key`).
+    fn same_as(&self, cur: Option<&str>) -> bool {
+        match (self, cur) {
+            (Want::Item(k, _, _), Some(c)) => k == c,
+            (Want::Own, Some(c)) => c == "own",
+            (Want::Folder(f), Some(c)) => c.strip_prefix("fb:") == Some(f.as_str()),
+            (Want::Bg(..), Some(c)) => c == "bg",
+            (Want::Nothing, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// What is at a point (see `Want`); `failed`: items whose drop target could not be made this
+/// drag (passed over, as before: the drop goes to what is behind them).
+fn want_at(hwnd: HWND, pt: &POINTL, failed: &std::collections::HashSet<String>) -> Want {
     with(|app| {
         enter_screen_of(app, hwnd);
         // (The desktop window under the boxes-above window: its loose icons count.)
         app.hit_desk = app.is_above() && hwnd != app.hwnd;
-        let t = target_at_in(app, hwnd, pt);
+        let w = want_at_in(app, hwnd, pt, failed);
         app.hit_desk = false;
-        t
+        w
     })
-    .flatten()
+    .unwrap_or(Want::Nothing)
 }
 
 /// Several screens: a drag over another screen's window makes that screen the one in use (its
@@ -86,53 +117,76 @@ fn enter_screen_of(app: &mut crate::app::App, hwnd: HWND) {
     }
 }
 
-fn target_at_in(app: &mut crate::app::App, hwnd: HWND, pt: &POINTL) -> Option<Target> {
-    {
-        let p = app.screen_to_dip(pt.x, pt.y);
-        let own = app.own_drag.as_ref().map(|(keys, _)| keys.clone());
-        let hit = app.hit_test(p);
-        // Boxes above windows, outside the boxes: the app below takes it once the window has
-        // shrunk to the boxes (`above_drag_begin`); until then, nothing here does.
-        if app.is_above() && hwnd == app.hwnd && matches!(hit, Hit::Empty) {
-            return None;
+/// An item's own drop target (not one of the dragged items), else, for our own drag, a layout
+/// move, else the folder background's drop target.
+fn want_at_in(app: &crate::app::App, hwnd: HWND, pt: &POINTL, failed: &std::collections::HashSet<String>) -> Want {
+    let p = app.screen_to_dip(pt.x, pt.y);
+    let own = app.own_drag.as_ref().map(|(keys, _)| keys.as_slice());
+    let hit = app.hit_test(p);
+    // Boxes above windows, outside the boxes: the app below takes it once the window has
+    // shrunk to the boxes (`above_drag_begin`); until then, nothing here does.
+    if app.is_above() && hwnd == app.hwnd && matches!(hit, Hit::Empty) {
+        return Want::Nothing;
+    }
+    if let Hit::Item { key, .. } = hit {
+        let dragged = own.is_some_and(|k| k.contains(&key));
+        // Our own icons next to an icon (its name, the room around it) go in beside it: only
+        // its picture takes them in (as the icons making room show).
+        let beside = own.is_some_and(|k| app.onto_icon(p, k).is_none());
+        if !dragged && !beside && !failed.contains(&*key.0) {
+            if let Some(it) = app.items.get(&key) {
+                let container = it.is_folder() || crate::app::is_recycle_bin(&it.parsing_name) || it.ext.eq_ignore_ascii_case("zip") || it.parsing_name.starts_with("::");
+                let dest = Dest { name: it.display_name.clone(), open_with: !container };
+                return Want::Item(key.0.to_string(), it.parsing_name.clone(), dest);
+            }
         }
-        if let Hit::Item { key, .. } = hit {
-            let dragged = own.as_ref().map(|k| k.contains(&key)).unwrap_or(false);
-            // Our own icons next to an icon (its name, the room around it) go in beside it: only
-            // its picture takes them in (as the icons making room show).
-            let beside = own.as_ref().is_some_and(|k| app.onto_icon(p, k).is_none());
-            if !dragged && !beside {
-                if let Some(it) = app.items.get(&key) {
-                    if let Some(t) = deskboxes_shell::view::item_drop_target(&it.parsing_name) {
-                        let container = it.is_folder() || crate::app::is_recycle_bin(&it.parsing_name) || it.ext.eq_ignore_ascii_case("zip") || it.parsing_name.starts_with("::");
-                        let dest = Dest { name: it.display_name.clone(), open_with: !container };
-                        return Some(Target::Shell(key.0.clone(), t, dest));
-                    }
+    }
+    if let Some(keys) = own {
+        // A folder box's files go only into a folder (another folder box, a folder icon).
+        if keys.iter().any(|k| app.is_folder_item(k)) && app.drop_box(p).filter(|id| app.is_folder_box(*id)).is_none() {
+            return Want::Nothing;
+        }
+        return Want::Own;
+    }
+    // Over a folder box: its folder takes the drop.
+    if let Some(f) = app.folder_box_at(p) {
+        return Want::Folder(f);
+    }
+    let folder = app.args.desktop_dir.as_ref().map(|d| d.display().to_string());
+    Want::Bg(folder, deskboxes_i18n::t(app.lang, deskboxes_i18n::S::DesktopName).to_string())
+}
+
+/// The drop target for what is at a point. An item whose own target cannot be made is noted in
+/// `failed` and what is behind it is taken instead.
+fn target_at(hwnd: HWND, pt: &POINTL, want: Want, failed: &RefCell<std::collections::HashSet<String>>) -> Option<Target> {
+    let mut want = want;
+    loop {
+        match want {
+            Want::Item(key, parsing, dest) => match deskboxes_shell::view::item_drop_target(&parsing) {
+                Some(t) => return Some(Target::Shell(key, t, dest)),
+                None => {
+                    failed.borrow_mut().insert(key);
+                    want = want_at(hwnd, pt, &failed.borrow());
                 }
+            },
+            Want::Own => return Some(Target::Own),
+            Want::Folder(f) => {
+                return deskboxes_shell::view::background_drop_target(Some(&f), hwnd.0 as isize)
+                    .map_err(|e| log::warn!("folder box drop target: {e}"))
+                    .ok()
+                    .map(|t| {
+                        let name = std::path::Path::new(&f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.clone());
+                        Target::Shell(format!("fb:{f}"), t, Dest { name, open_with: false })
+                    });
             }
-        }
-        if let Some(keys) = &own {
-            // A folder box's files go only into a folder (another folder box, a folder icon).
-            if keys.iter().any(|k| app.is_folder_item(k)) && app.drop_box(p).filter(|id| app.is_folder_box(*id)).is_none() {
-                return None;
+            Want::Bg(folder, name) => {
+                return deskboxes_shell::view::background_drop_target(folder.as_deref(), hwnd.0 as isize)
+                    .map_err(|e| log::warn!("background drop target: {e}"))
+                    .ok()
+                    .map(|t| Target::Shell("bg".to_string(), t, Dest { name, open_with: false }));
             }
-            return Some(Target::Own);
+            Want::Nothing => return None,
         }
-        // Over a folder box: its folder takes the drop.
-        if let Some(f) = app.folder_box_at(p) {
-            return deskboxes_shell::view::background_drop_target(Some(&f), hwnd.0 as isize)
-                .map_err(|e| log::warn!("folder box drop target: {e}"))
-                .ok()
-                .map(|t| {
-                    let name = std::path::Path::new(&f).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.clone());
-                    Target::Shell(format!("fb:{f}"), t, Dest { name, open_with: false })
-                });
-        }
-        let folder = app.args.desktop_dir.as_ref().map(|d| d.display().to_string());
-        deskboxes_shell::view::background_drop_target(folder.as_deref(), hwnd.0 as isize)
-            .map_err(|e| log::warn!("background drop target: {e}"))
-            .ok()
-            .map(|t| Target::Shell("bg".to_string(), t, Dest { name: deskboxes_i18n::t(app.lang, deskboxes_i18n::S::DesktopName).to_string(), open_with: false }))
     }
 }
 
@@ -174,7 +228,7 @@ fn feedback(pt: Option<&POINTL>, cur: Option<&Target>, eff: DROPEFFECT) {
     with(|app| {
         let p = pt.map(|pt| app.screen_to_dip(pt.x, pt.y));
         let hl = match cur {
-            Some(Target::Shell(k, _, _)) if k != "bg" && !k.starts_with("fb:") && eff != DROPEFFECT_NONE => Some(deskboxes_core::ItemKey(k.clone())),
+            Some(Target::Shell(k, _, _)) if k != "bg" && !k.starts_with("fb:") && eff != DROPEFFECT_NONE => Some(deskboxes_core::ItemKey(k.as_str().into())),
             _ => None,
         };
         app.ole_drag_over(p, hl);
@@ -227,7 +281,9 @@ impl IDropTarget_Impl for DropTarget_Impl {
                 app.above_drag_begin();
             }
         });
-        let t = target_at(self.hwnd, pt);
+        self.failed.borrow_mut().clear();
+        let want = want_at(self.hwnd, pt, &self.failed.borrow());
+        let t = target_at(self.hwnd, pt, want, &self.failed);
         // Back from another window: its caption may still be on the drag.
         *self.caption_set.borrow_mut() = None;
         unsafe {
@@ -250,10 +306,13 @@ impl IDropTarget_Impl for DropTarget_Impl {
 
     fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, eff: *mut DROPEFFECT) -> windows::core::Result<()> {
         let allowed = unsafe { *eff };
-        let key_now = target_at(self.hwnd, pt);
-        let changed = self.cur.borrow().as_ref().map(|c| c.key().to_string()) != key_now.as_ref().map(|k| k.key().to_string());
+        // What is there now; a target is made only when it changed (over the same item or the
+        // same background, the one held gets the move).
+        let want = want_at(self.hwnd, pt, &self.failed.borrow());
+        let changed = !want.same_as(self.cur.borrow().as_ref().map(|c| c.key()));
         unsafe {
             if changed {
+                let key_now = target_at(self.hwnd, pt, want, &self.failed);
                 if let Some(Target::Shell(_, old, _)) = self.cur.borrow_mut().take() {
                     let _ = old.DragLeave();
                 }
@@ -311,7 +370,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
             if let Some((keys, start)) = app.own_drag.clone() {
                 let take = match &cur {
                     Some(Target::Own) => true,
-                    Some(Target::Shell(k, _, _)) => app.drop_onto_item(p, &keys).map(|t| t.0 == *k).unwrap_or(false),
+                    Some(Target::Shell(k, _, _)) => app.drop_onto_item(p, &keys).map(|t| *t.0 == **k).unwrap_or(false),
                     None => false,
                 };
                 if take {
