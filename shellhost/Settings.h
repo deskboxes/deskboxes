@@ -25,4 +25,6 @@ namespace dbx
     // { scope: "dialog", dialog, ok, value } (Esc, Cancel or closing: ok = false).
     void ShowDialog(winrt::Windows::Data::Json::JsonObject const& data,
                     std::function<void(winrt::Windows::Data::Json::JsonObject)> send);
+    // Settings, a color picker or a dialog is open (the host is not recycled meanwhile).
+    bool HostWindowsOpen();
 }

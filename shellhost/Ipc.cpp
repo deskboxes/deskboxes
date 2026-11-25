@@ -12,6 +12,8 @@
 #include "MenuModel.h"
 #include "MenuView.h"
 #include "Settings.h"
+#include <powrprof.h>
+#pragma comment(lib, "powrprof.lib")
 
 using namespace winrt;
 using namespace winrt::Windows::Data::Json;
@@ -27,6 +29,23 @@ namespace dbx
         std::wstring g_prefetchKey;
         bool g_menuOpen = false;
         JsonObject g_nextShow{ nullptr };   // a "show" that came while a menu was open
+        void Prewarm();
+        // The first menu is built ahead once the core has its "ready" (0) and the package scan
+        // is done (1), a moment later (what the core asks for first, as Settings, goes first).
+        bool g_said[2] = { false, false };
+        void PrewarmSoon()
+        {
+            static bool started = false;
+            if (started || !g_said[0] || !g_said[1]) return;
+            started = true;
+            static winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer t{ nullptr };
+            t = g_ui.CreateTimer();
+            t.Interval(std::chrono::milliseconds(400));
+            t.IsRepeating(false);
+            t.Tick([](auto&&, auto&&) { Prewarm(); });
+            t.Start();
+        }
+        void RecycleWhenIdle(const wchar_t* why);
 
         bool IoWait(BOOL ok, OVERLAPPED& ov, DWORD& n)
         {
@@ -151,6 +170,10 @@ namespace dbx
                 auto m = Msg(L"ready", id);
                 m.SetNamedValue(L"proto", JsonValue::CreateNumberValue(1));
                 Send(m);
+                // Only now the first menu is built ahead: before, "ready" (and with it every
+                // menu and Settings) waited behind it, 0.6-2.8 s after the host started.
+                g_said[0] = true;
+                PrewarmSoon();
             }
             else if (t == L"prefetch")
             {
@@ -211,10 +234,15 @@ namespace dbx
                     c.SetNamedValue(L"cmd", JsonValue::CreateStringValue(cmd));
                     Send(c);
                 };
-                ev.done = [id](const std::wstring& invoked) {
+                // Opened, but nothing of it on a screen (MenuView): the core asks a fresh host to
+                // show it again, and this one makes way (RecycleWhenIdle).
+                auto nothing = std::make_shared<bool>(false);
+                ev.nothingShown = [nothing] { *nothing = true; RecycleWhenIdle(L"a menu showed nothing"); };
+                ev.done = [id, nothing](const std::wstring& invoked) {
                     g_menuOpen = false;
                     auto c = Msg(L"closed", id);
                     c.SetNamedValue(L"invoked", invoked.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(invoked));
+                    if (*nothing) c.SetNamedValue(L"error", JsonValue::CreateStringValue(L"nothing shown"));
                     Send(c);
                     // The menu asked for while this one was open.
                     if (g_nextShow)
@@ -282,6 +310,72 @@ namespace dbx
             Log(L"prewarm: desktop background menu in %.1f ms (%zu entries)", NowMs() - t0, m->list.size());
         }
 
+        // After a sleep, or the screens going off and on, WinUI's menus could stay broken in this
+        // process: a right-click showed nothing until the host was ended by hand (WinUI popups have
+        // known faults of this kind with no fix: microsoft-ui-xaml#11068, #9832). So an open menu
+        // is closed before the PC sleeps, and afterwards this host makes way for a fresh one as
+        // soon as no menu or window of it is open (the core starts the next at once, and it builds
+        // the first menu ahead again). MenuView also checks every menu it opens (MenuShowsNothing).
+        bool g_recycle = false;
+        const wchar_t* g_recycleWhy = L"";
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer g_recycleTimer{ nullptr };
+
+        void RecycleNow()
+        {
+            if (!g_recycle) return;
+            if (g_menuOpen || HostWindowsOpen()) return;   // (the timer asks again)
+            Log(L"recycling: %s; a fresh host takes over", g_recycleWhy);
+            if (g_recycleTimer) g_recycleTimer.Stop();
+            // The core sees the pipe close and starts the next host (crates/desktop start_host).
+            g_ui.TryEnqueue([] { winrt::Microsoft::UI::Xaml::Application::Current().Exit(); });
+        }
+
+        void RecycleWhenIdle(const wchar_t* why)
+        {
+            if (g_recycle) return;
+            g_recycle = true;
+            g_recycleWhy = why;
+            g_recycleTimer = g_ui.CreateTimer();
+            g_recycleTimer.Interval(std::chrono::seconds(2));
+            g_recycleTimer.Tick([](auto&&, auto&&) { RecycleNow(); });
+            g_recycleTimer.Start();
+            RecycleNow();
+        }
+
+        ULONG CALLBACK OnPower(PVOID, ULONG type, PVOID setting)
+        {
+            if (type == PBT_APMSUSPEND)
+                g_ui.TryEnqueue([] { if (g_menuOpen) { Log(L"the PC sleeps: closing the open menu"); HideMenuView(); } });
+            else if (type == PBT_APMRESUMEAUTOMATIC)
+                g_ui.TryEnqueue([] { RecycleWhenIdle(L"the PC woke from sleep"); });
+            else if (type == PBT_POWERSETTINGCHANGE && setting)
+            {
+                // The screens (GUID_CONSOLE_DISPLAY_STATE: 0 off, 1 on, 2 dimmed). Off and on again
+                // can be monitors that were disconnected and connected again.
+                static std::atomic<DWORD> last{ 1 };
+                auto* ps = static_cast<POWERBROADCAST_SETTING*>(setting);
+                if (ps->PowerSetting == GUID_CONSOLE_DISPLAY_STATE && ps->DataLength >= sizeof(DWORD))
+                {
+                    DWORD now = *reinterpret_cast<DWORD*>(ps->Data);
+                    DWORD before = last.exchange(now);
+                    if (now == 1 && before == 0)
+                        g_ui.TryEnqueue([] { RecycleWhenIdle(L"the screens came back on"); });
+                    else if (now == 0)
+                        g_ui.TryEnqueue([] { if (g_menuOpen) HideMenuView(); });
+                }
+            }
+            return 0;
+        }
+
+        void WatchPower()
+        {
+            static DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS p{ OnPower, nullptr };
+            HPOWERNOTIFY sleep = nullptr, screens = nullptr;
+            DWORD e1 = PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, &p, &sleep);
+            DWORD e2 = PowerSettingRegisterNotification(&GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_CALLBACK, &p, &screens);
+            if (e1 || e2) Log(L"power notifications: sleep %lu, screens %lu", e1, e2);
+        }
+
         void ReaderThread()
         {
             OVERLAPPED ov{}; ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -347,8 +441,10 @@ namespace dbx
         LocalFree(sd);
         if (g_pipe == INVALID_HANDLE_VALUE) { Log(L"pipe: CreateNamedPipe(%s) failed (%lu)", path.c_str(), GetLastError()); return false; }
         Log(L"pipe: listening on %s", path.c_str());
+        // The package scan meanwhile, on a thread of its own (it reads every package's manifest).
+        StartPackagedScan([] { g_ui.TryEnqueue([] { g_said[1] = true; PrewarmSoon(); }); });
         std::thread(ReaderThread).detach();
-        g_ui.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { Prewarm(); });
+        WatchPower();
         return true;
     }
 }

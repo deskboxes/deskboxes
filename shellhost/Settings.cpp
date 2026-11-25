@@ -1170,11 +1170,15 @@ namespace dbx
             if (standalone)
                 x += L" xmlns=\"http://schemas.microsoft.com/winfx/2006/xaml/presentation\" xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"";
             x += L"><Grid.RowDefinitions><RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/></Grid.RowDefinitions>"
-                 L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>"
-                 L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\" IgnoredInputKinds=\"MouseWheel\">";  // (the wheel: WireWheel)
+                 L"<TextBlock x:Name=\"PageTitle\" Text=\"" + Str(cur->title) + L"\" Style=\"{StaticResource TitleTextBlockStyle}\" Margin=\"36,12,36,16\" MaxWidth=\"1000\" HorizontalAlignment=\"Stretch\" TextTrimming=\"CharacterEllipsis\"/>";
+            // The scroller as it comes: its wheel, touchpad and keyboard scrolling run on the
+            // compositor, apart from the UI thread, and notches that follow flow on. (0.1.6 had a
+            // wheel of its own, a glide started from the UI thread per notch: late, later still on
+            // a slow PC, and each notch began its glide anew.)
+            x += L"<ScrollView x:Name=\"Scroll\" Grid.Row=\"1\">";
             // In a Grid: straight in the ScrollViewer, a page narrower than MaxWidth was placed by
             // its own width and then stretched, so it sat off to the right in a wide window.
-            // (PageMove inside a plain Grid: the ScrollView drives its content's composition visual, and
+            // (PageMove inside a plain Grid: the scroller moves its content's composition visual, and
             // Rise moves PageMove's; one element's visual for both crashed the window. Transparent,
             // not empty: the gaps between cards catch the wheel too.)
             x += L"<Grid Background=\"Transparent\"><Grid x:Name=\"PageMove\"><StackPanel x:Name=\"PageBody\" Spacing=\"4\" Margin=\"36,0,36,36\" MaxWidth=\"1000\"";
@@ -1881,76 +1885,6 @@ namespace dbx
                 hover.AddHandler(ev, winrt::box_value(mux::Input::PointerEventHandler(leave)), true);
         }
 
-        // The mouse wheel on a page, as Windows Settings scrolls (measured from a recording of it):
-        // a notch goes about 100 px (3 lines, Windows' wheel setting) in a quick ease-out of about
-        // 170 ms whose speed falls off evenly (36, 28, 22, 14, 8 px a frame at 30 fps). A notch that
-        // comes while the page still moves goes on from where the last one was headed. A touchpad's
-        // small steps follow at once. The ScrollView ignores the wheel (it scrolled on the compositor,
-        // where no step can be set); this listens on its content, which sees the wheel first (also
-        // over pictures and clips that mark it handled; not over a control that scrolls itself), and
-        // looks the scroller up then (Refresh moves content between pages).
-        struct WheelGlide
-        {
-            int32_t id = -1;                                   // the ScrollTo of the last notch
-            double target = 0;                                 // where it goes
-            std::chrono::steady_clock::time_point at{};        // when it started
-        };
-        WheelGlide g_wheel;
-        constexpr auto kWheelGlide = std::chrono::milliseconds(170);
-
-        void WireWheel(mux::FrameworkElement const& root)
-        {
-            auto sv = Find<muxc::ScrollView>(root, L"Scroll");
-            auto content = sv ? sv.Content().try_as<mux::UIElement>() : mux::UIElement{ nullptr };
-            if (!content) return;
-            // The notch's glide (other scrolls, as bringing a found setting into view, keep theirs).
-            sv.ScrollAnimationStarting([](auto&&, muxc::ScrollingScrollAnimationStartingEventArgs const& a)
-                {
-                    if (a.CorrelationId() != g_wheel.id) return;
-                    auto comp = a.Animation().Compositor();
-                    auto glide = comp.CreateVector3KeyFrameAnimation();
-                    // Ease-out quad: the speed falls off in a straight line.
-                    auto quad = comp.CreateCubicBezierEasingFunction({ 0.5f, 1.0f }, { 0.89f, 1.0f });
-                    auto end = a.EndPosition();
-                    glide.InsertKeyFrame(1.0f, { end.x, end.y, 0.0f }, quad);
-                    glide.Duration(kWheelGlide);
-                    a.Animation(glide);
-                });
-            auto wheel = [](winrt::Windows::Foundation::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e)
-            {
-                if ((e.KeyModifiers() & winrt::Windows::System::VirtualKeyModifiers::Control) != winrt::Windows::System::VirtualKeyModifiers::None) return;
-                auto self = s.as<mux::DependencyObject>();
-                // Handled by a control of its own scrolling (a long text box, a list): its wheel.
-                if (e.Handled())
-                    for (auto o = e.OriginalSource().try_as<mux::DependencyObject>(); o && o != self; o = mux::Media::VisualTreeHelper::GetParent(o))
-                        if (o.try_as<muxc::ScrollViewer>() || o.try_as<muxc::ScrollView>() || o.try_as<muxc::ComboBox>() || o.try_as<muxc::Slider>()) return;
-                auto pt = e.GetCurrentPoint(s.as<mux::UIElement>());
-                if (pt.Properties().IsHorizontalMouseWheel()) return;
-                muxc::ScrollView sv{ nullptr };
-                for (auto o = mux::Media::VisualTreeHelper::GetParent(self); o && !sv; o = mux::Media::VisualTreeHelper::GetParent(o))
-                    sv = o.try_as<muxc::ScrollView>();
-                if (!sv) return;
-                UINT lines = 3;
-                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-                double step = lines == WHEEL_PAGESCROLL ? sv.ViewportHeight() * 0.9 : 100.0 / 3.0 * lines;
-                double delta = -pt.Properties().MouseWheelDelta() / 120.0 * step;
-                double most = std::max(0.0, sv.ScrollableHeight());
-                e.Handled(true);
-                if (e.Pointer().PointerDeviceType() != winrt::Microsoft::UI::Input::PointerDeviceType::Mouse)
-                {
-                    g_wheel.id = -1;
-                    sv.ScrollTo(sv.HorizontalOffset(), std::clamp(sv.VerticalOffset() + delta, 0.0, most), muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Disabled, muxc::ScrollingSnapPointsMode::Ignore));
-                    return;
-                }
-                auto now = std::chrono::steady_clock::now();
-                double from = now - g_wheel.at < kWheelGlide ? g_wheel.target : sv.VerticalOffset();
-                g_wheel.target = std::clamp(from + delta, 0.0, most);
-                g_wheel.at = now;
-                g_wheel.id = sv.ScrollTo(sv.HorizontalOffset(), g_wheel.target, muxc::ScrollingScrollOptions(muxc::ScrollingAnimationMode::Enabled, muxc::ScrollingSnapPointsMode::Ignore));
-            };
-            content.AddHandler(mux::UIElement::PointerWheelChangedEvent(), winrt::box_value(mux::Input::PointerEventHandler(wheel)), true);
-        }
-
         void Wire(mux::FrameworkElement const& root)
         {
             for (auto const& t : kTiles)
@@ -1966,7 +1900,6 @@ namespace dbx
                         if (std::abs(w.ItemWidth() - item) > 0.5) w.ItemWidth(item);
                     });
             WireFind(root);
-            WireWheel(root);
             if (auto nav = Find<muxc::NavigationView>(root, L"Nav"))
                 nav.SelectionChanged([](auto&&, muxc::NavigationViewSelectionChangedEventArgs const& e)
                 {
@@ -2524,6 +2457,35 @@ namespace dbx
             aw.MoveAndResize({ wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h });
             // Not smaller than the navigation and a settings card need.
             SetWindowSubclass(g.hwnd, MinSizeProc, 1, 0);
+            // Tests (DBX_UI_LAG=1): how late the UI thread is (a 10 ms timer's worst lateness and
+            // the share of time it was busy, every 2 s): how late clicks and typing are answered.
+            if (GetEnvironmentVariableW(L"DBX_UI_LAG", nullptr, 0))
+            {
+                static winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer lag{ nullptr };
+                struct Lag { double last = 0, start = 0, worst = 0, late = 0; int n = 0; };
+                auto st = std::make_shared<Lag>();
+                lag = g.window.DispatcherQueue().CreateTimer();
+                lag.Interval(std::chrono::milliseconds(10));
+                lag.Tick([st](auto&&, auto&&)
+                    {
+                        double now = NowMs();
+                        if (st->last > 0)
+                        {
+                            double over = std::max(0.0, now - st->last - 10.0);
+                            st->worst = std::max(st->worst, over);
+                            st->late += over;
+                            ++st->n;
+                        }
+                        else st->start = now;
+                        st->last = now;
+                        if (now - st->start >= 2000)
+                        {
+                            Log(L"ui lag: worst %.1f ms, late %.0f%% of %d ticks", st->worst, 100.0 * st->late / (now - st->start), st->n);
+                            st->worst = st->late = 0; st->n = 0; st->start = now;
+                        }
+                    });
+                lag.Start();
+            }
             g.window.Closed([](auto&&, auto&&)
                 {
                     if (g.switchTimer) g.switchTimer.Stop();
@@ -2817,6 +2779,7 @@ namespace dbx
 
     void ShowSettings(JsonObject const& data, bool open, std::function<void(JsonObject)> send)
     {
+        double t0 = NowMs();
         g.data = data;
         g.send = std::move(send);
         if (!g.window && !open) return;
@@ -2876,6 +2839,8 @@ namespace dbx
             if (IsIconic(g.hwnd)) ShowWindow(g.hwnd, SW_RESTORE);
             SetForegroundWindow(g.hwnd);
         }
-        Log(L"settings %s (%u boxes)", fresh ? L"opened" : L"refreshed", g.data.GetNamedArray(L"boxes", JsonArray()).Size());
+        Log(L"settings %s (%u boxes) in %.0f ms", fresh ? L"opened" : L"refreshed", g.data.GetNamedArray(L"boxes", JsonArray()).Size(), NowMs() - t0);
     }
+
+    bool HostWindowsOpen() { return g.window || gp.window || gd.window; }
 }

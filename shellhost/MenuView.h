@@ -9,6 +9,7 @@ namespace dbx
         std::function<void(double msVisible)> opened;          // flyout visible (ms since ShowMenuView)
         std::function<void(const std::wstring& cmd)> command;   // Deskboxes-handled entry chosen (rename, view.*, ...)
         std::function<void(const std::wstring& invoked)> done;  // closed; invoked entry id or empty when dismissed
+        std::function<void()> nothingShown;                     // opened, but nothing of it on any screen (then done)
     };
 
     // Shows a built menu as a WinUI CommandBarFlyout (command row + list), the same control

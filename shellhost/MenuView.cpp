@@ -5,6 +5,7 @@
 // at the cursor.
 
 #include "pch.h"
+#include <dwmapi.h>
 #include "MenuView.h"
 #include "Log.h"
 #include <winrt/Windows.Storage.Streams.h>
@@ -346,6 +347,8 @@ namespace dbx
         bool opened = false;    // the flyout opened (Opened fired)
         bool aborted = false;   // given up on before it opened (see AbortView)
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer openCheck{ nullptr };
+        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer seenCheck{ nullptr };
+        bool closed = false;    // its Closed came
     };
     static std::shared_ptr<View> g_view;
     static void WatchDismiss(bool on);
@@ -423,6 +426,35 @@ namespace dbx
             if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
             if (g_fgHook) { UnhookWinEvent(g_fgHook); g_fgHook = nullptr; }
         }
+    }
+
+    // An open menu that nothing of is on any screen: no window of ours besides the menu's 1x1
+    // host is visible, uncloaked, of some size and on a monitor. After a sleep WinUI could open
+    // its flyouts (Opened came) in windows that never showed; the host then answered every
+    // right-click and nothing appeared until it was ended by hand.
+    static bool MenuShowsNothing(View& v)
+    {
+        struct Find { HWND host; DWORD pid; int seen = 0; std::wstring what; } f{ v.hwnd, GetCurrentProcessId() };
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL
+        {
+            auto& f = *reinterpret_cast<Find*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid != f.pid || h == f.host || !IsWindowVisible(h)) return TRUE;
+            BOOL cloaked = FALSE;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            RECT r{};
+            GetWindowRect(h, &r);
+            if (cloaked || r.right - r.left < 8 || r.bottom - r.top < 8 || !MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) return TRUE;
+            wchar_t cls[96]{};
+            GetClassNameW(h, cls, 96);
+            ++f.seen;
+            if (f.what.empty()) f.what = std::wstring(cls) + L" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&f));
+        static bool told = false;
+        if (f.seen && !told) { Log(L"menu view: on screen as %s", f.what.c_str()); told = true; }
+        return f.seen == 0;
     }
 
     void HideMenuView()
@@ -828,6 +860,19 @@ namespace dbx
             double ms = NowMs() - t0;
             Log(L"menu view opened in %.1f ms (model %.1f ms)", ms, v->m->msTotal);
             if (v->ev.opened) v->ev.opened(ms);
+            // A moment later: is any of it on a screen (see MenuShowsNothing)?
+            v->seenCheck = v->window.DispatcherQueue().CreateTimer();
+            v->seenCheck.Interval(std::chrono::milliseconds(250));
+            v->seenCheck.IsRepeating(false);
+            v->seenCheck.Tick([wv = std::weak_ptr<View>(v)](auto&&, auto&&)
+            {
+                auto v = wv.lock();
+                if (!v || v->closed || !v->flyout || !MenuShowsNothing(*v)) return;
+                Log(L"menu view: opened, but nothing of it is on a screen");
+                if (auto nothing = v->ev.nothingShown) { v->ev.nothingShown = nullptr; nothing(); }
+                try { v->flyout.Hide(); } catch (winrt::hresult_error const&) {}
+            });
+            v->seenCheck.Start();
             // Building the menu leaves the wait cursor up (shell handlers set it) until the mouse
             // moves: the menu is ready, so show the arrow now, and let the pointer's window set
             // its own cursor (a move to where it already is).
@@ -842,6 +887,7 @@ namespace dbx
         {
             auto v = wv.lock();
             if (!v || v->aborted) return;
+            v->closed = true;
             WatchDismiss(false);
             if (v->pending) v->pending();
             auto id = v->invoked;

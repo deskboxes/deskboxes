@@ -105,6 +105,8 @@ namespace dbx
     // ---- ExplorerCommands.cpp
     struct PackagedRegistration { std::wstring family, fullName, displayName, itemType, verbId; CLSID clsid{}; };
     void LoadPackagedRegistrations(bool force = false);
+    // The same on a thread of its own (`done` on that thread at its end); the first Load waits for it.
+    void StartPackagedScan(std::function<void()> done);
     std::vector<PackagedRegistration> PackagedFor(const std::vector<std::wstring>& itemTypes);
     winrt::com_ptr<IExplorerCommand> GetCommand(const CLSID& clsid);   // cached instances
     winrt::com_ptr<IExplorerCommand> CommandStoreHandler(const std::wstring& name, std::wstring* iconRef);

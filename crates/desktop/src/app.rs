@@ -436,6 +436,8 @@ pub struct App {
     pub menu_wait: Option<(u32, MenuAsk)>,
     /// A menu to ask again once a new shell host is ready (the old one never showed it), since.
     pub menu_replay: Option<(Instant, MenuAsk)>,
+    /// The last menu asked for, and how to ask again (a host that opened it on no screen).
+    pub menu_last_ask: Option<(u32, MenuAsk)>,
     /// An icon created from the "New" menu: sorted by the rules once its name is given.
     pub sort_after_rename: Option<ItemKey>,
     /// An icon's name being edited (Windows' text box).
@@ -1190,6 +1192,7 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         menu: None,
         menu_wait: None,
         menu_replay: None,
+        menu_last_ask: None,
         sort_after_rename: None,
         rename: None,
         returning: None,
@@ -4440,6 +4443,7 @@ impl App {
             Ok(id) => {
                 log::info!("menu {id} asked for");
                 self.menu = Some((id, MenuCtx { at, hit, new_rect }));
+                self.menu_last_ask = Some((id, ask.clone()));
                 self.menu_wait = Some((id, ask));
                 self.menu_wait_replay = self.replaying_menu;
                 unsafe {
@@ -4468,6 +4472,12 @@ impl App {
         }
         let Some((id, ask)) = self.menu_wait.take() else { return };
         log::warn!("menu {id} not shown in {MENU_WAIT_MS} ms: the shell host is stuck; starting a new one");
+        self.replace_host(id, ask);
+    }
+
+    /// The shell host is broken (a menu it never showed, or showed on no screen): end it; a new one
+    /// starts and shows menu `id` again, once.
+    fn replace_host(&mut self, id: u32, ask: MenuAsk) {
         // Shown again by the new host once; a menu that hangs that one too is let go (else one
         // click could use up every host restart).
         if std::mem::take(&mut self.menu_wait_replay) {
@@ -4493,6 +4503,18 @@ impl App {
                 }
                 // A screen disconnected before the host was there.
                 self.next_screen_notice();
+            }
+            // The host opened the menu, but nothing of it was on a screen (WinUI after a sleep).
+            "closed" if v["error"].as_str() == Some("nothing shown") => {
+                let id = v["id"].as_f64().unwrap_or(-1.0);
+                self.menu_answered(id);
+                match self.menu_last_ask.take() {
+                    Some((last, ask)) if last as f64 == id => {
+                        log::warn!("menu {last} opened on no screen: the shell host is broken; starting a new one");
+                        self.replace_host(last, ask);
+                    }
+                    _ => log::warn!("menu {id} opened on no screen"),
+                }
             }
             "shown" => {
                 log::info!("menu {} shown in {} ms", v["id"], v["ms"]);

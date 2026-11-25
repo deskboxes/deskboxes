@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "MenuModel.h"
 #include "Log.h"
+#include <future>
 
 using namespace winrt;
 
@@ -25,11 +26,12 @@ namespace dbx
         return Utf8ToWide(buf);
     }
 
-    void LoadPackagedRegistrations(bool force)
+    // The packages' context-menu verbs (0.4-0.8 s: every package's manifest is read). No shell
+    // objects: StartPackagedScan runs it on a thread of its own while the host starts.
+    static std::vector<PackagedRegistration> ScanPackaged()
     {
-        if (g_regsLoaded && !force) return;
+        std::vector<PackagedRegistration> regs;
         auto t0 = NowMs();
-        g_regs.clear();
         try
         {
             Windows::Management::Deployment::PackageManager pm;
@@ -76,7 +78,7 @@ namespace dbx
                         std::wstring cl = ve.GetAttribute(L"Clsid").c_str();
                         if (cl.empty() || cl[0] != L'{') cl = L"{" + cl + L"}";
                         if (FAILED(CLSIDFromString(cl.c_str(), &r.clsid))) continue;
-                        g_regs.push_back(std::move(r));
+                        regs.push_back(std::move(r));
                     }
                 }
             }
@@ -86,13 +88,42 @@ namespace dbx
         // Verified on 26300 against three menus (desktop background, .docx, .png), where
         // full-name order would put Notepad after the PowerToys packages. The exact string
         // comparison Explorer uses for non-ASCII names is UNVERIFIED (linguistic, case-insensitive here).
-        std::stable_sort(g_regs.begin(), g_regs.end(), [](auto& a, auto& b) {
+        std::stable_sort(regs.begin(), regs.end(), [](auto& a, auto& b) {
             int c = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE, a.displayName.c_str(), -1, b.displayName.c_str(), -1, nullptr, nullptr, 0);
             if (c != CSTR_EQUAL) return c == CSTR_LESS_THAN;
             return _wcsicmp(a.fullName.c_str(), b.fullName.c_str()) < 0;
         });
+        Log(L"packaged registrations: %zu in %.1f ms", regs.size(), NowMs() - t0);
+        return regs;
+    }
+
+    static std::shared_future<std::vector<PackagedRegistration>> g_scan;
+
+    void StartPackagedScan(std::function<void()> done)
+    {
+        if (g_regsLoaded || g_scan.valid()) return;
+        g_scan = std::async(std::launch::async, [done]
+        {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            auto v = ScanPackaged();
+            winrt::uninit_apartment();
+            if (done) done();
+            return v;
+        }).share();
+    }
+
+    void LoadPackagedRegistrations(bool force)
+    {
+        if (g_regsLoaded && !force) return;
+        if (!force && g_scan.valid())
+        {
+            double t0 = NowMs();
+            g_regs = g_scan.get();
+            if (NowMs() - t0 > 5) Log(L"packaged registrations: waited %.1f ms for the scan", NowMs() - t0);
+        }
+        else g_regs = ScanPackaged();
+        g_scan = {};
         g_regsLoaded = true;
-        Log(L"packaged registrations: %zu in %.1f ms", g_regs.size(), NowMs() - t0);
     }
 
     std::vector<PackagedRegistration> PackagedFor(const std::vector<std::wstring>& itemTypes)
