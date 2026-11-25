@@ -9,6 +9,9 @@
 #   ... -Publish -Legacy                        also publish it to the old deskboxes/releases
 #                                               repository, which copies up to 0.1.3 read
 #
+# A revision of a release is X.Y.Z-N (0.1.7-1): update.rs compares the numbers split at "." and
+# "-", so every copy (0.1.4 on) takes 0.1.7-1 for newer than 0.1.7.
+#
 # Release notes: docs/releases/<version>.md (see docs/releases/TEMPLATE.md). The script puts the
 # installer's SHA-256 table at the top, as "## Installer hashes".
 #
@@ -16,7 +19,7 @@
 # once a day (crates/desktop/src/update.rs): {version, url, sha256, size}. They download the
 # installer from `url`, check the size and SHA-256, and install it the next time Deskboxes starts.
 param(
-    [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
+    [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+(-\d+)?$')][string]$Version,
     [switch]$Publish,
     [switch]$Legacy
 )

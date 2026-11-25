@@ -29,6 +29,10 @@ namespace dbx
             bool wiring = false; // building the content: control events are not user changes
             std::wstring page = L"home";    // shown page (navigation tag)
             std::wstring builtPage;          // page of the content now in the window
+            // Pages visited before (`back`) and gone back from (`forward`): the mouse's back and
+            // forward buttons, Alt+Left and Alt+Right move through them, as in Windows' Settings.
+            std::vector<std::wstring> back, forward;
+            bool historyMove = false;        // a page switch made by GoBack/GoForward
             std::set<long long> expanded;    // box groups open on the Boxes page
             long long focusBox = 0;          // box to bring into view on the next build
             bool lookOpen = false;           // the Look entry is open in the navigation
@@ -1530,10 +1534,20 @@ namespace dbx
 
         void SwitchPage();
 
+        // The page left for another one, kept for going back (a new visit ends the way forward).
+        void NoteVisit(const std::wstring& to)
+        {
+            if (to == g.page || g.historyMove) return;
+            g.back.push_back(g.page);
+            if (g.back.size() > 50) g.back.erase(g.back.begin());
+            g.forward.clear();
+        }
+
         // Open a page from inside a page (a Home tile): select its navigation entry, which
         // switches the page; an entry under the closed Look group: build the window anew.
         void GoTo(const std::wstring& tag)
         {
+            NoteVisit(tag);
             g.page = tag;
             auto root = g.window ? g.window.Content().try_as<mux::FrameworkElement>() : mux::FrameworkElement{ nullptr };
             auto nav = root ? Find<muxc::NavigationView>(root, L"Nav") : muxc::NavigationView{ nullptr };
@@ -1553,6 +1567,51 @@ namespace dbx
             for (auto const& p : kPages)
                 if (tag == p.tag && p.group) g.lookOpen = true;
             g.window.DispatcherQueue().TryEnqueue([] { Build(); });
+        }
+
+        // Back to the page before (or forward again): the page is opened as its navigation
+        // entry would open it, without being noted as a new visit.
+        void MoveInHistory(bool backward)
+        {
+            auto& from = backward ? g.back : g.forward;
+            auto& to = backward ? g.forward : g.back;
+            if (from.empty() || !g.window) return;
+            std::wstring tag = from.back();
+            from.pop_back();
+            to.push_back(g.page);
+            g.historyMove = true;
+            GoTo(tag);
+            g.historyMove = false;
+        }
+
+        // The mouse's back and forward buttons anywhere in the window (also over controls that
+        // handle the press themselves), Alt+Left / Alt+Right and the keyboard's Back key.
+        void WireHistory(mux::FrameworkElement const& root)
+        {
+            root.AddHandler(mux::UIElement::PointerPressedEvent(), winrt::box_value(mux::Input::PointerEventHandler(
+                [root = winrt::make_weak(root)](auto&&, mux::Input::PointerRoutedEventArgs const& e)
+                {
+                    auto r = root.get();
+                    if (!r) return;
+                    auto p = e.GetCurrentPoint(r).Properties();
+                    if (p.IsXButton1Pressed()) { e.Handled(true); MoveInHistory(true); }
+                    else if (p.IsXButton2Pressed()) { e.Handled(true); MoveInHistory(false); }
+                })), true);
+            using winrt::Windows::System::VirtualKey;
+            using winrt::Windows::System::VirtualKeyModifiers;
+            auto key = [&](VirtualKey k, VirtualKeyModifiers m, bool backward)
+            {
+                mux::Input::KeyboardAccelerator a;
+                a.Key(k);
+                a.Modifiers(m);
+                a.Invoked([backward](auto&&, mux::Input::KeyboardAcceleratorInvokedEventArgs const& e) { e.Handled(true); MoveInHistory(backward); });
+                root.KeyboardAccelerators().Append(a);
+            };
+            root.KeyboardAcceleratorPlacementMode(mux::Input::KeyboardAcceleratorPlacementMode::Hidden);
+            key(VirtualKey::Left, VirtualKeyModifiers::Menu, true);
+            key(VirtualKey::Right, VirtualKeyModifiers::Menu, false);
+            key(VirtualKey::GoBack, VirtualKeyModifiers::None, true);
+            key(VirtualKey::GoForward, VirtualKeyModifiers::None, false);
         }
 
         // ------------------------------------------------------------ finding a setting
@@ -2153,6 +2212,7 @@ namespace dbx
                     if (!it) return;
                     std::wstring tag = winrt::unbox_value_or<winrt::hstring>(it.Tag(), L"").c_str();
                     if (tag.empty()) return;
+                    NoteVisit(tag);
                     g.page = tag;
                     g.window.DispatcherQueue().TryEnqueue([] { SwitchPage(); });
                 });
@@ -2659,6 +2719,7 @@ namespace dbx
             g.window.Content(root);
             g.window.SetTitleBar(Find<mux::UIElement>(root, L"TitleBar"));
             Wire(root);
+            WireHistory(root);
             if (scroll == 0 && !g.focusBox) DeferLater(root);
             // Opened from a box's menu: that box's group open and in view.
             muxc::Expander focus{ nullptr };
@@ -2804,6 +2865,7 @@ namespace dbx
                     g.movedNames = nullptr;
                     SettingsClosed();
                     g.window = nullptr; g.hwnd = nullptr; g.builtPage.clear(); TrimMemorySoon();
+                    g.back.clear(); g.forward.clear();
                 });
         }
     }
@@ -3128,6 +3190,13 @@ namespace dbx
             copy.SetNamedValue(L"update", update);
             std::wstring sig = copy.Stringify().c_str();
             bool same = !open && g.window && sig == g.lastSig;
+            if (!same && !open && g.window && GetEnvironmentVariableW(L"DBX_SETTINGS_TIMING", nullptr, 0))
+            {
+                size_t at = 0;
+                while (at < sig.size() && at < g.lastSig.size() && sig[at] == g.lastSig[at]) ++at;
+                size_t from = at > 60 ? at - 60 : 0;
+                Log(L"settings: refresh differs at %zu: was \"%.140s\" now \"%.140s\"", at, g.lastSig.substr(std::min(from, g.lastSig.size())).c_str(), sig.substr(from).c_str());
+            }
             g.lastSig = sig;
             if (same)
             {
@@ -3154,7 +3223,11 @@ namespace dbx
         {
             // Opened for a page (Sorting rules...) or a box (its group in Boxes).
             if (data.HasKey(L"page") && data.GetNamedValue(L"page").ValueType() == JsonValueType::String)
-                g.page = data.GetNamedString(L"page").c_str();
+            {
+                std::wstring to = data.GetNamedString(L"page").c_str();
+                if (!fresh) NoteVisit(to);
+                g.page = to;
+            }
             if (data.HasKey(L"focusBox") && data.GetNamedValue(L"focusBox").ValueType() == JsonValueType::Number)
             {
                 g.focusBox = (long long)data.GetNamedNumber(L"focusBox");

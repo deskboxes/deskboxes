@@ -70,6 +70,16 @@ public static class TestInput
         a[1].type = 0; a[1].m.fl = button == 1 ? 0x0010u : 0x0004u;
         SendInput(2, a, Marshal.SizeOf(typeof(INP)));
     }
+    /// The mouse's side button at screen pixel: 1 back (XBUTTON1), 2 forward (XBUTTON2).
+    public static void XClick(int x, int y, int which)
+    {
+        CheckPoint(x, y);
+        SetCursorPos(x, y);
+        var a = new INP[2];
+        a[0].type = 0; a[0].m.fl = 0x0080u; a[0].m.data = (uint)which;
+        a[1].type = 0; a[1].m.fl = 0x0100u; a[1].m.data = (uint)which;
+        SendInput(2, a, Marshal.SizeOf(typeof(INP)));
+    }
     public static void Move(int x, int y) { SetCursorPos(x, y); }
     /// Mouse wheel at screen pixel: clicks (+ away from you, - toward you), one notch each.
     public static void Wheel(int x, int y, int clicks)
