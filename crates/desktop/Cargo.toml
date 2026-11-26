@@ -20,7 +20,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 windows-core = { workspace = true }
-windows-numerics = "0.3"
 windows = { workspace = true, features = [
     "Win32_Devices_Display",
     "Win32_Foundation",

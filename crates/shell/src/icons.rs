@@ -16,16 +16,22 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// an item. The overlay is only filled in together with SHGFI_ICON (verified on 26300: without
 /// it every shortcut reported none), so a small icon is made and thrown away.
 pub fn sys_index(parsing: &str) -> (i32, u32) {
+    const FLAGS: SHGFI_FLAGS = SHGFI_FLAGS(SHGFI_SYSICONINDEX.0 | SHGFI_OVERLAYINDEX.0 | SHGFI_ICON.0 | SHGFI_SMALLICON.0);
     unsafe {
         let p = wide(parsing);
         let mut sfi = SHFILEINFOW::default();
-        let r = SHGetFileInfoW(
-            pcw(&p),
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            Some(&mut sfi),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_SYSICONINDEX | SHGFI_OVERLAYINDEX | SHGFI_ICON | SHGFI_SMALLICON,
-        );
+        let mut r = SHGetFileInfoW(pcw(&p), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut sfi), std::mem::size_of::<SHFILEINFOW>() as u32, FLAGS);
+        // A shell namespace item ("::{CLSID}": the Recycle Bin, This PC…) is not a path to
+        // SHGetFileInfo: through its ID list. Without an index its icon was extracted anew on
+        // every scan, and each watcher echo became a full UI update (2026-11-26).
+        if r == 0 {
+            let mut pidl = std::ptr::null_mut();
+            if SHParseDisplayName(pcw(&p), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+                sfi = SHFILEINFOW::default();
+                r = SHGetFileInfoW(windows::core::PCWSTR(pidl as *const u16), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut sfi), std::mem::size_of::<SHFILEINFOW>() as u32, FLAGS | SHGFI_PIDL);
+                windows::Win32::System::Com::CoTaskMemFree(Some(pidl as _));
+            }
+        }
         if !sfi.hIcon.is_invalid() {
             let _ = DestroyIcon(sfi.hIcon);
         }
@@ -256,5 +262,18 @@ pub fn overlay_icon(overlay: u32, px: u32) -> Option<IconImage> {
         let img = icon_pixels(hi);
         let _ = DestroyIcon(hi);
         img
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shell_namespace_items_have_a_system_icon_index() {
+        crate::com_sta();
+        // The Recycle Bin and This PC: without an index their icons were made again on every
+        // scan, and every rescan reached the UI as a change (2026-11-26).
+        for p in ["::{645FF040-5081-101B-9F08-00AA002F954E}", "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"] {
+            assert!(super::sys_index(p).0 >= 0, "{p}");
+        }
     }
 }

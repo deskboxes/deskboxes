@@ -200,8 +200,13 @@ impl App {
     /// entry, also one found made meanwhile. Shadow pictures stop at a budget: past it, offscreen
     /// labels get their layout only (the picture is made when they come into view).
     pub fn prep_more(&mut self) {
-        /// Shadow pictures kept for labels not yet seen, at most (a 10,000-icon box).
-        const SHADOW_BUDGET: usize = 3000;
+        /// Shadow pictures made ahead, while idle, until this many exist (those in view count;
+        /// the rows nearest each box's view come first). Each costs GPU memory that counts as
+        /// the process's own (pages plus the driver's pooled intermediates, about 25-50 KB a
+        /// label): at 3000, a 2,000-icon desktop with most icons scrolled away in boxes held
+        /// 206 MB, at 400 153 MB, with the same scroll frame times (pictures coming into view
+        /// are made before the frame that shows them, `prepare`). 2026-11-26.
+        const SHADOW_BUDGET: usize = 400;
         let t = Instant::now();
         // Snapshot icons not in view yet first (search results, other pages, a scroll show them).
         let uploading = !self.uploads.is_empty();

@@ -25,8 +25,17 @@ namespace dbx
         HANDLE g_pipe = INVALID_HANDLE_VALUE;
         std::mutex g_writeLock;
         winrt::Microsoft::UI::Dispatching::DispatcherQueue g_ui{ nullptr };
-        std::shared_ptr<BuiltMenu> g_prefetched;   // last prefetch result
+        std::shared_ptr<BuiltMenu> g_prefetched;   // last prefetch result (the shell's part)
         std::wstring g_prefetchKey;
+        // The desktop background's menu, the shell's part built ahead: at the host's start, and
+        // again after each time it was shown (a built menu is used once). Its classic part has no
+        // Paste or Undo (the desktop view's own, added per show), so nothing in it goes stale
+        // with the clipboard. A right-click on the desktop then only has to draw (it was built
+        // at show: 70-80 ms of shell handlers before anything was drawn).
+        std::shared_ptr<BuiltMenu> g_readyBg;
+        std::wstring g_readyBgKey;
+        MenuRequest g_lastBgReq;                   // what the next one is built for
+        void BgAheadSoon(int ms);
         double g_settingsOpenId = 0;
         bool g_menuOpen = false;
         JsonObject g_nextShow{ nullptr };   // a "show" that came while a menu was open
@@ -41,12 +50,9 @@ namespace dbx
             static bool started = false;
             if (started || !g_said[0] || !g_said[1]) return;
             started = true;
-            static winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer t{ nullptr };
-            t = g_ui.CreateTimer();
-            t.Interval(std::chrono::milliseconds(400));
-            t.IsRepeating(false);
-            t.Tick([](auto&&, auto&&) { Prewarm(); });
-            t.Start();
+            // At low priority: anything the core asked for meanwhile goes first (it waited 400 ms
+            // on a timer for that, and the first menu was ready only 1.4 s after the core started).
+            g_ui.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { Prewarm(); });
         }
         void RecycleWhenIdle(const wchar_t* why);
 
@@ -154,14 +160,42 @@ namespace dbx
             return r;
         }
 
-        // Cache key of a prefetch: what decides the menu's content (not the position).
+        // Cache key of the shell's part of a menu: what decides it (not the position, nor
+        // Deskboxes' entries: AssembleMenu adds those at show).
         std::wstring Key(const MenuRequest& r)
         {
             std::wstring k = r.background ? L"bg|" + r.folder : L"items";
             for (auto& i : r.items) k += L"|" + i;
             if (r.shift) k += L"|shift";
-            k += L"|" + r.extraJson; // extras are built into the menu
             return k;
+        }
+
+        // The desktop background's shell part, built now for the next right-click.
+        void BuildBgAhead()
+        {
+            if (g_menuOpen || g_showsWaiting.load() > 0) { BgAheadSoon(300); return; } // later
+            MenuRequest r = g_lastBgReq;
+            r.background = true; r.desktop = true; r.shift = false; r.keyboard = false;
+            r.extra.clear(); r.extraJson.clear(); r.ownChildren.clear();
+            auto m = BuildShellMenu(r);
+            if (!m->shellOk) { g_readyBg.reset(); return; }
+            Log(L"desktop background menu built ahead: classic %.1f, packaged %.1f, total %.1f ms", m->msClassic, m->msPackaged, m->msTotal);
+            g_readyBg = std::move(m);
+            g_readyBgKey = Key(r);
+        }
+
+        void BgAheadSoon(int ms)
+        {
+            static winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer t{ nullptr };
+            if (!t)
+            {
+                t = g_ui.CreateTimer();
+                t.IsRepeating(false);
+                t.Tick([](auto&&, auto&&) { BuildBgAhead(); });
+            }
+            t.Stop();
+            t.Interval(std::chrono::milliseconds(ms));
+            t.Start();
         }
 
         void Handle(JsonObject const& o)
@@ -183,7 +217,7 @@ namespace dbx
                 // Build ahead (on hover / selection) so "show" only has to draw.
                 MenuRequest r = Request(o);
                 g_prefetchKey = Key(r);
-                g_prefetched = BuildMenu(r);
+                g_prefetched = BuildShellMenu(r);
                 Log(L"prefetch %zu item(s): resolve %.1f, classic %.1f, packaged %.1f, total %.1f ms",
                     r.items.size(), g_prefetched->msResolve, g_prefetched->msClassic, g_prefetched->msPackaged, g_prefetched->msTotal);
             }
@@ -203,22 +237,32 @@ namespace dbx
                 Send(Msg(L"building", id));
                 MenuRequest r = Request(o);
                 std::shared_ptr<BuiltMenu> m;
-                // A prefetched model is reused when it was built for the same items and extras (the
-                // background menu's own entries change per show, so it is always built at show).
-                if (g_prefetched && g_prefetchKey == Key(r) && r.ownChildren.empty() && !r.desktop && !r.ownOnly)
+                // The shell's part built ahead for the same items (a prefetch) or the desktop
+                // background (BuildBgAhead) is used once; Deskboxes' entries are added now.
+                const std::wstring key = Key(r);
+                const bool desktopBg = r.background && r.desktop && !r.ownOnly;
+                if (!r.ownOnly && g_prefetched && g_prefetchKey == key)
                 {
                     m = g_prefetched;
-                    POINT pt = r.pt; bool kb = r.keyboard;
-                    m->req.pt = pt; m->req.keyboard = kb; m->req.owner = r.owner;
+                    Log(L"show %zu item(s): prefetched %.0f ms before", r.items.size(), NowMs() - m->builtAt);
+                }
+                else if (desktopBg && g_readyBg && g_readyBgKey == key && CommandsAlive(*g_readyBg))
+                {
+                    m = g_readyBg;
+                    g_readyBg.reset();
+                    Log(L"show: desktop background built ahead %.1f s before", (NowMs() - m->builtAt) / 1000.0);
                 }
                 else
                 {
-                    m = BuildMenu(r);
-                    Log(L"show %zu item(s): built at show (%s): resolve %.1f, classic %.1f, packaged %.1f, total %.1f ms",
-                        r.items.size(), g_prefetched ? L"prefetch key differed" : L"no prefetch",
-                        m->msResolve, m->msClassic, m->msPackaged, m->msTotal);
+                    m = BuildShellMenu(r);
+                    if (!r.ownOnly)
+                        Log(L"show %zu item(s): built at show (%s): resolve %.1f, classic %.1f, packaged %.1f, total %.1f ms",
+                            r.items.size(), g_prefetched ? L"prefetch key differed" : L"no prefetch",
+                            m->msResolve, m->msClassic, m->msPackaged, m->msTotal);
                 }
                 g_prefetched.reset(); g_prefetchKey.clear();
+                AssembleMenu(*m, r);
+                if (desktopBg) g_lastBgReq = r;
                 if (m->row.empty() && m->list.empty())
                 {
                     auto c = Msg(L"closed", id); c.SetNamedValue(L"invoked", JsonValue::CreateNullValue());
@@ -243,8 +287,10 @@ namespace dbx
                 // show it again, and this one makes way (RecycleWhenIdle).
                 auto nothing = std::make_shared<bool>(false);
                 ev.nothingShown = [nothing] { *nothing = true; RecycleWhenIdle(L"a menu showed nothing"); };
-                ev.done = [id, nothing](const std::wstring& invoked) {
+                ev.done = [id, nothing, desktopBg](const std::wstring& invoked) {
                     g_menuOpen = false;
+                    // The next desktop menu, built while nothing else goes on.
+                    if (desktopBg) BgAheadSoon(400);
                     auto c = Msg(L"closed", id);
                     c.SetNamedValue(L"invoked", invoked.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(invoked));
                     if (*nothing) c.SetNamedValue(L"error", JsonValue::CreateStringValue(L"nothing shown"));
@@ -310,11 +356,11 @@ namespace dbx
         {
             // Pay the package scan and the out-of-process activations once, before the first
             // right-click (cold build ~0.6 s vs ~25-75 ms warm; REPORT.md §7).
+            // That build is kept: the first right-click on the desktop uses it.
             double t0 = NowMs();
             LoadPackagedRegistrations();
-            MenuRequest r; r.background = true; r.desktop = true;
-            auto m = BuildMenu(r);
-            Log(L"prewarm: desktop background menu in %.1f ms (%zu entries)", NowMs() - t0, m->list.size());
+            if (!g_readyBg) BuildBgAhead();
+            Log(L"prewarm: desktop background menu in %.1f ms", NowMs() - t0);
         }
 
         // After a sleep, or the screens going off and on, WinUI's menus could stay broken in this
@@ -460,6 +506,24 @@ namespace dbx
     void SettingsClosed()
     {
         Send(Msg(L"settingsClosed", g_settingsOpenId));
+        // Settings leaves its memory behind in this process when it closes (WinUI, its pictures
+        // and clips): 52 -> 176 MB committed and 30 -> 70 threads, for the rest of the session
+        // (2026-11-26; the working set is trimmed, the commit stays). A minute later, unless it
+        // is open again, a fresh host takes over (RecycleWhenIdle: once no menu or window of
+        // this one is open). Once a minute at most, below the core's limit on restarts.
+        static winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer after{ nullptr };
+        if (!after)
+        {
+            after = g_ui.CreateTimer();
+            after.IsRepeating(false);
+            after.Interval(std::chrono::seconds(60));
+            after.Tick([](auto&&, auto&&)
+                {
+                    if (!HostWindowsOpen()) RecycleWhenIdle(L"Settings closed a minute ago (its memory goes with this host)");
+                });
+        }
+        after.Stop();
+        after.Start();
     }
 
     bool StartPipeServer(const std::wstring& pipeName)
@@ -483,7 +547,10 @@ namespace dbx
         if (g_pipe == INVALID_HANDLE_VALUE) { Log(L"pipe: CreateNamedPipe(%s) failed (%lu)", path.c_str(), GetLastError()); return false; }
         Log(L"pipe: listening on %s", path.c_str());
         // The package scan meanwhile, on a thread of its own (it reads every package's manifest).
-        StartPackagedScan([] { g_ui.TryEnqueue([] { g_said[1] = true; PrewarmSoon(); }); });
+        StartPackagedScan(
+            [] { g_said[1] = true; PrewarmSoon(); },
+            // Extensions installed or removed since the cache: menus built with the old list go.
+            [] { g_prefetched.reset(); g_prefetchKey.clear(); if (g_readyBg) { g_readyBg.reset(); BgAheadSoon(100); } });
         std::thread(ReaderThread).detach();
         WatchPower();
         return true;

@@ -8,7 +8,6 @@ description = "Deskboxes rendering: D3D11 + Direct2D + DirectComposition surface
 
 [dependencies]
 deskboxes-core = { workspace = true }
-windows-core = { workspace = true }
 windows-numerics = "0.3"
 windows = { workspace = true, features = [
     "Win32_Foundation",

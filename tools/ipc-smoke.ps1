@@ -86,7 +86,10 @@ try {
     }
     $rows += Show-And-Dismiss $hundred.Clone() '100 items (first)'
     for ($i = 0; $i -lt $Repeat; $i++) { $rows += Show-And-Dismiss $hundred.Clone() '100 items (warm)' }
-    $rows += Show-And-Dismiss @{ kind = 'background'; desktop = $true; own = @{ view = @(@{ id = 'view.large'; text = 'Large icons'; radio = $true }, @{ id = 'view.medium'; text = 'Medium icons'; radio = $true; checked = $true }); arrange = @(@{ id = 'sort.name'; text = 'Name'; radio = $true; checked = $true }) } } 'desktop background'
+    $bg = @{ kind = 'background'; desktop = $true; own = @{ view = @(@{ id = 'view.large'; text = 'Large icons'; radio = $true }, @{ id = 'view.medium'; text = 'Medium icons'; radio = $true; checked = $true }); arrange = @(@{ id = 'sort.name'; text = 'Name'; radio = $true; checked = $true }) } }
+    $rows += Show-And-Dismiss $bg.Clone() 'desktop background'
+    # The host builds the next desktop menu ahead a moment after one closes.
+    for ($i = 0; $i -lt $Repeat; $i++) { Start-Sleep -Milliseconds 900; $rows += Show-And-Dismiss $bg.Clone() 'desktop background (again)' }
 
     $pipe.Dispose()
     $exited = $hostProc.WaitForExit(5000)

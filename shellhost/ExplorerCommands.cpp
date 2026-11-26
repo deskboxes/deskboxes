@@ -2,6 +2,7 @@
 #include "MenuModel.h"
 #include "Log.h"
 #include <future>
+#include <sstream>
 
 using namespace winrt;
 
@@ -28,10 +29,11 @@ namespace dbx
 
     // The packages' context-menu verbs (0.4-0.8 s: every package's manifest is read). No shell
     // objects: StartPackagedScan runs it on a thread of its own while the host starts.
-    static std::vector<PackagedRegistration> ScanPackaged()
+    static std::vector<PackagedRegistration> ScanPackaged(bool* ok = nullptr)
     {
         std::vector<PackagedRegistration> regs;
         auto t0 = NowMs();
+        if (ok) *ok = true;
         try
         {
             Windows::Management::Deployment::PackageManager pm;
@@ -83,7 +85,7 @@ namespace dbx
                 }
             }
         }
-        catch (hresult_error const& e) { Log(L"PackageManager failed: 0x%08X %s", (uint32_t)e.code(), e.message().c_str()); }
+        catch (hresult_error const& e) { Log(L"PackageManager failed: 0x%08X %s", (uint32_t)e.code(), e.message().c_str()); if (ok) *ok = false; }
         // Explorer orders extension commands by the package's (localized) display name.
         // Verified on 26300 against three menus (desktop background, .docx, .png), where
         // full-name order would put Notepad after the PowerToys packages. The exact string
@@ -97,21 +99,132 @@ namespace dbx
         return regs;
     }
 
-    static std::shared_future<std::vector<PackagedRegistration>> g_scan;
-
-    void StartPackagedScan(std::function<void()> done)
+    // ---- The list kept from last time ----------------------------------------------------
+    // The scan took 0.4 s of every host start (and the first menu waited for it). The list is
+    // kept in %LOCALAPPDATA%\Deskboxes\packaged-menus.cache: a host starts with it, and the scan
+    // runs meanwhile only to check it (Windows has no cheap, complete "packages changed" stamp:
+    // the per-user repository key misses a quarter of the packages here). One line per verb,
+    // tab-separated; the first line names the format and the language (display names, order).
+    static std::wstring CachePath()
     {
-        if (g_regsLoaded || g_scan.valid()) return;
-        g_scan = std::async(std::launch::async, [done]
+        wchar_t buf[MAX_PATH]{};
+        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH)) return {};
+        return std::wstring(buf) + L"\\Deskboxes\\packaged-menus.cache";
+    }
+
+    static std::wstring CacheHeader()
+    {
+        wchar_t loc[LOCALE_NAME_MAX_LENGTH]{};
+        GetUserDefaultLocaleName(loc, LOCALE_NAME_MAX_LENGTH);
+        return L"deskboxes packaged menus 1 " + std::to_wstring(GetUserDefaultUILanguage()) + L" " + loc;
+    }
+
+    static bool ReadCache(std::vector<PackagedRegistration>& out)
+    {
+        std::wstring path = CachePath();
+        if (path.empty()) return false;
+        std::wstring text = ReadFileUtf8(path);
+        std::wistringstream in(text);
+        std::wstring line;
+        auto next = [&] { if (!std::getline(in, line)) return false; if (!line.empty() && line.back() == L'\r') line.pop_back(); return true; };
+        if (!next() || line != CacheHeader()) return false;
+        while (next())
+        {
+            if (line.empty()) continue;
+            std::vector<std::wstring> f;
+            for (size_t a = 0;;)
+            {
+                size_t b = line.find(L'\t', a);
+                f.push_back(line.substr(a, b == std::wstring::npos ? std::wstring::npos : b - a));
+                if (b == std::wstring::npos) break;
+                a = b + 1;
+            }
+            PackagedRegistration r;
+            if (f.size() != 6 || FAILED(CLSIDFromString(f[5].c_str(), &r.clsid))) return false;
+            r.family = f[0]; r.fullName = f[1]; r.displayName = f[2]; r.itemType = f[3]; r.verbId = f[4];
+            out.push_back(std::move(r));
+        }
+        return true;
+    }
+
+    static void WriteCache(const std::vector<PackagedRegistration>& regs)
+    {
+        std::wstring path = CachePath();
+        if (path.empty()) return;
+        auto clean = [](std::wstring s) { for (auto& c : s) if (c == L'\t' || c == L'\r' || c == L'\n') c = L' '; return s; };
+        std::wstring s = CacheHeader() + L"\n";
+        for (auto& r : regs)
+        {
+            wchar_t g[64]; StringFromGUID2(r.clsid, g, 64);
+            s += clean(r.family) + L"\t" + clean(r.fullName) + L"\t" + clean(r.displayName) + L"\t" + clean(r.itemType) + L"\t" + clean(r.verbId) + L"\t" + g + L"\n";
+        }
+        std::string body = WideToUtf8(s);
+        std::wstring tmp = path + L".tmp";
+        HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return;
+        DWORD wr = 0;
+        BOOL ok = WriteFile(f, body.data(), (DWORD)body.size(), &wr, nullptr) && wr == body.size();
+        CloseHandle(f);
+        if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp.c_str());
+    }
+
+    static bool SameRegs(const std::vector<PackagedRegistration>& a, const std::vector<PackagedRegistration>& b)
+    {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].family != b[i].family || a[i].fullName != b[i].fullName || a[i].displayName != b[i].displayName ||
+                a[i].itemType != b[i].itemType || a[i].verbId != b[i].verbId || !IsEqualCLSID(a[i].clsid, b[i].clsid))
+                return false;
+        return true;
+    }
+
+    static std::shared_future<std::vector<PackagedRegistration>> g_scan;
+    static bool g_scanStarted = false;
+
+    void StartPackagedScan(std::function<void()> ready, std::function<void()> changed)
+    {
+        if (g_regsLoaded || g_scanStarted) return;
+        g_scanStarted = true;
+        auto ui = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+        double t0 = NowMs();
+        std::vector<PackagedRegistration> cached;
+        const bool hit = ReadCache(cached);
+        auto promise = std::make_shared<std::promise<std::vector<PackagedRegistration>>>();
+        if (hit)
+        {
+            g_regs = std::move(cached);
+            g_regsLoaded = true;
+            Log(L"packaged registrations: %zu from the cache in %.1f ms (a scan checks them meanwhile)", g_regs.size(), NowMs() - t0);
+        }
+        else g_scan = promise->get_future().share();
+        std::thread([ui, hit, promise, ready, changed]
         {
             // Background work: menus and Settings come first.
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            auto v = ScanPackaged();
+            bool ok = true;
+            auto v = ScanPackaged(&ok);
             winrt::uninit_apartment();
-            if (done) done();
-            return v;
-        }).share();
+            if (!hit) promise->set_value(v);
+            ui.TryEnqueue([v = std::move(v), ok, hit, ready, changed]() mutable
+            {
+                if (!hit)
+                {
+                    // (A menu may have taken it already: LoadPackagedRegistrations.)
+                    if (!g_regsLoaded) { g_regs = v; g_regsLoaded = true; }
+                    g_scan = {};
+                    if (ok) WriteCache(v);
+                    if (ready) ready();
+                    return;
+                }
+                if (!ok || SameRegs(v, g_regs)) return;
+                Log(L"packaged registrations changed since the cache (%zu -> %zu): menus use the new ones", g_regs.size(), v.size());
+                g_regs = std::move(v);
+                WriteCache(g_regs);
+                if (changed) changed();
+            });
+        }).detach();
+        if (hit && ready) ready();
     }
 
     void LoadPackagedRegistrations(bool force)
@@ -126,6 +239,22 @@ namespace dbx
         else g_regs = ScanPackaged();
         g_scan = {};
         g_regsLoaded = true;
+    }
+
+    bool CommandsAlive(const BuiltMenu& m)
+    {
+        for (auto& e : m.packaged)
+        {
+            if (!e.cmd) continue;
+            EXPCMDFLAGS f = 0;
+            HRESULT hr = e.cmd->GetFlags(&f);
+            if (hr == RPC_E_DISCONNECTED || hr == RPC_E_SERVER_DIED_DNE || hr == RPC_E_SERVER_DIED || hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE) || hr == HRESULT_FROM_WIN32(RPC_S_CALL_FAILED))
+            {
+                Log(L"menu built ahead: %s no longer answers (0x%08X); built again", e.text.c_str(), (unsigned)hr);
+                return false;
+            }
+        }
+        return true;
     }
 
     std::vector<PackagedRegistration> PackagedFor(const std::vector<std::wstring>& itemTypes)

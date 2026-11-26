@@ -26,6 +26,12 @@ namespace dbx
                 path += L"\\logs";
                 CreateDirectoryW(path.c_str(), nullptr);
                 path += L"\\shellhost.log";
+                // One previous file kept, as the core does (deskboxes.1.log): it grew without
+                // bound (2.9 MB, 34,000 lines on the dev PC in two days). A host still writing
+                // it (tests) keeps the rename from happening; it is tried again next start.
+                WIN32_FILE_ATTRIBUTE_DATA fa{};
+                if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > (2u << 20)))
+                    MoveFileExW(path.c_str(), (path.substr(0, path.size() - 4) + L".1.log").c_str(), MOVEFILE_REPLACE_EXISTING);
             }
         }
         // Shared: a second host (tests) and readers can open it while a host runs.

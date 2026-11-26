@@ -30,7 +30,6 @@ use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const T_HOST: usize = 1;
 const T_SAVE: usize = 2;
 const T_FS: usize = 3;
 const T_EXIT: usize = 4;
@@ -1062,6 +1061,9 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
         }
         return 0;
     }
+    // The graphics device, the slow part of starting (the driver: 40 ms, up to 0.8 s at sign-in),
+    // made on a thread from here while the window, the snapshot and the wallpaper get ready.
+    let pending_device = deskboxes_render::start_device();
     if real_desktop {
         turnon::remove_verb();
         // Started at sign-in at above-normal priority (the logon task) so the desktop comes up
@@ -1103,34 +1105,6 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     };
     let snap = snap.filter(|s| s.source_id == source_id);
 
-    // 2. Devices and the surface.
-    // (At sign-in the graphics driver can come late: tried again for a while before Explorer's
-    // icons are shown, which are hidden still from the last session.)
-    let gpu = {
-        let tg = Instant::now();
-        let limit = if real_desktop { 20.0 } else { 0.0 };
-        loop {
-            match Gpu::new() {
-                Ok(g) => {
-                    if tg.elapsed().as_secs_f64() > 0.5 {
-                        log::info!("graphics device after {:.1} s", tg.elapsed().as_secs_f64());
-                    }
-                    break g;
-                }
-                Err(e) if tg.elapsed().as_secs_f64() < limit => {
-                    log::warn!("no graphics device yet: {e}; trying again");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(e) => {
-                    log::error!("no graphics device: {e}; native icons stay visible");
-                    hide::restore();
-                    return 3;
-                }
-            }
-        }
-    };
-    log::info!("MEM after graphics devices: private/working set {:.1?} MB", mem_mb());
-    let t_devices = t0.elapsed().as_secs_f64() * 1000.0;
     // The screens: the main one is made now, the others once it is on screen.
     let mut monitors = crate::screens::monitors();
     if args.one_screen {
@@ -1174,6 +1148,35 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
             return 3;
         }
     };
+    // 2. The devices (made meanwhile: `pending_device`) and the surface.
+    // (At sign-in the graphics driver can come late: tried again for a while before Explorer's
+    // icons are shown, which are hidden still from the last session.)
+    let gpu = {
+        let tg = Instant::now();
+        let limit = if real_desktop { 20.0 } else { 0.0 };
+        let mut pending = Some(pending_device);
+        loop {
+            match pending.take().map(Gpu::from_pending).unwrap_or_else(Gpu::new) {
+                Ok(g) => {
+                    if tg.elapsed().as_secs_f64() > 0.5 {
+                        log::info!("graphics device after {:.1} s", tg.elapsed().as_secs_f64());
+                    }
+                    break g;
+                }
+                Err(e) if tg.elapsed().as_secs_f64() < limit => {
+                    log::warn!("no graphics device yet: {e}; trying again");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => {
+                    log::error!("no graphics device: {e}; native icons stay visible");
+                    hide::restore();
+                    return 3;
+                }
+            }
+        }
+    };
+    log::info!("MEM after graphics devices: private/working set {:.1?} MB", mem_mb());
+    let t_devices = t0.elapsed().as_secs_f64() * 1000.0;
     let dpi = GetDpiForWindow(hwnd).max(96);
     let scale = dpi as f32 / 96.0;
     let mut cr = RECT::default();
@@ -1516,8 +1519,11 @@ unsafe fn run_inner(args: Args, paths: Paths, t0: Instant) -> i32 {
     app.folder_sync();
     let _ = app.worker.send(Req::Scan);
     deskboxes_shell::watch::watch(dirs.iter().map(|d| d.path.clone()).collect(), |d| events::post(Ev::DirChanged(d.display().to_string())));
+    // The shell host (menus, Settings), at below-normal priority, as soon as the first frame is
+    // up and the first scan asked for. It was started on a 300 ms timer (a timer waits behind
+    // every other message, too), and the first menu was ready only 1.4 s after start (0.4 s now).
     if !app.args.no_host {
-        SetTimer(Some(msg_hwnd), T_HOST, 300, None);
+        app.start_host();
     }
     let _ = windows::Win32::System::Ole::RegisterDragDrop(hwnd, &crate::droptarget::DropTarget::create(hwnd));
     app.register_above_hotkey();
@@ -4894,8 +4900,37 @@ impl App {
         }
     }
 
+    /// A new host: the menu of a file of the desktop's most common type (shortcuts, mostly) built
+    /// ahead, so the classic handlers for files (their DLLs, a first QueryContextMenu: 340 ms the
+    /// first time, 75 ms after) are loaded before the first right-click on an icon. (The host
+    /// builds the desktop background's menu ahead itself.)
+    fn warm_item_menu(&mut self) {
+        if self.host_prefetch.is_some() {
+            return;
+        }
+        let ext = |p: &str| std::path::Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase());
+        let files = || self.items.values().filter(|i| i.source != Source::Folder && !i.parsing_name.starts_with("::"));
+        let mut count: HashMap<String, usize> = HashMap::new();
+        for i in files() {
+            if let Some(e) = ext(&i.parsing_name) {
+                *count.entry(e).or_default() += 1;
+            }
+        }
+        let mut common: Vec<(String, usize)> = count.into_iter().collect();
+        common.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let file = common
+            .iter()
+            .take(3)
+            .find_map(|(e, _)| files().find(|i| ext(&i.parsing_name).as_deref() == Some(e.as_str()) && std::path::Path::new(&i.parsing_name).is_file()))
+            .map(|i| i.parsing_name.clone());
+        if let Some(p) = file {
+            self.send_prefetch(vec![p], false);
+        }
+    }
+
     fn prefetch_selection(&mut self) {
-        if self.menu.is_some() || self.sel.set.is_empty() || !matches!(self.drag, Drag::None) {
+        // (Also while a band drawn with the right button grows: its menu opens on release.)
+        if self.menu.is_some() || self.sel.set.is_empty() || !matches!(self.drag, Drag::None | Drag::RightRubber { .. }) {
             return;
         }
         let items = self.selection_paths();
@@ -5045,12 +5080,13 @@ impl App {
             "ready" => {
                 self.stats.host_ready_ms = self.t0.elapsed().as_secs_f64() * 1000.0;
                 log::info!("PHASE host_ready ms={:.1}", self.stats.host_ready_ms);
-                // Tests: Settings opened as soon as the host is there.
-                if self.args.open_settings {
+                // Tests: Settings opened as soon as the (first) host is there.
+                if std::mem::take(&mut self.args.open_settings) {
                     self.send_settings(true, None);
                 }
                 // A screen disconnected before the host was there.
                 self.next_screen_notice();
+                self.warm_item_menu();
             }
             // The host opened the menu, but nothing of it was on a screen (WinUI after a sleep).
             "closed" if v["error"].as_str() == Some("nothing shown") => {
@@ -7530,10 +7566,12 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                                 app.menu_wait = None;
                                 let _ = KillTimer(Some(app.msg_hwnd), T_MENU_WAIT);
                                 // (Ended if it still runs: `wait_timeout_ms` kills it.)
-                                if let Some(mut c) = app.host_child.take() {
-                                    let _ = c.wait_timeout_ms(200);
-                                }
-                                SetTimer(Some(app.msg_hwnd), T_HOST_RETRY, 1000, None);
+                                let clean = app.host_child.take().is_some_and(|mut c| c.wait_timeout_ms(200) && c.try_wait().ok().flatten().is_some_and(|s| s.success()));
+                                // A host that made way on purpose (RecycleWhenIdle: after a sleep,
+                                // Settings closed) is followed at once: there was a second with no
+                                // context menus. One that failed, a moment later (and at most five
+                                // in a minute: `start_host`).
+                                SetTimer(Some(app.msg_hwnd), T_HOST_RETRY, if clean { 50 } else { 1000 }, None);
                             }
                         }
                     }
@@ -7567,7 +7605,7 @@ unsafe fn dispatch(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> Option<Option<LRESU
                 let id = w.0;
                 let _ = KillTimer(Some(h), id);
                 match id {
-                    T_HOST | T_HOST_RETRY => app.start_host(),
+                    T_HOST_RETRY => app.start_host(),
                     T_PREFETCH => app.prefetch_selection(),
                     T_HOVER => app.prefetch_hover(),
                     T_REVEAL => app.reveal_pending(),

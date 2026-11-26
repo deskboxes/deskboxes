@@ -24,8 +24,8 @@ so the settings window opens instantly and we don't ship a second ~100 MB WinUI 
 shell extension also closes an open settings window. Settings are saved on every change, so nothing is lost.
 
 **Startup chain:** HKCU `Run` → `deskboxes-watchdog.exe --launch` → spawns `deskboxes.exe --watchdog-pid <pid>`.
-About 300 ms after first paint, the core spawns `deskboxes-shellhost.exe` at below-normal priority and connects to
-its pipe.
+Right after first paint, the core spawns `deskboxes-shellhost.exe` at below-normal priority and connects to
+its pipe (REPORT.md §22; it was about 300 ms later).
 
 **Who restarts whom:**
 - The watchdog restarts the core: up to 3 times in 60 s, then gives up with icons restored.
@@ -266,7 +266,8 @@ UndoStack   { Vec<Op> } // metadata ops + references to shell file ops (rename e
    snapshot with one read.
 2. Create D3D/D2D/DComp devices, find Progman, create the surfaces, upload snapshot icons, draw, commit
    (**first paint**). **No shell calls before this point.**
-3. Hide native icons (`FWF_NOICONS`). Start the shell host about 300 ms later at low priority.
+3. Hide native icons (`FWF_NOICONS`). Start the shell host at low priority (at once since REPORT.md §22; the D3D device
+   is made on a thread from the start of `run_inner` while the window and snapshot get ready).
 4. FS thread: enumerate both folders (fast path) → diff against the snapshot → shell workers resolve display names
    and icons for new/changed items → UI applies the changes in one frame (**full reconciliation**).
 5. Start the watchers (`ReadDirectoryChangesExW`, `SHChangeNotifyRegister`, registry notifications).
@@ -509,7 +510,7 @@ subset, and in places a simpler form. Everything here was checked against the co
 | Drag source `SHCreateDataObject` + private format (§10) | The shell's data object for the items (`BHID_DataObject`). Inside our surface a drag is a metadata move. Once the cursor leaves the window, it becomes an OLE drag with the shell's data object. Drops onto a **folder** item use `IFileOperation` (Windows' copy engine). The folder's own `IDropTarget` returned S_OK without moving anything when driven from our worker; that is recorded, and the cause is not known. Other drop targets (programs, archives, the Recycle Bin) get the item's own `IDropTarget`. |
 | Cut ghosting via `AddClipboardFormatListener` (§10) | Not implemented. Hidden items are drawn faded, as Explorer does. |
 | IPC messages (§11) | Implemented: `hello`/`ready`, `prefetch`, `show`, `quit`; `shown`, `command`, `closed`. Not implemented: `settings`, `log`, `invoke`. Enter and double-click open items in the core with `ShellExecuteEx` (default verb, `SEE_MASK_INVOKEIDLIST`). The pipe is `deskboxes-host-<session>-<core pid>`, with a DACL for the current user's SID only. |
-| Host builds menus off its UI thread, 150 ms budget for slow handlers (§12) | Menus are built on the host's UI thread (STA). The core prefetches when the pointer rests 150 ms on an unselected item (a right-click would select it), on right-button-down unless the host already holds that exact menu, and 150 ms after the selection settles or a menu closes (for the Menu key and Shift+F10). A show uses the prefetch up. Selections are resolved by parsing each parent folder once and the names relative to it: 100 items in 4 ms, previously 148 ms. Slow-handler budgets and late insertion are Phase 2. |
+| Host builds menus off its UI thread, 150 ms budget for slow handlers (§12) | Menus are built on the host's UI thread (STA). The core prefetches when the pointer rests 150 ms on an unselected item (a right-click would select it), on right-button-down unless the host already holds that exact menu, and 150 ms after the selection settles or a menu closes (for the Menu key and Shift+F10). A show uses the prefetch up. Since REPORT.md §22 a prefetch holds only the shell's part of the menu (`BuildShellMenu`); Deskboxes' entries and the desktop view's own (View, Sort by, Paste, Undo) are added at show (`AssembleMenu`), so the desktop background's menu is built ahead too (at the host's start and after each show), and a new host starts from the extension list cached in `packaged-menus.cache`. Selections are resolved by parsing each parent folder once and the names relative to it: 100 items in 4 ms, previously 148 ms. Slow-handler budgets and late insertion are Phase 2. |
 | Settings window (§1, §13) | Not implemented. `settings.json` is edited by hand; "Disable Deskboxes" is in the desktop background menu (Deskboxes submenu). |
 | Mixed selections (§12) | On the real desktop, user and Public desktop items share the desktop root, so one menu covers them. In fixture mode two unrelated folders have no common parent, and the host builds no menu for such a selection. This is a fixture-only limitation; `perf-check` uses one folder. |
 

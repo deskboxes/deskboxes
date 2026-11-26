@@ -126,21 +126,13 @@ namespace dbx
         return out;
     }
 
-    std::unique_ptr<BuiltMenu> BuildMenu(const MenuRequest& r)
+    std::unique_ptr<BuiltMenu> BuildShellMenu(const MenuRequest& r)
     {
         auto t0 = NowMs();
         auto m = std::make_unique<BuiltMenu>();
         m->req = r;
-        if (r.ownOnly)
-        {
-            // Deskboxes' own menu (a desktop page's name): its entries alone, no shell.
-            m->list = r.extra;
-            for (auto& e : m->list) e.packageFamily.clear();
-            m->msTotal = NowMs() - t0;
-            return m;
-        }
+        if (r.ownOnly) { m->builtAt = NowMs(); return m; } // Deskboxes' own menu: no shell (AssembleMenu)
         const Policy& pol = GetPolicy();
-        m->customizable = CustomizableMenuPresent();
 
         Selection sel;
         if (!r.background)
@@ -190,7 +182,7 @@ namespace dbx
                             e.id = v; if (e.iconRef.empty()) e.iconRef = icon;
                             Decorate(e, pol); e.iconRef.clear(); // row uses glyphs
                             if (auto g = pol.glyphs.find(v); g != pol.glyphs.end()) e.glyph = g->second;
-                            m->row.push_back(std::move(e));
+                            m->shellRow.push_back(std::move(e));
                         }
                     }
                     continue;
@@ -199,7 +191,7 @@ namespace dbx
                 if (it == m->classicAll.end()) continue;
                 MenuEntry e = *it; e.classicBitmap = nullptr; Decorate(e, pol);
                 if (auto g = pol.glyphs.find(v); g != pol.glyphs.end()) e.glyph = g->second;
-                m->row.push_back(std::move(e));
+                m->shellRow.push_back(std::move(e));
             }
         }
 
@@ -278,8 +270,58 @@ namespace dbx
                 if (at != list.end()) ++at;
                 list.insert(at, std::move(e));
             }
+        m->shellList = std::move(list);
 
-        // ---- 4. Deskboxes' own top entries (View / Sort by / Refresh / Undo ...) ------
+        // ---- 4. third-party modern entries (packaged IExplorerCommand) ---------------
+        // (Where each goes, the top level or App extensions, is the user's choice in Windows'
+        // Settings: decided at show, AssembleMenu.)
+        auto t1 = NowMs();
+        for (auto& reg : PackagedFor(ItemTypesFor(r)))
+        {
+            auto c = GetCommand(reg.clsid);
+            if (!c) continue;
+            SetCommandSite(c.get(), siteFolder);
+            MenuEntry e; e.source = Source::Packaged; e.packageFamily = reg.family;
+            if (!ReadExplorerCommand(c.get(), m->items.get(), e, false)) continue;
+            if (e.id.empty()) { wchar_t g[64]; StringFromGUID2(reg.clsid, g, 64); e.id = g; }
+            if (e.hasSubmenu)
+            {
+                // A root whose subcommands are all hidden is not shown (an empty flyout).
+                LoadChildren(e, m->items.get());
+                size_t visible = 0;
+                for (auto& ch : e.children) if (!ch.separator) ++visible;
+                if (visible == 0) { Log(L"packaged %s: no visible subcommands, hidden", e.text.c_str()); continue; }
+            }
+            m->packaged.push_back(std::move(e));
+        }
+        m->msPackaged = NowMs() - t1;
+        m->msTotal = NowMs() - t0;
+        m->builtAt = NowMs();
+        m->shellOk = true;
+        return m;
+    }
+
+    void AssembleMenu(BuiltMenu& mm, const MenuRequest& r)
+    {
+        auto t0 = NowMs();
+        BuiltMenu* m = &mm;
+        m->req = r;
+        m->row.clear(); m->list.clear();
+        if (r.ownOnly)
+        {
+            // Deskboxes' own menu (a desktop page's name): its entries alone, no shell.
+            m->list = r.extra;
+            for (auto& e : m->list) e.packageFamily.clear();
+            m->msAssemble = NowMs() - t0;
+            return;
+        }
+        if (!m->shellOk) return; // (an empty menu: the caller says so)
+        const Policy& pol = GetPolicy();
+        m->customizable = CustomizableMenuPresent();
+        m->row = m->shellRow;
+        std::vector<MenuEntry> list = m->shellList;
+
+        // ---- Deskboxes' own top entries (View / Sort by / Refresh / Undo ...) ----------
         if (r.background && r.desktop)
         {
             auto own = DesktopOwnEntries(r, pol);
@@ -311,29 +353,13 @@ namespace dbx
             InsertExtras(*m, L"beforeProperties", list, props);
         }
 
-        // ---- 5. third-party modern entries (packaged IExplorerCommand) ---------------
-        auto t1 = NowMs();
+        // ---- the extensions: at the top level, or in App extensions (26H2) --------------
         std::vector<MenuEntry> top, appExt;
-        for (auto& reg : PackagedFor(ItemTypesFor(r)))
+        for (auto& e : m->packaged)
         {
-            auto c = GetCommand(reg.clsid);
-            if (!c) continue;
-            SetCommandSite(c.get(), siteFolder);
-            MenuEntry e; e.source = Source::Packaged; e.packageFamily = reg.family;
-            if (!ReadExplorerCommand(c.get(), m->items.get(), e, false)) continue;
-            if (e.id.empty()) { wchar_t g[64]; StringFromGUID2(reg.clsid, g, 64); e.id = g; }
-            if (e.hasSubmenu)
-            {
-                // A root whose subcommands are all hidden is not shown (an empty flyout).
-                LoadChildren(e, m->items.get());
-                size_t visible = 0;
-                for (auto& ch : e.children) if (!ch.separator) ++visible;
-                if (visible == 0) { Log(L"packaged %s: no visible subcommands, hidden", e.text.c_str()); continue; }
-            }
-            if (!m->customizable || ExtensionPromoted(reg.family)) top.push_back(std::move(e));
-            else appExt.push_back(std::move(e));
+            if (!m->customizable || ExtensionPromoted(e.packageFamily)) top.push_back(e);
+            else appExt.push_back(e);
         }
-        m->msPackaged = NowMs() - t1;
 
         PushSep(list);
         InsertExtras(*m, L"extensions", list, list.end());
@@ -373,7 +399,14 @@ namespace dbx
         InsertExtras(*m, L"bottom", list, list.end());
         TrimSeps(list);
         m->list = std::move(list);
-        m->msTotal = NowMs() - t0;
+        m->msAssemble = NowMs() - t0;
+    }
+
+    std::unique_ptr<BuiltMenu> BuildMenu(const MenuRequest& r)
+    {
+        auto m = BuildShellMenu(r);
+        AssembleMenu(*m, r);
+        m->msTotal += m->msAssemble;
         return m;
     }
 

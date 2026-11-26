@@ -228,10 +228,11 @@ fn main() {
     let paths = Paths::new(&args);
     logger::init(&paths.logs, t0);
     log::info!(
-        "deskboxes {} start args={:?} elevated={}",
+        "deskboxes {} start args={:?} elevated={} ({:.0} ms after the process was created)",
         env!("CARGO_PKG_VERSION"),
         std::env::args().skip(1).collect::<Vec<_>>(),
-        token_elevated()
+        token_elevated(),
+        ms_since_process_created(t0)
     );
     if args.restore_icons {
         std::process::exit(restore_icons_cmd());
@@ -259,6 +260,22 @@ fn main() {
     transfer::respawn_if_wanted();
     log::logger().flush();
     std::process::exit(code);
+}
+
+/// Time from the process's creation to `t0` (the start of `main`): loading the program and the
+/// DLLs it imports, before any of its code runs.
+fn ms_since_process_created(t0: Instant) -> f64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    unsafe {
+        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).is_err() {
+            return 0.0;
+        }
+        let now = windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime();
+        let ft = |f: FILETIME| ((f.dwHighDateTime as i64) << 32) | f.dwLowDateTime as i64;
+        (ft(now) - ft(c)) as f64 / 1e4 - t0.elapsed().as_secs_f64() * 1000.0
+    }
 }
 
 /// Windows' own dialogs shown from this process (copy progress, delete and replace confirmations,

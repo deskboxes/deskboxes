@@ -89,16 +89,46 @@ pub fn decode_image_cpu(path: &str, scale_for: impl FnOnce(u32, u32) -> f32) -> 
     }
 }
 
+/// The D3D11 device being made on a thread of its own (`start_device`).
+pub struct PendingDevice(std::thread::JoinHandle<R<SendDevice>>);
+struct SendDevice(ID3D11Device);
+// A D3D11 device is free-threaded; it is only handed over to the thread that uses it.
+unsafe impl Send for SendDevice {}
+
+/// Start making the D3D11 device now, for `Gpu::from_pending` later. It is the slow part of
+/// starting: ~40 ms (the graphics driver loading), and 135-770 ms at sign-in on the dev PC,
+/// while the rest of the start (the window, the snapshot, the wallpaper) is a few ms of other
+/// work that can go on meanwhile.
+pub fn start_device() -> PendingDevice {
+    PendingDevice(std::thread::spawn(|| create_device().map(SendDevice)))
+}
+
+fn create_device() -> R<ID3D11Device> {
+    unsafe {
+        let mut dev: Option<ID3D11Device> = None;
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        if D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None).is_err() {
+            // No usable GPU (VM, driver reset): WARP keeps the desktop working.
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None)?;
+        }
+        dev.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+    }
+}
+
 impl Gpu {
     pub fn new() -> R<Gpu> {
+        Self::with_device(create_device()?)
+    }
+
+    /// The device `start_device` made (waited for if it is still being made).
+    pub fn from_pending(p: PendingDevice) -> R<Gpu> {
+        let dev = p.0.join().map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))??;
+        Self::with_device(dev.0)
+    }
+
+    fn with_device(dev: ID3D11Device) -> R<Gpu> {
         unsafe {
-            let mut dev: Option<ID3D11Device> = None;
-            let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-            if D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None).is_err() {
-                // No usable GPU (VM, driver reset): WARP keeps the desktop working.
-                D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None)?;
-            }
-            let dxgi: IDXGIDevice = dev.unwrap().cast()?;
+            let dxgi: IDXGIDevice = dev.cast()?;
             // At most one frame queued ahead of the GPU: when a slower GPU falls behind, the
             // picture (a selection rectangle, a dragged box) trails the pointer by one frame, not
             // three.

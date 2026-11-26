@@ -66,8 +66,12 @@ namespace dbx
         std::vector<MenuEntry> classicAll;      // full classic tree (dump + diagnostics)
         std::vector<MenuEntry> row;             // command row (Cut/Copy/Rename/Share/Delete)
         std::vector<MenuEntry> list;            // the menu list (top level)
+        // The shell's part (BuildShellMenu), from which AssembleMenu makes row and list per show.
+        std::vector<MenuEntry> shellRow, shellList, packaged;
+        bool shellOk = false;
         bool customizable = false;              // 26H2 "Customize menu" feature present
         double msResolve = 0, msClassic = 0, msPackaged = 0, msTotal = 0;
+        double msAssemble = 0, builtAt = 0;     // builtAt: NowMs() when the shell's part was done
         ~BuiltMenu();
     };
 
@@ -105,8 +109,13 @@ namespace dbx
     // ---- ExplorerCommands.cpp
     struct PackagedRegistration { std::wstring family, fullName, displayName, itemType, verbId; CLSID clsid{}; };
     void LoadPackagedRegistrations(bool force = false);
-    // The same on a thread of its own (`done` on that thread at its end); the first Load waits for it.
-    void StartPackagedScan(std::function<void()> done);
+    // The same on a thread of its own; the first Load waits for it. With the list cached from
+    // last time, that is used at once and the scan only checks it. `ready` once the list is there,
+    // `changed` if the scan found it changed since the cache (both on the calling thread).
+    void StartPackagedScan(std::function<void()> ready, std::function<void()> changed);
+    // Every extension command of a menu built a while ago still answers (its server may have
+    // ended since: an update, a crash).
+    bool CommandsAlive(const BuiltMenu& m);
     std::vector<PackagedRegistration> PackagedFor(const std::vector<std::wstring>& itemTypes);
     winrt::com_ptr<IExplorerCommand> GetCommand(const CLSID& clsid);   // cached instances
     winrt::com_ptr<IExplorerCommand> CommandStoreHandler(const std::wstring& name, std::wstring* iconRef);
@@ -146,7 +155,15 @@ namespace dbx
     std::wstring PolicyString(const wchar_t* key, const wchar_t* fallback);
 
     // ---- MenuBuilder.cpp
-    std::unique_ptr<BuiltMenu> BuildMenu(const MenuRequest& r);
+    // A menu is built in two parts. The shell's part (resolving the items, the classic handlers'
+    // QueryContextMenu, the extension commands' GetState) is what takes the time (25-90 ms warm),
+    // and depends only on the items / folder and Shift: it can be built ahead (a prefetch, the
+    // desktop background). The rest changes with every show (Deskboxes' own entries, the desktop
+    // view's View / Sort by / Paste / Undo, where extensions go): AssembleMenu, once per menu,
+    // at show (well under 1 ms).
+    std::unique_ptr<BuiltMenu> BuildShellMenu(const MenuRequest& r);
+    void AssembleMenu(BuiltMenu& m, const MenuRequest& r);
+    std::unique_ptr<BuiltMenu> BuildMenu(const MenuRequest& r); // both, at once
     std::wstring DumpMenu(const BuiltMenu& m, bool includeClassic);
     std::wstring DumpMenuJson(const BuiltMenu& m, bool includeClassic); // same shape as tools/menu-probe output
 }

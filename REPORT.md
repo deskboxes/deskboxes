@@ -669,3 +669,28 @@ in `CONTRIBUTING.md`). This supersedes the split in §18.
   added by the script.
 - Issues use forms (`.github/ISSUE_TEMPLATE`), Discussions are on, and vulnerabilities are
   reported privately (`SECURITY.md`).
+
+## 22. Performance (2026-11-26): lighter, faster start, faster menus
+
+Measured with Release builds on fixtures (`--desktop-dir`, `--window`, non-elevated), medians of
+6 runs; menus from `tools/ipc-smoke.ps1` (request to menu visible, measured in the host).
+
+| What | Before | After | Change |
+| --- | --- | --- | --- |
+| Right-click on the desktop (background menu) | 100 ms | 19 ms | Its shell part is built ahead: at the host's start, and again after each show (`BuildShellMenu` / `AssembleMenu`). |
+| Menu host ready after start (300 icons) | 454 ms | 166 ms | Started right after first paint, not on a 300 ms timer. |
+| First menu fully built ahead | 1,477 ms | 406 ms | Extension list read from `packaged-menus.cache` (2 ms, was a 404 ms scan, which now only checks it); prewarm without its 400 ms wait. |
+| No menus after a host recycle (Settings closed, sleep) | ~1.1 s | ~0.12 s | A host that exits cleanly is restarted after 50 ms, not 1 s. |
+| Core memory at idle, 2,000 icons | 199 MB | 148 MB | Look-ahead label shadows capped at 400 (`SHADOW_BUDGET`). |
+| Host memory after Settings closed | 176 MB | 52 MB | The host recycles a minute after Settings closes. |
+| No-change rescans redrawn | 10 of 10 | 0 of 10 | The Recycle Bin's system icon index is found through its PIDL. |
+
+Also: the first file menu is built ahead for the desktop's most common file type when a host
+starts (a cold one took 340 ms, a warm one 75 ms); a right-button band prefetches its
+selection's menu while it is drawn; the D3D device is made on a thread from the start;
+`shellhost.log` rotates at 2 MB; unused dependencies removed.
+
+Not changed: the first frame at sign-in waits for the graphics driver. `D3D11CreateDevice` took
+37-53 ms warm and 135-767 ms in the sign-in starts in the dev PC's logs (wallpaper decode is no
+longer on that path since 0.1.7's cache). The menu view itself opens in ~20 ms (WinUI window and
+flyout); a prefetched item menu shows in ~20 ms, one built at show in 75-95 ms.
